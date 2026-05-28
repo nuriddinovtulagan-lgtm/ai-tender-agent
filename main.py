@@ -1,270 +1,155 @@
-import os
-import json
-import requests
+import os, json, requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Request
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Scraper")
+app = FastAPI(title="AI Tender Agent")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-LOGISTICS_KEYWORDS = [
-    "логистика", "логистик", "груз", "грузоперевоз", "перевозка",
-    "перевоз", "транспорт", "автотранспорт", "доставка", "экспед",
-    "экспедитор", "контейнер", "склад", "тамож", "cargo", "freight",
-    "transport", "truck", "warehouse", "container", "delivery", "shipping"
-]
+KEYWORDS = ["логист", "груз", "перевоз", "транспорт", "доставка", "экспед", "контейнер", "cargo", "freight", "transport", "delivery", "truck"]
+BAD = ["мебель", "ремонт", "строительство", "канц", "бумага", "продукт", "компьютер", "телефон"]
 
-BLOCKED_KEYWORDS = [
-    "мебель", "канц", "бумага", "питание", "строительство", "ремонт",
-    "компьютер", "сервер", "телефон", "молоко", "хлеб", "мясо"
-]
-
-SCAN_URLS = [
+SITES = [
     "https://www.tenderweek.com/",
     "https://xt-xarid.uz/",
     "https://xt-xarid.uz/ru",
     "https://xarid.uzex.uz/home",
 ]
 
+def send_telegram(text):
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text},
+        timeout=20
+    )
 
-def send_telegram(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram env vars missing")
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=20)
-
-
-def get_sheet():
+def sheet():
     info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    client = gspread.authorize(creds)
-    return client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
+    creds = Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
 
-
-def normalize_text(text: str) -> str:
+def clean(text):
     return " ".join((text or "").replace("\n", " ").split())
 
-
-def is_logistics(text: str) -> bool:
-    clean = text.lower()
-
-    if any(word in clean for word in BLOCKED_KEYWORDS):
+def is_logistics(text):
+    t = text.lower()
+    if any(x in t for x in BAD):
         return False
+    return any(x in t for x in KEYWORDS)
 
-    return any(word in clean for word in LOGISTICS_KEYWORDS)
-
-
-def detect_source(url: str) -> str:
-    low = url.lower()
-
-    if "tenderweek" in low:
-        return "Tenderweek"
-
-    if "xarid.uzex" in low or "etender.uzex" in low:
-        return "Xarid UZEX"
-
-    if "xt-xarid" in low:
-        return "XT-Xarid"
-
+def source(url):
+    u = url.lower()
+    if "tenderweek" in u: return "Tenderweek"
+    if "xt-xarid" in u: return "XT-Xarid"
+    if "xarid.uzex" in u or "etender.uzex" in u: return "Xarid UZEX"
     return "Другой источник"
 
-
-def assign_responsible(source: str) -> str:
-    if source == "Tenderweek":
-        return "Nurik"
-
-    if source == "Xarid UZEX":
-        return "Otabek"
-
-    if source == "XT-Xarid":
-        return "101"
-
+def responsible(src):
+    if src == "Tenderweek": return "Nurik"
+    if src == "Xarid UZEX": return "Otabek"
+    if src == "XT-Xarid": return "101"
     return "Nuriddin"
 
-
-def get_priority(source: str, text: str) -> str:
-    low = text.lower()
-
-    if source == "Tenderweek":
+def priority(src, title):
+    t = title.lower()
+    if src == "Tenderweek" or any(x in t for x in ["cargo", "freight", "container", "международ"]):
         return "🔴 Высокий"
-
-    if any(k in low for k in ["международ", "international", "cargo", "freight", "container"]):
-        return "🔴 Высокий"
-
-    if source in ["Xarid UZEX", "XT-Xarid"]:
+    if src in ["Xarid UZEX", "XT-Xarid"]:
         return "🟡 Средний"
-
     return "🟢 Низкий"
 
-
-def get_win_chance(source: str, priority: str) -> str:
-    if source == "Tenderweek" and priority == "🔴 Высокий":
-        return "🏆 Высокий"
-
-    if source in ["Xarid UZEX", "XT-Xarid"]:
-        return "⚖️ Средний"
-
-    return "⚠️ Низкий"
-
-
-def finance_analysis(source: str, priority: str):
-    margin = "💰 Средняя"
-    risk = "⚠️ Средний"
-    logistics = "🚚 Средняя"
-
-    if source == "Tenderweek":
-        margin = "💰 Высокая"
-        logistics = "🚚 Высокая"
-
-    if source == "Xarid UZEX":
-        risk = "⚠️ Низкий"
-
-    if priority == "🔴 Высокий":
-        margin = "💰 Высокая"
-
-    return margin, risk, logistics
-
-
-def get_ai_analysis(source: str) -> str:
-    if source == "Tenderweek":
-        return "Проверить международные требования, дедлайн и условия участия."
-
-    if source == "Xarid UZEX":
-        return "Изучить ТЗ, требования госзакупки, сроки и документы."
-
-    if source == "XT-Xarid":
-        return "Проверить соответствие логистическим услугам и условия оплаты."
-
-    return "Требуется анализ тендера."
-
-
-def save_tender(url: str, title: str) -> bool:
-    sheet = get_sheet()
-
-    existing_links = sheet.col_values(3)
-    if url in existing_links:
+def save_tender(url, title):
+    sh = sheet()
+    if url in sh.col_values(3):
         return False
 
-    source = detect_source(url)
-    responsible = assign_responsible(source)
-    combined_text = title + " " + url
-    priority = get_priority(source, combined_text)
-    chance = get_win_chance(source, priority)
-    margin, risk, logistics = finance_analysis(source, priority)
-    ai = get_ai_analysis(source)
+    src = source(url)
+    resp = responsible(src)
+    pr = priority(src, title + " " + url)
+    chance = "⚖️ Средний" if src in ["Xarid UZEX", "XT-Xarid"] else "🏆 Высокий" if src == "Tenderweek" else "⚠️ Низкий"
+    margin = "💰 Высокая" if pr == "🔴 Высокий" else "💰 Средняя"
+    risk = "⚠️ Низкий" if src == "Xarid UZEX" else "⚠️ Средний"
+    logistics = "🚚 Высокая" if src == "Tenderweek" else "🚚 Средняя"
+    ai = "Изучить ТЗ, сроки, документы и условия оплаты."
 
-    sheet.append_row([
+    sh.append_row([
         datetime.now().strftime("%d.%m.%Y %H:%M"),
         "AUTO",
         url,
-        source,
+        src,
         "Новый",
-        priority,
+        pr,
         ai,
         title,
         "",
-        responsible,
+        resp,
         "",
         chance,
         margin,
         risk,
-        logistics,
+        logistics
     ])
 
     send_telegram(
         "🆕 Новый логистический тендер\n\n"
         f"Название: {title}\n"
-        f"Источник: {source}\n"
+        f"Источник: {src}\n"
         f"Ссылка: {url}\n\n"
-        f"👤 Ответственный: {responsible}\n"
-        f"📌 Приоритет: {priority}\n"
+        f"👤 Ответственный: {resp}\n"
+        f"📌 Приоритет: {pr}\n"
         f"🏆 Шанс победы: {chance}\n"
         f"{margin}\n{risk}\n{logistics}"
     )
-
     return True
 
+def scan_site(url):
+    found = 0
+    html = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
+    soup = BeautifulSoup(html, "html.parser")
 
-def extract_links_from_page(page_url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    response = requests.get(page_url, timeout=30, headers=headers)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    results = []
-
-    for a in soup.find_all("a", href=True):
-        title = normalize_text(a.get_text(" ", strip=True))
-        href = a.get("href")
-
-        if not href:
-            continue
-
-        full_url = requests.compat.urljoin(page_url, href)
-        combined = title + " " + full_url
+    for a in soup.find_all("a", href=True)[:500]:
+        title = clean(a.get_text(" ", strip=True))
+        href = a["href"]
+        full = requests.compat.urljoin(url, href)
 
         if len(title) < 4:
             continue
 
-        results.append({
-            "title": title,
-            "url": full_url,
-            "combined": combined
-        })
+        combined = title + " " + full
 
-    return results
-
-
-def scan_page(page_url: str) -> int:
-    found = 0
-
-    try:
-        links = extract_links_from_page(page_url)
-
-        for item in links[:300]:
-            if is_logistics(item["combined"]):
-                if save_tender(item["url"], item["title"]):
-                    found += 1
-
-    except Exception as e:
-        send_telegram(f"❌ Ошибка сканирования:\n{page_url}\n\n{e}")
+        if is_logistics(combined):
+            if save_tender(full, title):
+                found += 1
 
     return found
-
-
-def run_all_scans():
-    details = {}
-    total = 0
-
-    for url in SCAN_URLS:
-        count = scan_page(url)
-        details[url] = count
-        total += count
-
-    return total, details
-
 
 @app.get("/")
 def home():
     return {"status": "AI Tender Scraper is running"}
 
-
 @app.get("/scan")
 def scan():
-    total, details = run_all_scans()
+    total = 0
+    details = {}
+
+    for url in SITES:
+        try:
+            count = scan_site(url)
+        except Exception as e:
+            count = 0
+            send_telegram(f"❌ Ошибка сканирования\n{url}\n{e}")
+
+        details[url] = count
+        total += count
 
     msg = "📊 AI Auto Scan завершён\n\n"
     for url, count in details.items():
@@ -272,35 +157,22 @@ def scan():
     msg += f"\nВсего новых: {total}"
 
     send_telegram(msg)
-
-    return {
-        "total": total,
-        "details": details
-    }
-
+    return {"total": total, "details": details}
 
 @app.post("/webhook")
-async def telegram_webhook(request: Request):
+async def webhook(request: Request):
     data = await request.json()
-
-    message = data.get("message", {})
-    text = message.get("text", "")
-
-    if not text:
-        return {"ok": True}
+    text = data.get("message", {}).get("text", "")
 
     if text == "/scan":
-        total, details = run_all_scans()
-        send_telegram(f"📊 Ручной AI Scan завершён\nВсего новых: {total}")
-        return {"ok": True}
+        return scan()
 
     if "http" in text:
         if not is_logistics(text):
             send_telegram("❌ Ссылка не похожа на логистический тендер.")
             return {"ok": True}
 
-        saved = save_tender(text, "Ссылка от сотрудника")
-        if not saved:
+        if not save_tender(text, "Ссылка от сотрудника"):
             send_telegram("⚠️ Этот тендер уже есть в базе\n\n" + text)
 
     return {"ok": True}
