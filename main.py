@@ -27,7 +27,12 @@ SITES = [
 # =========================
 
 def get_sheet():
-    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    if not raw_json:
+        raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
+
+    info = json.loads(raw_json)
 
     creds = Credentials.from_service_account_info(
         info,
@@ -38,8 +43,8 @@ def get_sheet():
     )
 
     client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
 
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
     return sheet
 
 # =========================
