@@ -380,12 +380,12 @@ def scan():
         print(e)
 
     try:
-        uzex = parse_uzex()
-        all_tenders.extend(uzex)
-        message += f"UZEX найдено: {len(uzex)}\n"
-    except Exception as e:
-        message += "UZEX ERROR\n"
-        print(e)
+    xt = parse_xt_xarid()
+    all_tenders.extend(xt)
+    message += f"XT-Xarid найдено: {len(xt)}\n"
+except Exception as e:
+    message += "XT-Xarid ERROR\n"
+    print(e)
 
     message += "\n"
 
