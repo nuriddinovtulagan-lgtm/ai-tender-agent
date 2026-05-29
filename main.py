@@ -200,7 +200,9 @@ def save_to_sheet(site, title, url):
 @app.get("/scan")
 def scan():
 
-    total = 0
+    found_total = 0
+new_total = 0
+duplicate_total = 0
     message = "📊 AI Auto Scan завершён\n\n"
 
     all_tenders = []
