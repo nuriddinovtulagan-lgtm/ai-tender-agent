@@ -21,7 +21,10 @@ KEYWORDS = [
     "спецтехника",
     "склад"
 ]
+def is_logistics_tender(title):
+    title = title.lower()
 
+    return any(word in title for word in KEYWORDS)
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
