@@ -82,56 +82,70 @@ def send_telegram(text):
 
 
 def parse_tenderweek():
-    url = "https://www.tenderweek.com/"
+    base_url = "https://www.tenderweek.com/"
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    r = requests.get(url, headers=headers, timeout=30)
-    soup = BeautifulSoup(r.text, "html.parser")
+    search_words = [
+        "перевозка",
+        "перевозка грузов",
+        "транспорт",
+        "транспортные услуги",
+        "доставка",
+        "логистика",
+        "экспедирование",
+        "склад",
+        "спецтехника"
+    ]
 
     tenders = []
+    seen_urls = set()
 
-    for link in soup.find_all("a"):
-        text = link.get_text(strip=True)
-        href = link.get("href")
+    pages_to_scan = [base_url]
 
-        if not text or len(text) < 15:
-            continue
+    for word in search_words:
+        pages_to_scan.append(f"{base_url}?search={word}")
+        pages_to_scan.append(f"{base_url}?q={word}")
 
-        if not href:
-            continue
+    for url in pages_to_scan:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
 
-        full_url = requests.compat.urljoin(url, href)
+            for link in soup.find_all("a"):
+                title = link.get_text(strip=True)
+                href = link.get("href")
 
-        tenders.append({
-            "site": "Tenderweek",
-            "title": text,
-            "url": full_url
-        })
+                if not title or len(title) < 10:
+                    continue
 
-    return tenders[:10]
+                if not href:
+                    continue
 
+                full_url = requests.compat.urljoin(base_url, href)
 
-def parse_xt_xarid():
-    url = "https://xt-xarid.uz/"
-    headers = {"User-Agent": "Mozilla/5.0"}
+                if "tender" not in full_url.lower():
+                    continue
 
-    r = requests.get(url, headers=headers, timeout=30)
-    soup = BeautifulSoup(r.text, "html.parser")
+                if full_url in seen_urls:
+                    continue
 
-    tenders = []
+                combined_text = f"{title} {full_url}"
 
-    for card in soup.find_all("div"):
-        text = card.get_text(strip=True)
+                if not is_logistics_tender(combined_text):
+                    continue
 
-        if len(text) > 20 and ("тендер" in text.lower() or "закуп" in text.lower()):
-            tenders.append({
-                "site": "XT-Xarid",
-                "title": text[:300],
-                "url": url
-            })
+                seen_urls.add(full_url)
 
-    return tenders[:10]
+                tenders.append({
+                    "site": "Tenderweek",
+                    "title": title,
+                    "url": full_url
+                })
 
+        except Exception as e:
+            print("TENDERWEEK SEARCH ERROR:", e)
+
+    return tenders[:30]
 
 def parse_uzex():
     url = "https://etender.uzex.uz/lots/1/0"
