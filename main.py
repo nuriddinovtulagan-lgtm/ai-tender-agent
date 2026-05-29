@@ -247,13 +247,17 @@ def scan():
     message += "\n"
 
     for tender in all_tenders[:20]:
-        found_total += 1
 
-        saved = save_to_sheet(
-            tender["site"],
-            tender["title"],
-            tender["url"]
-        )
+    if not is_logistics_tender(tender["title"]):
+        continue
+
+    found_total += 1
+
+    saved = save_to_sheet(
+        tender["site"],
+        tender["title"],
+        tender["url"]
+    )
 
         if saved:
             new_total += 1
