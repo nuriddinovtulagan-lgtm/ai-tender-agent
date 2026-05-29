@@ -246,6 +246,33 @@ def home():
 
 @app.head("/")
 def head_home():
+    @app.get("/health")
+def health():
+    result = {
+        "status": "ok",
+        "telegram": False,
+        "google_sheets": False,
+        "errors": []
+    }
+
+    try:
+        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+        tg_response = requests.get(tg_url, timeout=10)
+        result["telegram"] = tg_response.status_code == 200
+    except Exception as e:
+        result["errors"].append("Telegram error: " + str(e))
+
+    try:
+        sh = get_sheet()
+        sh.row_values(1)
+        result["google_sheets"] = True
+    except Exception as e:
+        result["errors"].append("Google Sheets error: " + str(e))
+
+    if result["errors"]:
+        result["status"] = "warning"
+
+    return result
     return {}
 
 # =========================
