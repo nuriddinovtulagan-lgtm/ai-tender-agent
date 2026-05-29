@@ -231,31 +231,81 @@ def scan():
 
     message += "\n"
 
+   @app.get("/scan")
+def scan():
+
+    found_total = 0
+    new_total = 0
+    duplicate_total = 0
+
+    message = "📊 AI Auto Scan завершён\n\n"
+
+    all_tenders = []
+
+    try:
+        tw = parse_tenderweek()
+        all_tenders.extend(tw)
+        message += f"Tenderweek найдено: {len(tw)}\n"
+    except Exception as e:
+        message += "Tenderweek ERROR\n"
+        print(e)
+
+    try:
+        xt = parse_xt_xarid()
+        all_tenders.extend(xt)
+        message += f"XT-Xarid найдено: {len(xt)}\n"
+    except Exception as e:
+        message += "XT-Xarid ERROR\n"
+        print(e)
+
+    try:
+        uzex = parse_uzex()
+        all_tenders.extend(uzex)
+        message += f"UZEX найдено: {len(uzex)}\n"
+    except Exception as e:
+        message += "UZEX ERROR\n"
+        print(e)
+
+    message += "\n"
+
     for tender in all_tenders[:20]:
 
-        total += 1
+        found_total += 1
 
-        text = (
-            f"📌 {tender['site']}\n\n"
-            f"{tender['title']}\n\n"
-            f"{tender['url']}"
-        )
-
-        send_telegram(text)
-
-        save_to_sheet(
+        saved = save_to_sheet(
             tender["site"],
             tender["title"],
             tender["url"]
         )
 
-    message += f"Всего найдено: {total}"
+        if saved:
+            new_total += 1
+
+            text = (
+                f"🆕 Новый тендер\n\n"
+                f"📌 {tender['site']}\n\n"
+                f"{tender['title']}\n\n"
+                f"{tender['url']}"
+            )
+
+            send_telegram(text)
+
+        else:
+            duplicate_total += 1
+
+    message += (
+        f"Всего найдено: {found_total}\n"
+        f"Новых сохранено: {new_total}\n"
+        f"Дубликатов пропущено: {duplicate_total}"
+    )
 
     send_telegram(message)
 
     return {
         "status": "success",
-        "total": total
+        "found_total": found_total,
+        "new_total": new_total,
+        "duplicates": duplicate_total
     }
 
 # =========================
