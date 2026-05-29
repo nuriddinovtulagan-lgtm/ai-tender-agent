@@ -247,7 +247,6 @@ def scan():
     message += "\n"
 
     for tender in all_tenders[:20]:
-
         if not is_logistics_tender(tender["title"]):
             continue
 
@@ -270,11 +269,11 @@ def scan():
             )
 
             send_telegram(text)
-
         else:
             duplicate_total += 1
+
     message += (
-        f"Всего найдено: {found_total}\n"
+        f"Всего найдено по логистике: {found_total}\n"
         f"Новых сохранено: {new_total}\n"
         f"Дубликатов пропущено: {duplicate_total}"
     )
@@ -287,13 +286,3 @@ def scan():
         "new_total": new_total,
         "duplicates": duplicate_total
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=10000
-    )
