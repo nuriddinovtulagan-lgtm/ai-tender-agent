@@ -270,43 +270,45 @@ def scan():
 
     for tender in all_tenders[:20]:
 
-        found_total += 1
+    found_total += 1
 
-        saved = save_to_sheet(
-            tender["site"],
-            tender["title"],
-            tender["url"]
-        )
-
-        if saved:
-            new_total += 1
-
-            text = (
-                f"🆕 Новый тендер\n\n"
-                f"📌 {tender['site']}\n\n"
-                f"{tender['title']}\n\n"
-                f"{tender['url']}"
-            )
-
-            send_telegram(text)
-
-        else:
-            duplicate_total += 1
-
-    message += (
-        f"Всего найдено: {found_total}\n"
-        f"Новых сохранено: {new_total}\n"
-        f"Дубликатов пропущено: {duplicate_total}"
+    saved = save_to_sheet(
+        tender["site"],
+        tender["title"],
+        tender["url"]
     )
 
-    send_telegram(message)
+    if saved:
 
-    return {
-        "status": "success",
-        "found_total": found_total,
-        "new_total": new_total,
-        "duplicates": duplicate_total
-    }
+        new_total += 1
+
+        text = (
+            f"🆕 Новый тендер\n\n"
+            f"📌 {tender['site']}\n\n"
+            f"{tender['title']}\n\n"
+            f"{tender['url']}"
+        )
+
+        send_telegram(text)
+
+    else:
+
+        duplicate_total += 1
+
+message += (
+    f"Всего найдено: {found_total}\n"
+    f"Новых сохранено: {new_total}\n"
+    f"Дубликатов пропущено: {duplicate_total}"
+)
+
+send_telegram(message)
+
+return {
+    "status": "success",
+    "found_total": found_total,
+    "new_total": new_total,
+    "duplicates": duplicate_total
+}
 
 # =========================
 # ROOT
