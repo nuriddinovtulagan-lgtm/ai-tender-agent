@@ -157,8 +157,25 @@ def parse_uzex():
 # SAVE TO GOOGLE SHEETS
 # =========================
 
+def tender_exists(url):
+    try:
+        sheet = get_sheet()
+
+        urls = sheet.col_values(4)
+
+        return url in urls
+
+    except Exception as e:
+        print("CHECK ERROR:", e)
+        return False
+
+
 def save_to_sheet(site, title, url):
     try:
+
+        if tender_exists(url):
+            return False
+
         sheet = get_sheet()
 
         row = [
@@ -171,9 +188,11 @@ def save_to_sheet(site, title, url):
 
         sheet.append_row(row)
 
+        return True
+
     except Exception as e:
         print("GOOGLE SHEETS ERROR:", e)
-
+        return False
 # =========================
 # MAIN SCAN
 # =========================
