@@ -148,26 +148,75 @@ def parse_tenderweek():
     return tenders[:30]
 
 def parse_uzex():
-    url = "https://etender.uzex.uz/lots/1/0"
+    base_urls = [
+        "https://etender.uzex.uz/lots/1/0",
+        "https://etender.uzex.uz/"
+    ]
+
     headers = {"User-Agent": "Mozilla/5.0"}
 
-    r = requests.get(url, headers=headers, timeout=30)
-    soup = BeautifulSoup(r.text, "html.parser")
+    search_words = [
+        "перевозка",
+        "перевозка грузов",
+        "транспорт",
+        "транспортные услуги",
+        "доставка",
+        "логистика",
+        "экспедирование",
+        "склад",
+        "спецтехника"
+    ]
 
     tenders = []
+    seen_urls = set()
 
-    for card in soup.find_all("div"):
-        text = card.get_text(strip=True)
+    pages_to_scan = []
 
-        if len(text) > 40 and ("UZS" in text or "лот" in text.lower()):
-            tenders.append({
-                "site": "UZEX",
-                "title": text[:300],
-                "url": url
-            })
+    for base_url in base_urls:
+        pages_to_scan.append(base_url)
 
-    return tenders[:10]
+        for word in search_words:
+            pages_to_scan.append(f"{base_url}?search={word}")
+            pages_to_scan.append(f"{base_url}?q={word}")
+            pages_to_scan.append(f"{base_url}?keyword={word}")
 
+    for url in pages_to_scan:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for link in soup.find_all("a"):
+                title = link.get_text(strip=True)
+                href = link.get("href")
+
+                if not title or len(title) < 6:
+                    continue
+
+                if not href:
+                    continue
+
+                full_url = requests.compat.urljoin(url, href)
+
+                combined_text = f"{title} {full_url}"
+
+                if not is_logistics_tender(combined_text):
+                    continue
+
+                if full_url in seen_urls:
+                    continue
+
+                seen_urls.add(full_url)
+
+                tenders.append({
+                    "site": "UZEX",
+                    "title": title,
+                    "url": full_url
+                })
+
+        except Exception as e:
+            print("UZEX SEARCH ERROR:", e)
+
+    return tenders[:30]
 
 def tender_exists(url):
     try:
