@@ -12,6 +12,7 @@ app = FastAPI(title="AI Tender Agent")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
 KEYWORDS = [
     "услуга по перевозке грузов",
     "услуги по перевозке грузов",
@@ -39,10 +40,13 @@ KEYWORDS = [
     "погрузка",
     "разгрузка"
 ]
-def is_logistics_tender(title):
-    title = title.lower()
 
+
+def is_logistics_tender(title):
+    title = (title or "").lower()
     return any(word in title for word in KEYWORDS)
+
+
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -60,8 +64,7 @@ def get_sheet():
     )
 
     client = gspread.authorize(creds)
-    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
-    return sheet
+    return client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
 
 
 def send_telegram(text):
@@ -69,14 +72,9 @@ def send_telegram(text):
         print("Telegram variables missing")
         return
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
     requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": text
-        },
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": text},
         timeout=20
     )
 
@@ -99,7 +97,6 @@ def parse_tenderweek():
 
     tenders = []
     seen_urls = set()
-
     pages_to_scan = [base_url]
 
     for word in search_words:
@@ -143,82 +140,12 @@ def parse_tenderweek():
                 })
 
         except Exception as e:
-            print("TENDERWEEK SEARCH ERROR:", e)
+            print("TENDERWEEK ERROR:", e)
 
     return tenders[:30]
 
-def parse_uzex():
-    base_urls = [
-        "https://etender.uzex.uz/lots/1/0",
-        "https://etender.uzex.uz/"
-    ]
 
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    search_words = [
-        "перевозка",
-        "перевозка грузов",
-        "транспорт",
-        "транспортные услуги",
-        "доставка",
-        "логистика",
-        "экспедирование",
-        "склад",
-        "спецтехника"
-    ]
-
-    tenders = []
-    seen_urls = set()
-
-    pages_to_scan = []
-
-    for base_url in base_urls:
-        pages_to_scan.append(base_url)
-
-        for word in search_words:
-            pages_to_scan.append(f"{base_url}?search={word}")
-            pages_to_scan.append(f"{base_url}?q={word}")
-            pages_to_scan.append(f"{base_url}?keyword={word}")
-
-    for url in pages_to_scan:
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for link in soup.find_all("a"):
-                title = link.get_text(strip=True)
-                href = link.get("href")
-
-                if not title or len(title) < 6:
-                    continue
-
-                if not href:
-                    continue
-
-                full_url = requests.compat.urljoin(url, href)
-
-                combined_text = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined_text):
-                    continue
-
-                if full_url in seen_urls:
-                    continue
-
-                seen_urls.add(full_url)
-
-                tenders.append({
-                    "site": "UZEX",
-                    "title": title,
-                    "url": full_url
-                })
-
-        except Exception as e:
-            print("UZEX SEARCH ERROR:", e)
-
-    return tenders[:30]
- def parse_xt_xarid():
-
+def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
     headers = {"User-Agent": "Mozilla/5.0"}
 
@@ -236,7 +163,6 @@ def parse_uzex():
 
     tenders = []
     seen_urls = set()
-
     pages_to_scan = [base_url]
 
     for word in search_words:
@@ -277,9 +203,81 @@ def parse_uzex():
                 })
 
         except Exception as e:
-            print("XT-XARID SEARCH ERROR:", e)
+            print("XT-XARID ERROR:", e)
 
     return tenders[:30]
+
+
+def parse_uzex():
+    base_urls = [
+        "https://etender.uzex.uz/lots/1/0",
+        "https://etender.uzex.uz/"
+    ]
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    search_words = [
+        "перевозка",
+        "перевозка грузов",
+        "транспорт",
+        "транспортные услуги",
+        "доставка",
+        "логистика",
+        "экспедирование",
+        "склад",
+        "спецтехника"
+    ]
+
+    tenders = []
+    seen_urls = set()
+    pages_to_scan = []
+
+    for base_url in base_urls:
+        pages_to_scan.append(base_url)
+
+        for word in search_words:
+            pages_to_scan.append(f"{base_url}?search={word}")
+            pages_to_scan.append(f"{base_url}?q={word}")
+            pages_to_scan.append(f"{base_url}?keyword={word}")
+
+    for url in pages_to_scan:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for link in soup.find_all("a"):
+                title = link.get_text(strip=True)
+                href = link.get("href")
+
+                if not title or len(title) < 6:
+                    continue
+
+                if not href:
+                    continue
+
+                full_url = requests.compat.urljoin(url, href)
+                combined_text = f"{title} {full_url}"
+
+                if not is_logistics_tender(combined_text):
+                    continue
+
+                if full_url in seen_urls:
+                    continue
+
+                seen_urls.add(full_url)
+
+                tenders.append({
+                    "site": "UZEX",
+                    "title": title,
+                    "url": full_url
+                })
+
+        except Exception as e:
+            print("UZEX ERROR:", e)
+
+    return tenders[:30]
+
+
 def tender_exists(url):
     try:
         sheet = get_sheet()
@@ -315,9 +313,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {
-        "status": "AI Tender Agent is running"
-    }
+    return {"status": "AI Tender Agent is running"}
 
 
 @app.head("/")
@@ -354,6 +350,19 @@ def health():
     return result
 
 
+@app.get("/test_filter")
+def test_filter():
+    tests = [
+        "Услуга по перевозке грузов",
+        "Оказание транспортных услуг",
+        "Закупка бетона для АЭС",
+        "Поставка мебели",
+        "Транспортно-экспедиционные услуги"
+    ]
+
+    return {t: is_logistics_tender(t) for t in tests}
+
+
 @app.get("/scan")
 def scan():
     found_total = 0
@@ -380,16 +389,16 @@ def scan():
         print(e)
 
     try:
-    xt = parse_xt_xarid()
-    all_tenders.extend(xt)
-    message += f"XT-Xarid найдено: {len(xt)}\n"
-except Exception as e:
-    message += "XT-Xarid ERROR\n"
-    print(e)
+        uzex = parse_uzex()
+        all_tenders.extend(uzex)
+        message += f"UZEX найдено: {len(uzex)}\n"
+    except Exception as e:
+        message += "UZEX ERROR\n"
+        print(e)
 
     message += "\n"
 
-    for tender in all_tenders[:20]:
+    for tender in all_tenders[:60]:
         if not is_logistics_tender(tender["title"]):
             continue
 
@@ -405,13 +414,14 @@ except Exception as e:
             new_total += 1
 
             text = (
-                f"🆕 Новый тендер\n\n"
+                f"🆕 Новый логистический тендер\n\n"
                 f"📌 {tender['site']}\n\n"
                 f"{tender['title']}\n\n"
                 f"{tender['url']}"
             )
 
             send_telegram(text)
+
         else:
             duplicate_total += 1
 
@@ -429,20 +439,13 @@ except Exception as e:
         "new_total": new_total,
         "duplicates": duplicate_total
     }
-@app.get("/test_filter")
-def test_filter():
 
-    tests = [
-        "Услуга по перевозке грузов",
-        "Оказание транспортных услуг",
-        "Закупка бетона для АЭС",
-        "Поставка мебели",
-        "Транспортно-экспедиционные услуги"
-    ]
 
-    result = {}
+if __name__ == "__main__":
+    import uvicorn
 
-    for t in tests:
-        result[t] = is_logistics_tender(t)
-
-    return result
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=10000
+    )
