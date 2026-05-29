@@ -240,6 +240,9 @@ def scan():
 
 @app.get("/")
 def home():
+    @app.get("/health")
+def health():
+    return {"status": "ok", "message": "AI Tender Agent is working"}
     return {
         "status": "AI Tender Agent is running"
     }
