@@ -304,3 +304,20 @@ def scan():
         "new_total": new_total,
         "duplicates": duplicate_total
     }
+@app.get("/test_filter")
+def test_filter():
+
+    tests = [
+        "Услуга по перевозке грузов",
+        "Оказание транспортных услуг",
+        "Закупка бетона для АЭС",
+        "Поставка мебели",
+        "Транспортно-экспедиционные услуги"
+    ]
+
+    result = {}
+
+    for t in tests:
+        result[t] = is_logistics_tender(t)
+
+    return result
