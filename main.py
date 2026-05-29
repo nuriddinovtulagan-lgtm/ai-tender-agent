@@ -217,7 +217,69 @@ def parse_uzex():
             print("UZEX SEARCH ERROR:", e)
 
     return tenders[:30]
+ def parse_xt_xarid():
 
+    base_url = "https://xt-xarid.uz/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    search_words = [
+        "перевозка",
+        "перевозка грузов",
+        "транспорт",
+        "транспортные услуги",
+        "доставка",
+        "логистика",
+        "экспедирование",
+        "склад",
+        "спецтехника"
+    ]
+
+    tenders = []
+    seen_urls = set()
+
+    pages_to_scan = [base_url]
+
+    for word in search_words:
+        pages_to_scan.append(f"{base_url}?search={word}")
+        pages_to_scan.append(f"{base_url}?q={word}")
+        pages_to_scan.append(f"{base_url}?keyword={word}")
+
+    for url in pages_to_scan:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for link in soup.find_all("a"):
+                title = link.get_text(strip=True)
+                href = link.get("href")
+
+                if not title or len(title) < 6:
+                    continue
+
+                if not href:
+                    continue
+
+                full_url = requests.compat.urljoin(base_url, href)
+                combined_text = f"{title} {full_url}"
+
+                if not is_logistics_tender(combined_text):
+                    continue
+
+                if full_url in seen_urls:
+                    continue
+
+                seen_urls.add(full_url)
+
+                tenders.append({
+                    "site": "XT-Xarid",
+                    "title": title,
+                    "url": full_url
+                })
+
+        except Exception as e:
+            print("XT-XARID SEARCH ERROR:", e)
+
+    return tenders[:30]
 def tender_exists(url):
     try:
         sheet = get_sheet()
