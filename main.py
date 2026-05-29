@@ -240,16 +240,15 @@ def scan():
 
 @app.get("/")
 def home():
-    @app.get("/health")
-def health():
-    return {"status": "ok", "message": "AI Tender Agent is working"}
     return {
         "status": "AI Tender Agent is running"
     }
 
 @app.head("/")
 def head_home():
-    @app.get("/health")
+    return {}
+
+@app.get("/health")
 def health():
     result = {
         "status": "ok",
@@ -276,7 +275,6 @@ def health():
         result["status"] = "warning"
 
     return result
-    return {}
 
 # =========================
 # START
