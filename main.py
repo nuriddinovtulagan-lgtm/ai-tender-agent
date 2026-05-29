@@ -248,16 +248,17 @@ def scan():
 
     for tender in all_tenders[:20]:
 
-    if not is_logistics_tender(tender["title"]):
-        continue
+        if not is_logistics_tender(tender["title"]):
+            continue
 
-    found_total += 1
+        found_total += 1
 
-    saved = save_to_sheet(
-        tender["site"],
-        tender["title"],
-        tender["url"]
-    )
+        saved = save_to_sheet(
+            tender["site"],
+            tender["title"],
+            tender["url"]
+        )
+
         if saved:
             new_total += 1
 
@@ -272,7 +273,6 @@ def scan():
 
         else:
             duplicate_total += 1
-
     message += (
         f"Всего найдено: {found_total}\n"
         f"Новых сохранено: {new_total}\n"
