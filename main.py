@@ -12,7 +12,15 @@ app = FastAPI(title="AI Tender Agent")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-
+KEYWORDS = [
+    "грузоперевоз",
+    "логист",
+    "транспорт",
+    "доставка",
+    "экспед",
+    "спецтехника",
+    "склад"
+]
 
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
