@@ -258,7 +258,6 @@ def scan():
         tender["title"],
         tender["url"]
     )
-
         if saved:
             new_total += 1
 
