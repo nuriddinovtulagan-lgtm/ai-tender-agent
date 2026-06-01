@@ -14,55 +14,61 @@ CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 KEYWORDS = [
-    "услуга по перевозке грузов",
-    "услуги по перевозке грузов",
-    "оказание услуг по перевозке грузов",
-    "перевозка грузов",
-    "доставка грузов",
-    "грузоперевоз",
-    "груз",
-    "логистика",
-    "логист",
-    "транспорт",
-    "транспортные услуги",
-    "оказание транспортных услуг",
-    "автотранспорт",
-    "автомобильные перевозки",
-    "международные перевозки",
-    "экспедирование",
-    "экспедиторские услуги",
-    "транспортно-экспедиционные услуги",
-    "доставка",
-    "контейнер",
-    "склад",
-    "спецтехника",
-    "фура",
-    "погрузка",
-    "разгрузка"
+    "услуга по перевозке грузов", "услуги по перевозке грузов",
+    "оказание услуг по перевозке грузов", "перевозка грузов",
+    "перевозка товара", "перевозка товаров", "доставка грузов",
+    "доставка товара", "доставка товаров", "грузоперевоз",
+    "грузовые перевозки", "грузовой транспорт", "груз",
+    "логистика", "логистические услуги", "логист",
+    "транспорт", "транспортные услуги", "оказание транспортных услуг",
+    "автотранспорт", "автотранспортные услуги", "автомобильные перевозки",
+    "международные перевозки", "внутренние перевозки", "междугородние перевозки",
+    "железнодорожные перевозки", "жд перевозки", "ж/д перевозки",
+    "контейнерные перевозки", "контейнер", "мультимодальные перевозки",
+    "интермодальные перевозки", "экспедирование", "экспедиторские услуги",
+    "транспортно-экспедиционные услуги", "транспортная экспедиция",
+    "экспедитор", "доставка", "склад", "складские услуги",
+    "хранение груза", "погрузка", "разгрузка",
+    "погрузочно-разгрузочные работы", "погрузо-разгрузочные работы",
+    "спецтехника", "аренда спецтехники", "фура", "тягач",
+    "полуприцеп", "рефрижератор", "изотермический", "бортовой автомобиль",
+    "самосвал", "контейнеровоз", "таможенное оформление",
+    "таможенный брокер", "таможенные услуги", "транзит",
+    "freight", "freight forwarding", "cargo", "cargo transportation",
+    "transportation", "transport services", "logistics", "logistics services",
+    "delivery", "shipping", "forwarding", "warehouse", "customs clearance",
+    "yuk tashish", "yuklarni tashish", "transport xizmati",
+    "transport xizmatlari", "logistika", "yetkazib berish", "ombor",
+    "юк ташиш", "юкларни ташиш", "транспорт хизмати",
+    "транспорт хизматлари", "логистика", "етказиб бериш", "омбор",
+]
+
+SEARCH_WORDS = [
+    "перевозка", "перевозка грузов", "транспорт", "транспортные услуги",
+    "доставка", "логистика", "экспедирование", "склад", "спецтехника",
+    "контейнер", "таможенное оформление", "freight", "cargo", "logistics",
+    "yuk tashish", "transport xizmati", "logistika", "yetkazib berish",
 ]
 
 
 def is_logistics_tender(title):
     title = (title or "").lower()
-    return any(word in title for word in KEYWORDS)
+    return any(word.lower() in title for word in KEYWORDS)
 
 
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-
     if not raw_json:
         raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
 
     info = json.loads(raw_json)
-
     creds = Credentials.from_service_account_info(
         info,
         scopes=[
             "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
-
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
 
@@ -70,212 +76,106 @@ def get_sheet():
 def send_telegram(text):
     if not BOT_TOKEN or not CHAT_ID:
         print("Telegram variables missing")
-        return
+        return False
 
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text},
-        timeout=20
-    )
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": text[:3900]},
+            timeout=20,
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print("TELEGRAM ERROR:", e)
+        return False
+
+
+def collect_links(base_url, pages_to_scan, site_name, min_title_len=6, require_tender_in_url=False):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent/1.0)"}
+    tenders = []
+    seen_urls = set()
+
+    for url in pages_to_scan:
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            for link in soup.find_all("a"):
+                title = " ".join(link.get_text(" ", strip=True).split())
+                href = link.get("href")
+
+                if not title or len(title) < min_title_len or not href:
+                    continue
+
+                full_url = requests.compat.urljoin(base_url, href)
+                combined_text = f"{title} {full_url}"
+
+                if require_tender_in_url and "tender" not in full_url.lower():
+                    if not is_logistics_tender(combined_text):
+                        continue
+
+                if not is_logistics_tender(combined_text):
+                    continue
+
+                if full_url in seen_urls:
+                    continue
+
+                seen_urls.add(full_url)
+                tenders.append({"site": site_name, "title": title, "url": full_url})
+
+        except Exception as e:
+            print(f"{site_name.upper()} ERROR:", e)
+
+    return tenders
 
 
 def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    search_words = [
-        "перевозка",
-        "перевозка грузов",
-        "транспорт",
-        "транспортные услуги",
-        "доставка",
-        "логистика",
-        "экспедирование",
-        "склад",
-        "спецтехника"
-    ]
-
-    tenders = []
-    seen_urls = set()
     pages_to_scan = [base_url]
 
-    for word in search_words:
-        pages_to_scan.append(f"{base_url}?search={word}")
-        pages_to_scan.append(f"{base_url}?q={word}")
+    for word in SEARCH_WORDS:
+        pages_to_scan.extend([
+            f"{base_url}?search={word}",
+            f"{base_url}?q={word}",
+            f"{base_url}?keyword={word}",
+        ])
 
-    for url in pages_to_scan:
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for link in soup.find_all("a"):
-                title = link.get_text(strip=True)
-                href = link.get("href")
-
-                if not title or len(title) < 10:
-                    continue
-
-                if not href:
-                    continue
-
-                full_url = requests.compat.urljoin(base_url, href)
-
-                if "tender" not in full_url.lower():
-                    continue
-
-                if full_url in seen_urls:
-                    continue
-
-                combined_text = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined_text):
-                    continue
-
-                seen_urls.add(full_url)
-
-                tenders.append({
-                    "site": "Tenderweek",
-                    "title": title,
-                    "url": full_url
-                })
-
-        except Exception as e:
-            print("TENDERWEEK ERROR:", e)
-
-    return tenders[:30]
+    return collect_links(base_url, pages_to_scan, "Tenderweek", min_title_len=10, require_tender_in_url=True)
 
 
 def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    search_words = [
-        "перевозка",
-        "перевозка грузов",
-        "транспорт",
-        "транспортные услуги",
-        "доставка",
-        "логистика",
-        "экспедирование",
-        "склад",
-        "спецтехника"
-    ]
-
-    tenders = []
-    seen_urls = set()
     pages_to_scan = [base_url]
 
-    for word in search_words:
-        pages_to_scan.append(f"{base_url}?search={word}")
-        pages_to_scan.append(f"{base_url}?q={word}")
-        pages_to_scan.append(f"{base_url}?keyword={word}")
+    for word in SEARCH_WORDS:
+        pages_to_scan.extend([
+            f"{base_url}?search={word}",
+            f"{base_url}?q={word}",
+            f"{base_url}?keyword={word}",
+        ])
 
-    for url in pages_to_scan:
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for link in soup.find_all("a"):
-                title = link.get_text(strip=True)
-                href = link.get("href")
-
-                if not title or len(title) < 6:
-                    continue
-
-                if not href:
-                    continue
-
-                full_url = requests.compat.urljoin(base_url, href)
-                combined_text = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined_text):
-                    continue
-
-                if full_url in seen_urls:
-                    continue
-
-                seen_urls.add(full_url)
-
-                tenders.append({
-                    "site": "XT-Xarid",
-                    "title": title,
-                    "url": full_url
-                })
-
-        except Exception as e:
-            print("XT-XARID ERROR:", e)
-
-    return tenders[:30]
+    return collect_links(base_url, pages_to_scan, "XT-Xarid", min_title_len=6)
 
 
 def parse_uzex():
     base_urls = [
         "https://etender.uzex.uz/lots/1/0",
-        "https://etender.uzex.uz/"
+        "https://etender.uzex.uz/",
+        "https://xarid.uzex.uz/",
     ]
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    search_words = [
-        "перевозка",
-        "перевозка грузов",
-        "транспорт",
-        "транспортные услуги",
-        "доставка",
-        "логистика",
-        "экспедирование",
-        "склад",
-        "спецтехника"
-    ]
-
-    tenders = []
-    seen_urls = set()
     pages_to_scan = []
 
     for base_url in base_urls:
         pages_to_scan.append(base_url)
+        for word in SEARCH_WORDS:
+            pages_to_scan.extend([
+                f"{base_url}?search={word}",
+                f"{base_url}?q={word}",
+                f"{base_url}?keyword={word}",
+            ])
 
-        for word in search_words:
-            pages_to_scan.append(f"{base_url}?search={word}")
-            pages_to_scan.append(f"{base_url}?q={word}")
-            pages_to_scan.append(f"{base_url}?keyword={word}")
-
-    for url in pages_to_scan:
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for link in soup.find_all("a"):
-                title = link.get_text(strip=True)
-                href = link.get("href")
-
-                if not title or len(title) < 6:
-                    continue
-
-                if not href:
-                    continue
-
-                full_url = requests.compat.urljoin(url, href)
-                combined_text = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined_text):
-                    continue
-
-                if full_url in seen_urls:
-                    continue
-
-                seen_urls.add(full_url)
-
-                tenders.append({
-                    "site": "UZEX",
-                    "title": title,
-                    "url": full_url
-                })
-
-        except Exception as e:
-            print("UZEX ERROR:", e)
-
-    return tenders[:30]
+    return collect_links("https://etender.uzex.uz/", pages_to_scan, "UZEX", min_title_len=6)
 
 
 def tender_exists(url):
@@ -294,15 +194,13 @@ def save_to_sheet(site, title, url):
             return False
 
         sheet = get_sheet()
-
         row = [
             datetime.now().strftime("%d.%m.%Y %H:%M"),
             site,
             title,
             url,
-            "Новый"
+            "Новый",
         ]
-
         sheet.append_row(row)
         return True
 
@@ -323,12 +221,7 @@ def head_home():
 
 @app.get("/health")
 def health():
-    result = {
-        "status": "ok",
-        "telegram": False,
-        "google_sheets": False,
-        "errors": []
-    }
+    result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
 
     try:
         tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
@@ -357,9 +250,11 @@ def test_filter():
         "Оказание транспортных услуг",
         "Закупка бетона для АЭС",
         "Поставка мебели",
-        "Транспортно-экспедиционные услуги"
+        "Транспортно-экспедиционные услуги",
+        "Yuk tashish xizmatlari",
+        "Cargo transportation services",
+        "Таможенное оформление и экспедирование",
     ]
-
     return {t: is_logistics_tender(t) for t in tests}
 
 
@@ -368,60 +263,51 @@ def scan():
     found_total = 0
     new_total = 0
     duplicate_total = 0
+    all_tenders = []
+    seen_urls = set()
 
     message = "📊 AI Auto Scan завершён\n\n"
-    all_tenders = []
 
-    try:
-        tw = parse_tenderweek()
-        all_tenders.extend(tw)
-        message += f"Tenderweek найдено: {len(tw)}\n"
-    except Exception as e:
-        message += "Tenderweek ERROR\n"
-        print(e)
+    sources = [
+        ("Tenderweek", parse_tenderweek),
+        ("XT-Xarid", parse_xt_xarid),
+        ("UZEX", parse_uzex),
+    ]
 
-    try:
-        xt = parse_xt_xarid()
-        all_tenders.extend(xt)
-        message += f"XT-Xarid найдено: {len(xt)}\n"
-    except Exception as e:
-        message += "XT-Xarid ERROR\n"
-        print(e)
-
-    try:
-        uzex = parse_uzex()
-        all_tenders.extend(uzex)
-        message += f"UZEX найдено: {len(uzex)}\n"
-    except Exception as e:
-        message += "UZEX ERROR\n"
-        print(e)
+    for source_name, parser in sources:
+        try:
+            result = parser()
+            all_tenders.extend(result)
+            message += f"{source_name} найдено: {len(result)}\n"
+        except Exception as e:
+            message += f"{source_name} ERROR\n"
+            print(f"{source_name} ERROR:", e)
 
     message += "\n"
 
-    for tender in all_tenders[:60]:
-        if not is_logistics_tender(tender["title"]):
+    for tender in all_tenders:
+        url = tender.get("url")
+        title = tender.get("title")
+
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        if not is_logistics_tender(f"{title} {url}"):
             continue
 
         found_total += 1
-
-        saved = save_to_sheet(
-            tender["site"],
-            tender["title"],
-            tender["url"]
-        )
+        saved = save_to_sheet(tender["site"], title, url)
 
         if saved:
             new_total += 1
-
             text = (
                 f"🆕 Новый логистический тендер\n\n"
                 f"📌 {tender['site']}\n\n"
-                f"{tender['title']}\n\n"
-                f"{tender['url']}"
+                f"{title}\n\n"
+                f"{url}"
             )
-
             send_telegram(text)
-
         else:
             duplicate_total += 1
 
@@ -430,22 +316,16 @@ def scan():
         f"Новых сохранено: {new_total}\n"
         f"Дубликатов пропущено: {duplicate_total}"
     )
-
     send_telegram(message)
 
     return {
         "status": "success",
         "found_total": found_total,
         "new_total": new_total,
-        "duplicates": duplicate_total
+        "duplicates": duplicate_total,
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=10000
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
