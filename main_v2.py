@@ -7,35 +7,55 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent V3")
+app = FastAPI(title="AI Tender Agent Cargo Strict V5")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-KEYWORDS = [
-    "перевоз", "транспорт", "достав", "груз", "логист",
-    "экспед", "контейнер", "склад", "погруз", "разгруз",
-    "тамож", "фура", "тягач", "рефриж",
-    "cargo", "freight", "transport", "logistic", "delivery",
-    "shipping", "forwarding", "warehouse",
-    "yuk", "tashish", "xizmat", "logistika",
-    "юк", "ташиш", "транспорт", "хизмати",
-]
-
 SEARCH_WORDS = [
     "перевозка грузов",
-    "транспортные услуги",
-    "логистика",
-    "экспедирование",
+    "услуги по перевозке грузов",
+    "оказание услуг по перевозке грузов",
     "доставка грузов",
-    "контейнерные перевозки",
-    "таможенное оформление",
-    "cargo",
-    "freight",
-    "logistics",
+    "грузоперевозки",
+    "транспортно-экспедиционные услуги",
+    "экспедиторские услуги",
+    "логистические услуги",
+    "cargo transportation",
+    "freight forwarding",
     "yuk tashish",
     "transport xizmati",
+]
+
+REQUIRED_TITLE_PHRASES = [
+    "перевозка грузов",
+    "перевозке грузов",
+    "перевозку грузов",
+    "перевозки грузов",
+    "услуги по перевозке грузов",
+    "оказание услуг по перевозке грузов",
+    "оказание услуги по перевозке грузов",
+    "доставка грузов",
+    "доставке грузов",
+    "доставку грузов",
+    "грузоперевоз",
+    "грузовые перевозки",
+    "транспортно-экспедиционные услуги",
+    "экспедиторские услуги",
+    "логистические услуги",
+    "контейнерные перевозки",
+    "международные перевозки грузов",
+    "автомобильные перевозки грузов",
+    "cargo transportation",
+    "freight forwarding",
+    "transportation of goods",
+    "delivery of goods",
+    "logistics services",
+    "yuk tashish",
+    "yuklarni tashish",
+    "transport xizmati",
+    "transport xizmatlari",
 ]
 
 BAD_URL_PARTS = [
@@ -45,7 +65,7 @@ BAD_URL_PARTS = [
     "english", "/en/", "news", "blog", "faq", "help",
     "contact", "about", "rules", "terms", "privacy",
     "advertising", "banner", "calendar", "archive",
-    "javascript:", "mailto:", "tel:",
+    "feedback", "javascript:", "mailto:", "tel:",
 ]
 
 BAD_TITLE_WORDS = [
@@ -54,13 +74,17 @@ BAD_TITLE_WORDS = [
     "english", "русский", "ўзбекча",
     "приглашение", "мои заявки", "моих заявок",
     "вопрос", "ответ", "помощь", "контакты",
-    "о сайте", "правила", "дата публикации",
-    "личный кабинет", "кабинет", "профиль",
+    "написать нам письмо", "о сайте", "правила",
+    "дата публикации", "личный кабинет", "кабинет", "профиль",
 ]
 
-TENDER_URL_HINTS = [
-    "tender", "lot", "lots", "auction", "procurement",
-    "purchase", "zakup", "xarid", "etender", "tender-",
+BLOCKED_NON_CARGO = [
+    "арматур", "бетон", "цемент", "лаборатор", "оборудован",
+    "мебел", "пленк", "стретч", "консультац", "технадзор",
+    "техническому надзору", "модернизац", "строительств",
+    "ремонт", "канцеляр", "компьютер", "принтер",
+    "медицин", "питание", "продукт", "одежд", "обув",
+    "уголь", "газ", "топливо", "дизель", "электро",
 ]
 
 
@@ -68,9 +92,13 @@ def clean_text(text):
     return " ".join((text or "").replace("\n", " ").replace("\t", " ").split())
 
 
-def is_logistics_tender(text):
-    text = (text or "").lower()
-    return any(word.lower() in text for word in KEYWORDS)
+def is_cargo_title(title):
+    title = clean_text(title).lower()
+
+    if any(bad in title for bad in BLOCKED_NON_CARGO):
+        return False
+
+    return any(phrase in title for phrase in REQUIRED_TITLE_PHRASES)
 
 
 def looks_like_bad_url(url):
@@ -79,29 +107,24 @@ def looks_like_bad_url(url):
 
 
 def looks_like_bad_title(title):
-    title = (title or "").lower().strip()
+    title = clean_text(title).lower()
 
-    if len(title) < 10:
-        return True
-
-    if any(word in title for word in BAD_TITLE_WORDS):
-        return True
-
-    if title.isdigit():
+    if len(title) < 12:
         return True
 
     if len(title.split()) < 2:
         return True
 
+    if title.isdigit():
+        return True
+
+    if any(word in title for word in BAD_TITLE_WORDS):
+        return True
+
     return False
 
 
-def looks_like_tender_url(url):
-    url = (url or "").lower()
-    return any(hint in url for hint in TENDER_URL_HINTS)
-
-
-def is_real_tender_candidate(title, url):
+def is_real_cargo_tender(title, url):
     title = clean_text(title)
 
     if not title or not url:
@@ -113,18 +136,13 @@ def is_real_tender_candidate(title, url):
     if looks_like_bad_title(title):
         return False
 
-    if len(title) < 10:
+    # САМОЕ ВАЖНОЕ:
+    # Проверяем только название лота, не URL.
+    # Ссылка tender-35910 сама по себе больше не проходит.
+    if not is_cargo_title(title):
         return False
 
-    combined = f"{title} {url}".lower()
-
-    if is_logistics_tender(combined):
-        return True
-
-    if looks_like_tender_url(url) and len(title) >= 18:
-        return True
-
-    return False
+    return True
 
 
 def get_sheet():
@@ -153,7 +171,7 @@ def send_telegram(text):
         response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text[:3900]},
-            timeout=20,
+            timeout=15,
         )
         return response.status_code == 200
     except Exception as e:
@@ -161,29 +179,26 @@ def send_telegram(text):
         return False
 
 
-def collect_links(base_url, pages_to_scan, site_name, min_title_len=10):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-V3/3.0)"
-    }
+def collect_links(base_url, pages_to_scan, site_name):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-Strict/5.0)"}
 
     tenders = []
     seen_urls = set()
+    total_links = 0
 
     for page_url in pages_to_scan:
         try:
-            r = requests.get(page_url, headers=headers, timeout=12)
+            r = requests.get(page_url, headers=headers, timeout=5)
             r.raise_for_status()
-
             soup = BeautifulSoup(r.text, "html.parser")
 
             for link in soup.find_all("a"):
+                total_links += 1
+
                 title = clean_text(link.get_text(" ", strip=True))
                 href = link.get("href")
 
                 if not title or not href:
-                    continue
-
-                if len(title) < min_title_len:
                     continue
 
                 full_url = requests.compat.urljoin(base_url, href)
@@ -191,7 +206,7 @@ def collect_links(base_url, pages_to_scan, site_name, min_title_len=10):
                 if full_url in seen_urls:
                     continue
 
-                if not is_real_tender_candidate(title, full_url):
+                if not is_real_cargo_tender(title, full_url):
                     continue
 
                 seen_urls.add(full_url)
@@ -205,6 +220,7 @@ def collect_links(base_url, pages_to_scan, site_name, min_title_len=10):
         except Exception as e:
             print(f"{site_name.upper()} ERROR:", e)
 
+    print(f"{site_name}: total_links={total_links}, strict_cargo_tenders={len(tenders)}")
     return tenders
 
 
@@ -255,9 +271,7 @@ def parse_uzex():
                 f"{base_url}?keyword={word}",
             ])
 
-        all_tenders.extend(
-            collect_links(base_url, pages_to_scan, "UZEX")
-        )
+        all_tenders.extend(collect_links(base_url, pages_to_scan, "UZEX"))
 
     return all_tenders
 
@@ -265,8 +279,9 @@ def parse_uzex():
 def tender_exists(url):
     try:
         sheet = get_sheet()
-        urls = sheet.col_values(4)
-        return url in urls
+        urls_col_c = sheet.col_values(3)
+        urls_col_d = sheet.col_values(4)
+        return url in urls_col_c or url in urls_col_d
     except Exception as e:
         print("CHECK ERROR:", e)
         return False
@@ -281,10 +296,13 @@ def save_to_sheet(site, title, url):
 
         row = [
             datetime.now().strftime("%d.%m.%Y %H:%M"),
-            site,
-            title,
+            "AI Agent",
             url,
+            site,
             "Новый",
+            "Высокий",
+            "Лот связан с перевозкой грузов / транспортно-экспедиционными услугами",
+            title,
         ]
 
         sheet.append_row(row)
@@ -297,7 +315,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent V3 is running"}
+    return {"status": "AI Tender Agent Cargo Strict V5 is running"}
 
 
 @app.head("/")
@@ -337,33 +355,37 @@ def health():
 @app.get("/test_filter")
 def test_filter():
     return {
-        "Услуга по перевозке грузов": is_real_tender_candidate(
+        "Услуга по перевозке грузов": is_real_cargo_tender(
             "Услуга по перевозке грузов",
             "https://etender.uzex.uz/lot/123",
         ),
-        "Оказание транспортных услуг": is_real_tender_candidate(
+        "Оказание транспортных услуг": is_real_cargo_tender(
             "Оказание транспортных услуг",
             "https://xarid.uzex.uz/tender/456",
         ),
-        "Регистрация": is_real_tender_candidate(
-            "Регистрация",
-            "https://www.tenderweek.com/register",
-        ),
-        "Стать заказчиком": is_real_tender_candidate(
-            "Стать заказчиком",
-            "https://www.tenderweek.com/add.html",
-        ),
-        "English": is_real_tender_candidate(
-            "English",
-            "https://www.tenderweek.com/en/",
-        ),
-        "Закупка бетона для АЭС": is_real_tender_candidate(
-            "Закупка бетона для АЭС",
-            "https://etender.uzex.uz/lot/789",
-        ),
-        "Транспортно-экспедиционные услуги": is_real_tender_candidate(
+        "Транспортно-экспедиционные услуги": is_real_cargo_tender(
             "Транспортно-экспедиционные услуги",
             "https://etender.uzex.uz/lot/999",
+        ),
+        "Лабораторное оборудование": is_real_cargo_tender(
+            "Лабораторное оборудование",
+            "https://www.tenderweek.com/tender-35921",
+        ),
+        "Консультационные услуги по техническому надзору": is_real_cargo_tender(
+            "Оказание консультационных услуг по техническому надзору",
+            "https://www.tenderweek.com/tender-35920",
+        ),
+        "Закупка арматуры для АЭС": is_real_cargo_tender(
+            "Закупка арматуры для АЭС",
+            "https://www.tenderweek.com/tender-35911",
+        ),
+        "Поставка стретч-худ пленки": is_real_cargo_tender(
+            "Поставка стретч-худ пленки",
+            "https://www.tenderweek.com/tender-35910",
+        ),
+        "Написать нам письмо": is_real_cargo_tender(
+            "Написать нам письмо",
+            "https://www.tenderweek.com/feedback",
         ),
     }
 
@@ -376,7 +398,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent V3 Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo Strict V5 Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -388,7 +410,7 @@ def scan():
         try:
             result = parser()
             all_tenders.extend(result)
-            message += f"{source_name}: найдено после фильтра {len(result)}\n"
+            message += f"{source_name}: лотов по перевозке грузов {len(result)}\n"
         except Exception as e:
             message += f"{source_name}: ERROR\n"
             print(f"{source_name} ERROR:", e)
@@ -404,7 +426,7 @@ def scan():
 
         seen_urls.add(url)
 
-        if not is_real_tender_candidate(title, url):
+        if not is_real_cargo_tender(title, url):
             continue
 
         found_total += 1
@@ -413,7 +435,7 @@ def scan():
         if saved:
             new_total += 1
             text = (
-                f"🆕 Новый тендер\n\n"
+                f"🚚 Новый лот по перевозке грузов\n\n"
                 f"📌 Источник: {tender['site']}\n\n"
                 f"📋 {title}\n\n"
                 f"🔗 {url}"
@@ -423,7 +445,7 @@ def scan():
             duplicate_total += 1
 
     message += (
-        f"Всего подходящих тендеров: {found_total}\n"
+        f"Всего лотов по перевозке грузов: {found_total}\n"
         f"Новых сохранено: {new_total}\n"
         f"Дубликатов пропущено: {duplicate_total}"
     )
@@ -432,7 +454,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "v3",
+        "version": "cargo_strict_v5",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
