@@ -117,7 +117,6 @@ def looks_like_tender_url(url):
 
 def is_real_tender_candidate(title, url):
     title = clean_text(title)
-    combined = f"{title} {url}".lower()
 
     if not title or not url:
         return False
@@ -128,14 +127,17 @@ def is_real_tender_candidate(title, url):
     if looks_like_bad_title(title):
         return False
 
+    combined = f"{title} {url}".lower()
+
+    # должен быть логистический тендер
     if not is_logistics_tender(combined):
         return False
 
-    if not looks_like_tender_url(url) and len(title) < 25:
+    # минимальная длина названия
+    if len(title) < 10:
         return False
 
     return True
-
 
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
