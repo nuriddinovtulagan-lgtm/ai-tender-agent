@@ -139,7 +139,7 @@ def fetch_lot_page_title(url):
     headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V6/6.0)"}
 
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=2)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -235,7 +235,7 @@ def collect_links(base_url, pages_to_scan, site_name):
 
     for page_url in pages_to_scan:
         try:
-            response = requests.get(page_url, headers=headers, timeout=5)
+            response = requests.get(page_url, headers=headers, timeout=3)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
 
