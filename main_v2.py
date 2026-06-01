@@ -7,58 +7,44 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent V2")
+app = FastAPI(title="AI Tender Agent V3")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 KEYWORDS = [
-    "услуга по перевозке грузов", "услуги по перевозке грузов",
-    "оказание услуг по перевозке грузов", "перевозка грузов",
-    "перевозка товара", "перевозка товаров", "доставка грузов",
-    "доставка товара", "доставка товаров", "грузоперевоз",
-    "грузовые перевозки", "грузовой транспорт", "логистика",
-    "логистические услуги", "транспортные услуги",
-    "оказание транспортных услуг", "автотранспортные услуги",
-    "автомобильные перевозки", "международные перевозки",
-    "внутренние перевозки", "междугородние перевозки",
-    "железнодорожные перевозки", "жд перевозки", "ж/д перевозки",
-    "контейнерные перевозки", "контейнер", "мультимодальные перевозки",
-    "экспедирование", "экспедиторские услуги",
-    "транспортно-экспедиционные услуги", "транспортная экспедиция",
-    "складские услуги", "хранение груза", "погрузка", "разгрузка",
-    "погрузочно-разгрузочные работы", "спецтехника",
-    "аренда спецтехники", "фура", "тягач", "полуприцеп",
-    "рефрижератор", "самосвал", "контейнеровоз",
-    "таможенное оформление", "таможенный брокер", "таможенные услуги",
-    "freight", "freight forwarding", "cargo", "cargo transportation",
-    "transportation", "transport services", "logistics",
-    "logistics services", "delivery", "shipping", "forwarding",
-    "warehouse", "customs clearance",
-    "yuk tashish", "yuklarni tashish", "transport xizmati",
-    "transport xizmatlari", "logistika", "yetkazib berish",
-    "юк ташиш", "юкларни ташиш", "транспорт хизмати",
-    "транспорт хизматлари", "логистика", "етказиб бериш",
+    "перевоз", "транспорт", "достав", "груз", "логист",
+    "экспед", "контейнер", "склад", "погруз", "разгруз",
+    "тамож", "фура", "тягач", "рефриж",
+    "cargo", "freight", "transport", "logistic", "delivery",
+    "shipping", "forwarding", "warehouse",
+    "yuk", "tashish", "xizmat", "logistika",
+    "юк", "ташиш", "транспорт", "хизмати",
 ]
 
 SEARCH_WORDS = [
-    "перевозка грузов", "транспортные услуги", "логистика",
-    "экспедирование", "доставка грузов", "контейнерные перевозки",
-    "таможенное оформление", "погрузочно-разгрузочные работы",
-    "cargo transportation", "logistics services", "yuk tashish",
-    "transport xizmati", "logistika",
+    "перевозка грузов",
+    "транспортные услуги",
+    "логистика",
+    "экспедирование",
+    "доставка грузов",
+    "контейнерные перевозки",
+    "таможенное оформление",
+    "cargo",
+    "freight",
+    "logistics",
+    "yuk tashish",
+    "transport xizmati",
 ]
 
 BAD_URL_PARTS = [
     "register", "login", "logout", "signin", "signup",
     "cabinet", "profile", "account", "user", "my",
-    "add.html", "/add", "create", "new",
-    "invited", "invitation",
-    "english", "/en/", "/ru/", "/uz/",
-    "news", "blog", "faq", "help", "contact", "about",
-    "rules", "terms", "privacy", "advertising",
-    "banner", "calendar", "archive",
+    "add.html", "/add", "create", "invited", "invitation",
+    "english", "/en/", "news", "blog", "faq", "help",
+    "contact", "about", "rules", "terms", "privacy",
+    "advertising", "banner", "calendar", "archive",
     "javascript:", "mailto:", "tel:",
 ]
 
@@ -84,17 +70,7 @@ def clean_text(text):
 
 def is_logistics_tender(text):
     text = (text or "").lower()
-
-    logistics_words = [
-        "перевоз", "транспорт", "достав", "груз",
-        "логист", "экспед", "контейнер", "склад",
-        "погруз", "разгруз", "тамож", "фура",
-        "тягач", "рефриж", "cargo", "freight",
-        "transport", "logistic", "delivery",
-        "yuk", "tashish", "xizmat"
-    ]
-
-    return any(word in text for word in logistics_words)
+    return any(word.lower() in text for word in KEYWORDS)
 
 
 def looks_like_bad_url(url):
@@ -105,7 +81,7 @@ def looks_like_bad_url(url):
 def looks_like_bad_title(title):
     title = (title or "").lower().strip()
 
-    if len(title) < 12:
+    if len(title) < 10:
         return True
 
     if any(word in title for word in BAD_TITLE_WORDS):
@@ -137,17 +113,19 @@ def is_real_tender_candidate(title, url):
     if looks_like_bad_title(title):
         return False
 
-    combined = f"{title} {url}".lower()
-
-    # должен быть логистический тендер
-    if not is_logistics_tender(combined):
-        return False
-
-    # минимальная длина названия
     if len(title) < 10:
         return False
 
-    return True
+    combined = f"{title} {url}".lower()
+
+    if is_logistics_tender(combined):
+        return True
+
+    if looks_like_tender_url(url) and len(title) >= 18:
+        return True
+
+    return False
+
 
 def get_sheet():
     raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -183,15 +161,19 @@ def send_telegram(text):
         return False
 
 
-def collect_links(base_url, pages_to_scan, site_name, min_title_len=12):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-V2/2.0)"}
+def collect_links(base_url, pages_to_scan, site_name, min_title_len=10):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-V3/3.0)"
+    }
+
     tenders = []
     seen_urls = set()
 
     for page_url in pages_to_scan:
         try:
-            r = requests.get(page_url, headers=headers, timeout=30)
+            r = requests.get(page_url, headers=headers, timeout=12)
             r.raise_for_status()
+
             soup = BeautifulSoup(r.text, "html.parser")
 
             for link in soup.find_all("a"):
@@ -213,6 +195,7 @@ def collect_links(base_url, pages_to_scan, site_name, min_title_len=12):
                     continue
 
                 seen_urls.add(full_url)
+
                 tenders.append({
                     "site": site_name,
                     "title": title,
@@ -236,7 +219,7 @@ def parse_tenderweek():
             f"{base_url}?keyword={word}",
         ])
 
-    return collect_links(base_url, pages_to_scan, "Tenderweek", min_title_len=12)
+    return collect_links(base_url, pages_to_scan, "Tenderweek")
 
 
 def parse_xt_xarid():
@@ -250,7 +233,7 @@ def parse_xt_xarid():
             f"{base_url}?keyword={word}",
         ])
 
-    return collect_links(base_url, pages_to_scan, "XT-Xarid", min_title_len=12)
+    return collect_links(base_url, pages_to_scan, "XT-Xarid")
 
 
 def parse_uzex():
@@ -273,7 +256,7 @@ def parse_uzex():
             ])
 
         all_tenders.extend(
-            collect_links(base_url, pages_to_scan, "UZEX", min_title_len=12)
+            collect_links(base_url, pages_to_scan, "UZEX")
         )
 
     return all_tenders
@@ -295,6 +278,7 @@ def save_to_sheet(site, title, url):
             return False
 
         sheet = get_sheet()
+
         row = [
             datetime.now().strftime("%d.%m.%Y %H:%M"),
             site,
@@ -302,6 +286,7 @@ def save_to_sheet(site, title, url):
             url,
             "Новый",
         ]
+
         sheet.append_row(row)
         return True
 
@@ -312,7 +297,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent V2 is ready"}
+    return {"status": "AI Tender Agent V3 is running"}
 
 
 @app.head("/")
@@ -351,7 +336,7 @@ def health():
 
 @app.get("/test_filter")
 def test_filter():
-    tests = {
+    return {
         "Услуга по перевозке грузов": is_real_tender_candidate(
             "Услуга по перевозке грузов",
             "https://etender.uzex.uz/lot/123",
@@ -382,8 +367,6 @@ def test_filter():
         ),
     }
 
-    return tests
-
 
 @app.get("/scan")
 def scan():
@@ -393,7 +376,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent V2 Scan завершён\n\n"
+    message = "📊 AI Tender Agent V3 Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -430,7 +413,7 @@ def scan():
         if saved:
             new_total += 1
             text = (
-                f"🆕 Новый логистический тендер\n\n"
+                f"🆕 Новый тендер\n\n"
                 f"📌 Источник: {tender['site']}\n\n"
                 f"📋 {title}\n\n"
                 f"🔗 {url}"
@@ -440,7 +423,7 @@ def scan():
             duplicate_total += 1
 
     message += (
-        f"Всего реальных логистических тендеров: {found_total}\n"
+        f"Всего подходящих тендеров: {found_total}\n"
         f"Новых сохранено: {new_total}\n"
         f"Дубликатов пропущено: {duplicate_total}"
     )
@@ -449,7 +432,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "v2",
+        "version": "v3",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
@@ -458,6 +441,7 @@ def scan():
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         app,
         host="0.0.0.0",
