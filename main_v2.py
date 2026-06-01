@@ -427,7 +427,14 @@ def scan():
             continue
 
         found_total += 1
+
+        print("=" * 50)
+        print("FOUND CARGO:", title)
+        print("URL:", url)
+        print("=" * 50)
+
         saved = save_to_sheet(tender["site"], title, url)
+        
 
         if saved:
             new_total += 1
