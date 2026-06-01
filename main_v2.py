@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo Strict V5")
+app = FastAPI(title="AI Tender Agent Cargo Strict V6")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -19,16 +19,19 @@ SEARCH_WORDS = [
     "оказание услуг по перевозке грузов",
     "доставка грузов",
     "грузоперевозки",
+    "транспортные услуги",
+    "оказание транспортных услуг",
     "транспортно-экспедиционные услуги",
     "экспедиторские услуги",
     "логистические услуги",
     "cargo transportation",
     "freight forwarding",
+    "logistics services",
     "yuk tashish",
     "transport xizmati",
 ]
 
-REQUIRED_TITLE_PHRASES = [
+REQUIRED_PHRASES = [
     "перевозка грузов",
     "перевозке грузов",
     "перевозку грузов",
@@ -41,6 +44,12 @@ REQUIRED_TITLE_PHRASES = [
     "доставку грузов",
     "грузоперевоз",
     "грузовые перевозки",
+    "транспортные услуги",
+    "оказание транспортных услуг",
+    "услуги автотранспорта",
+    "автотранспортные услуги",
+    "услуги грузового транспорта",
+    "грузовой транспорт",
     "транспортно-экспедиционные услуги",
     "экспедиторские услуги",
     "логистические услуги",
@@ -56,12 +65,6 @@ REQUIRED_TITLE_PHRASES = [
     "yuklarni tashish",
     "transport xizmati",
     "transport xizmatlari",
-    "оказание транспортных услуг",
-    "транспортные услуги",
-    "услуги автотранспорта",
-    "автотранспортные услуги",
-    "услуги грузового транспорта",
-    "грузовой транспорт",
 ]
 
 BAD_URL_PARTS = [
@@ -91,6 +94,7 @@ BLOCKED_NON_CARGO = [
     "ремонт", "канцеляр", "компьютер", "принтер",
     "медицин", "питание", "продукт", "одежд", "обув",
     "уголь", "газ", "топливо", "дизель", "электро",
+    "юридическ", "аудит", "страхован", "охрана",
 ]
 
 
@@ -98,13 +102,14 @@ def clean_text(text):
     return " ".join((text or "").replace("\n", " ").replace("\t", " ").split())
 
 
-def is_cargo_title(title):
-    title = clean_text(title).lower()
+def contains_required_phrase(text):
+    text = clean_text(text).lower()
+    return any(phrase in text for phrase in REQUIRED_PHRASES)
 
-    if any(bad in title for bad in BLOCKED_NON_CARGO):
-        return False
 
-    return any(phrase in title for phrase in REQUIRED_TITLE_PHRASES)
+def contains_blocked_non_cargo(text):
+    text = clean_text(text).lower()
+    return any(word in text for word in BLOCKED_NON_CARGO)
 
 
 def looks_like_bad_url(url):
@@ -130,8 +135,41 @@ def looks_like_bad_title(title):
     return False
 
 
-def is_real_cargo_tender(title, url):
+def fetch_lot_page_title(url):
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V6/6.0)"}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        candidates = []
+
+        if soup.title:
+            candidates.append(clean_text(soup.title.get_text(" ", strip=True)))
+
+        for selector in ["h1", "h2", ".title", ".lot-title", ".tender-title"]:
+            for item in soup.select(selector):
+                text = clean_text(item.get_text(" ", strip=True))
+                if text:
+                    candidates.append(text)
+
+        candidates = [x for x in candidates if x and len(x) >= 10]
+
+        if not candidates:
+            return ""
+
+        return max(candidates, key=len)
+
+    except Exception as e:
+        print("LOT PAGE ERROR:", url, e)
+        return ""
+
+
+def is_real_cargo_tender(title, url, page_title=""):
     title = clean_text(title)
+    page_title = clean_text(page_title)
 
     if not title or not url:
         return False
@@ -139,13 +177,15 @@ def is_real_cargo_tender(title, url):
     if looks_like_bad_url(url):
         return False
 
-    if looks_like_bad_title(title):
+    if looks_like_bad_title(title) and not page_title:
         return False
 
-    # САМОЕ ВАЖНОЕ:
-    # Проверяем только название лота, не URL.
-    # Ссылка tender-35910 сама по себе больше не проходит.
-    if not is_cargo_title(title):
+    combined = f"{title} {page_title}".lower()
+
+    if contains_blocked_non_cargo(combined):
+        return False
+
+    if not contains_required_phrase(combined):
         return False
 
     return True
@@ -186,25 +226,26 @@ def send_telegram(text):
 
 
 def collect_links(base_url, pages_to_scan, site_name):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-Strict/5.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V6/6.0)"}
 
     tenders = []
     seen_urls = set()
     total_links = 0
+    checked_lot_pages = 0
 
     for page_url in pages_to_scan:
         try:
-            r = requests.get(page_url, headers=headers, timeout=5)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
+            response = requests.get(page_url, headers=headers, timeout=5)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
 
             for link in soup.find_all("a"):
                 total_links += 1
 
-                title = clean_text(link.get_text(" ", strip=True))
+                raw_title = clean_text(link.get_text(" ", strip=True))
                 href = link.get("href")
 
-                if not title or not href:
+                if not raw_title or not href:
                     continue
 
                 full_url = requests.compat.urljoin(base_url, href)
@@ -212,21 +253,42 @@ def collect_links(base_url, pages_to_scan, site_name):
                 if full_url in seen_urls:
                     continue
 
-                if not is_real_cargo_tender(title, full_url):
+                if looks_like_bad_url(full_url):
+                    continue
+
+                page_title = ""
+
+                # Сначала быстрая проверка по названию ссылки
+                if contains_required_phrase(raw_title) and not contains_blocked_non_cargo(raw_title):
+                    final_title = raw_title
+                else:
+                    # Если ссылка похожа на лот, открываем саму страницу и читаем заголовок
+                    if any(x in full_url.lower() for x in ["tender", "lot", "lots", "xarid", "etender"]):
+                        checked_lot_pages += 1
+                        page_title = fetch_lot_page_title(full_url)
+                        final_title = page_title or raw_title
+                    else:
+                        continue
+
+                if not is_real_cargo_tender(raw_title, full_url, page_title):
                     continue
 
                 seen_urls.add(full_url)
 
                 tenders.append({
                     "site": site_name,
-                    "title": title,
+                    "title": final_title,
                     "url": full_url,
                 })
 
         except Exception as e:
             print(f"{site_name.upper()} ERROR:", e)
 
-    print(f"{site_name}: total_links={total_links}, strict_cargo_tenders={len(tenders)}")
+    print(
+        f"{site_name}: total_links={total_links}, "
+        f"checked_lot_pages={checked_lot_pages}, cargo_tenders={len(tenders)}"
+    )
+
     return tenders
 
 
@@ -321,7 +383,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo Strict V5 is running"}
+    return {"status": "AI Tender Agent Cargo Strict V6 is running"}
 
 
 @app.head("/")
@@ -346,8 +408,8 @@ def health():
         result["errors"].append("Telegram error: " + str(e))
 
     try:
-        sh = get_sheet()
-        sh.row_values(1)
+        sheet = get_sheet()
+        sheet.row_values(1)
         result["google_sheets"] = True
     except Exception as e:
         result["errors"].append("Google Sheets error: " + str(e))
@@ -404,7 +466,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo Strict V5 Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo Strict V6 Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -460,7 +522,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_strict_v5",
+        "version": "cargo_strict_v6",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
