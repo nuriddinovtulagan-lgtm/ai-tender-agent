@@ -225,12 +225,8 @@ def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
     pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS:
-        pages_to_scan.extend([
-            f"{base_url}?search={word}",
-            f"{base_url}?q={word}",
-            f"{base_url}?keyword={word}",
-        ])
+    for page in range(2, 8):
+        pages_to_scan.append(f"{base_url}?page={page}")
 
     return collect_links(base_url, pages_to_scan, "Tenderweek")
 
@@ -239,7 +235,7 @@ def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
     pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS[:4]:
+    for word in SEARCH_WORDS[:6]:
         pages_to_scan.extend([
             f"{base_url}?search={word}",
             f"{base_url}?q={word}",
@@ -260,7 +256,7 @@ def parse_uzex():
     for base_url in base_urls:
         pages_to_scan = [base_url]
 
-        for word in SEARCH_WORDS[:4]:
+        for word in SEARCH_WORDS[:6]:
             pages_to_scan.extend([
                 f"{base_url}?search={word}",
                 f"{base_url}?q={word}",
@@ -269,8 +265,6 @@ def parse_uzex():
         all_tenders.extend(collect_links(base_url, pages_to_scan, "UZEX"))
 
     return all_tenders
-
-
 def tender_exists(url):
     try:
         sheet = get_sheet()
