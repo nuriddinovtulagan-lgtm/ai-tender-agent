@@ -226,14 +226,13 @@ def send_telegram(text):
 
 
 def collect_links(base_url, pages_to_scan, site_name):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V6/6.0)"}
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V7/7.0)"}
 
     tenders = []
     seen_urls = set()
     total_links = 0
-    checked_lot_pages = 0
 
-    for page_url in pages_to_scan:
+    for page_url in pages_to_scan[:5]:
         try:
             response = requests.get(page_url, headers=headers, timeout=3)
             response.raise_for_status()
@@ -242,10 +241,10 @@ def collect_links(base_url, pages_to_scan, site_name):
             for link in soup.find_all("a"):
                 total_links += 1
 
-                raw_title = clean_text(link.get_text(" ", strip=True))
+                title = clean_text(link.get_text(" ", strip=True))
                 href = link.get("href")
 
-                if not raw_title or not href:
+                if not title or not href:
                     continue
 
                 full_url = requests.compat.urljoin(base_url, href)
@@ -253,44 +252,22 @@ def collect_links(base_url, pages_to_scan, site_name):
                 if full_url in seen_urls:
                     continue
 
-                if looks_like_bad_url(full_url):
-                    continue
-
-                page_title = ""
-
-                # Сначала быстрая проверка по названию ссылки
-                if contains_required_phrase(raw_title) and not contains_blocked_non_cargo(raw_title):
-                    final_title = raw_title
-                else:
-                    # Если ссылка похожа на лот, открываем саму страницу и читаем заголовок
-                    if any(x in full_url.lower() for x in ["tender", "lot", "lots", "xarid", "etender"]):
-                        checked_lot_pages += 1
-                        page_title = fetch_lot_page_title(full_url)
-                        final_title = page_title or raw_title
-                    else:
-                        continue
-
-                if not is_real_cargo_tender(raw_title, full_url, page_title):
+                if not is_real_cargo_tender(title, full_url):
                     continue
 
                 seen_urls.add(full_url)
 
                 tenders.append({
                     "site": site_name,
-                    "title": final_title,
+                    "title": title,
                     "url": full_url,
                 })
 
         except Exception as e:
             print(f"{site_name.upper()} ERROR:", e)
 
-    print(
-        f"{site_name}: total_links={total_links}, "
-        f"checked_lot_pages={checked_lot_pages}, cargo_tenders={len(tenders)}"
-    )
-
+    print(f"{site_name}: total_links={total_links}, cargo_tenders={len(tenders)}")
     return tenders
-
 
 def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
