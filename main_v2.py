@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo Strict V6")
+app = FastAPI(title="AI Tender Agent Cargo Strict V7 Fast")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -38,10 +38,7 @@ REQUIRED_PHRASES = [
     "перевозки грузов",
     "услуги по перевозке грузов",
     "оказание услуг по перевозке грузов",
-    "оказание услуги по перевозке грузов",
     "доставка грузов",
-    "доставке грузов",
-    "доставку грузов",
     "грузоперевоз",
     "грузовые перевозки",
     "транспортные услуги",
@@ -135,41 +132,8 @@ def looks_like_bad_title(title):
     return False
 
 
-def fetch_lot_page_title(url):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V6/6.0)"}
-
-    try:
-        response = requests.get(url, headers=headers, timeout=2)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        candidates = []
-
-        if soup.title:
-            candidates.append(clean_text(soup.title.get_text(" ", strip=True)))
-
-        for selector in ["h1", "h2", ".title", ".lot-title", ".tender-title"]:
-            for item in soup.select(selector):
-                text = clean_text(item.get_text(" ", strip=True))
-                if text:
-                    candidates.append(text)
-
-        candidates = [x for x in candidates if x and len(x) >= 10]
-
-        if not candidates:
-            return ""
-
-        return max(candidates, key=len)
-
-    except Exception as e:
-        print("LOT PAGE ERROR:", url, e)
-        return ""
-
-
-def is_real_cargo_tender(title, url, page_title=""):
+def is_real_cargo_tender(title, url):
     title = clean_text(title)
-    page_title = clean_text(page_title)
 
     if not title or not url:
         return False
@@ -177,15 +141,13 @@ def is_real_cargo_tender(title, url, page_title=""):
     if looks_like_bad_url(url):
         return False
 
-    if looks_like_bad_title(title) and not page_title:
+    if looks_like_bad_title(title):
         return False
 
-    combined = f"{title} {page_title}".lower()
-
-    if contains_blocked_non_cargo(combined):
+    if contains_blocked_non_cargo(title):
         return False
 
-    if not contains_required_phrase(combined):
+    if not contains_required_phrase(title):
         return False
 
     return True
@@ -217,7 +179,7 @@ def send_telegram(text):
         response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": text[:3900]},
-            timeout=15,
+            timeout=10,
         )
         return response.status_code == 200
     except Exception as e:
@@ -226,7 +188,9 @@ def send_telegram(text):
 
 
 def collect_links(base_url, pages_to_scan, site_name):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V7/7.0)"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V7/7.0)"
+    }
 
     tenders = []
     seen_urls = set()
@@ -269,6 +233,7 @@ def collect_links(base_url, pages_to_scan, site_name):
     print(f"{site_name}: total_links={total_links}, cargo_tenders={len(tenders)}")
     return tenders
 
+
 def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
     pages_to_scan = [base_url]
@@ -309,11 +274,10 @@ def parse_uzex():
     for base_url in base_urls:
         pages_to_scan = [base_url]
 
-        for word in SEARCH_WORDS:
+        for word in SEARCH_WORDS[:4]:
             pages_to_scan.extend([
                 f"{base_url}?search={word}",
                 f"{base_url}?q={word}",
-                f"{base_url}?keyword={word}",
             ])
 
         all_tenders.extend(collect_links(base_url, pages_to_scan, "UZEX"))
@@ -360,7 +324,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo Strict V6 is running"}
+    return {"status": "AI Tender Agent Cargo Strict V7 Fast is running"}
 
 
 @app.head("/")
@@ -437,13 +401,15 @@ def test_filter():
 
 @app.get("/scan")
 def scan():
+    print("SCAN STARTED")
+
     found_total = 0
     new_total = 0
     duplicate_total = 0
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo Strict V6 Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo Strict V7 Fast Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -452,6 +418,8 @@ def scan():
     ]
 
     for source_name, parser in sources:
+        print("PARSING:", source_name)
+
         try:
             result = parser()
             all_tenders.extend(result)
@@ -499,7 +467,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_strict_v6",
+        "version": "cargo_strict_v7_fast",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
