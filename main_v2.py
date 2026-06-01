@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo Strict V7 Fast")
+app = FastAPI(title="AI Tender Agent Cargo V8")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -15,53 +15,66 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 SEARCH_WORDS = [
     "перевозка грузов",
-    "услуги по перевозке грузов",
-    "оказание услуг по перевозке грузов",
+    "транспортные услуги",
+    "оказание транспортных услуг",
     "доставка грузов",
     "грузоперевозки",
-    "транспортные услуги",
-    "оказание транспортных услуг",
-    "транспортно-экспедиционные услуги",
     "экспедиторские услуги",
     "логистические услуги",
-    "cargo transportation",
-    "freight forwarding",
-    "logistics services",
-    "yuk tashish",
-    "transport xizmati",
+    "транспортно-экспедиционные услуги",
 ]
 
-REQUIRED_PHRASES = [
-    "перевозка грузов",
-    "перевозке грузов",
-    "перевозку грузов",
-    "перевозки грузов",
-    "услуги по перевозке грузов",
-    "оказание услуг по перевозке грузов",
-    "доставка грузов",
-    "грузоперевоз",
-    "грузовые перевозки",
-    "транспортные услуги",
-    "оказание транспортных услуг",
-    "услуги автотранспорта",
-    "автотранспортные услуги",
-    "услуги грузового транспорта",
-    "грузовой транспорт",
-    "транспортно-экспедиционные услуги",
-    "экспедиторские услуги",
-    "логистические услуги",
-    "контейнерные перевозки",
-    "международные перевозки грузов",
-    "автомобильные перевозки грузов",
-    "cargo transportation",
-    "freight forwarding",
-    "transportation of goods",
-    "delivery of goods",
-    "logistics services",
-    "yuk tashish",
-    "yuklarni tashish",
-    "transport xizmati",
-    "transport xizmatlari",
+GOOD_WORDS = [
+    "перевоз",
+    "груз",
+    "достав",
+    "логист",
+    "экспед",
+    "транспорт",
+    "автотранспорт",
+    "контейнер",
+    "фура",
+    "тягач",
+    "рефриж",
+    "cargo",
+    "freight",
+    "delivery",
+    "logistics",
+    "transport",
+    "yuk",
+    "tashish",
+]
+
+BAD_WORDS = [
+    "арматур",
+    "бетон",
+    "цемент",
+    "лаборатор",
+    "оборудован",
+    "мебел",
+    "пленк",
+    "стретч",
+    "консультац",
+    "технадзор",
+    "строительств",
+    "ремонт",
+    "канцеляр",
+    "компьютер",
+    "принтер",
+    "медицин",
+    "питание",
+    "продукт",
+    "одежд",
+    "обув",
+    "уголь",
+    "газ",
+    "топливо",
+    "дизель",
+    "электро",
+    "юридическ",
+    "аудит",
+    "страхован",
+    "охрана",
 ]
 
 BAD_URL_PARTS = [
@@ -84,52 +97,29 @@ BAD_TITLE_WORDS = [
     "дата публикации", "личный кабинет", "кабинет", "профиль",
 ]
 
-BLOCKED_NON_CARGO = [
-    "арматур", "бетон", "цемент", "лаборатор", "оборудован",
-    "мебел", "пленк", "стретч", "консультац", "технадзор",
-    "техническому надзору", "модернизац", "строительств",
-    "ремонт", "канцеляр", "компьютер", "принтер",
-    "медицин", "питание", "продукт", "одежд", "обув",
-    "уголь", "газ", "топливо", "дизель", "электро",
-    "юридическ", "аудит", "страхован", "охрана",
-]
-
 
 def clean_text(text):
     return " ".join((text or "").replace("\n", " ").replace("\t", " ").split())
 
 
-def contains_required_phrase(text):
-    text = clean_text(text).lower()
-    return any(phrase in text for phrase in REQUIRED_PHRASES)
+def is_cargo_title(title):
+    title = clean_text(title).lower()
 
+    if len(title) < 10:
+        return False
 
-def contains_blocked_non_cargo(text):
-    text = clean_text(text).lower()
-    return any(word in text for word in BLOCKED_NON_CARGO)
+    if any(bad in title for bad in BAD_TITLE_WORDS):
+        return False
+
+    if any(bad in title for bad in BAD_WORDS):
+        return False
+
+    return any(good in title for good in GOOD_WORDS)
 
 
 def looks_like_bad_url(url):
     url = (url or "").lower()
     return any(part in url for part in BAD_URL_PARTS)
-
-
-def looks_like_bad_title(title):
-    title = clean_text(title).lower()
-
-    if len(title) < 12:
-        return True
-
-    if len(title.split()) < 2:
-        return True
-
-    if title.isdigit():
-        return True
-
-    if any(word in title for word in BAD_TITLE_WORDS):
-        return True
-
-    return False
 
 
 def is_real_cargo_tender(title, url):
@@ -141,16 +131,13 @@ def is_real_cargo_tender(title, url):
     if looks_like_bad_url(url):
         return False
 
-    if looks_like_bad_title(title):
+    if title.isdigit():
         return False
 
-    if contains_blocked_non_cargo(title):
+    if len(title.split()) < 2:
         return False
 
-    if not contains_required_phrase(title):
-        return False
-
-    return True
+    return is_cargo_title(title)
 
 
 def get_sheet():
@@ -189,14 +176,14 @@ def send_telegram(text):
 
 def collect_links(base_url, pages_to_scan, site_name):
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V7/7.0)"
+        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V8/8.0)"
     }
 
     tenders = []
     seen_urls = set()
     total_links = 0
 
-    for page_url in pages_to_scan[:5]:
+    for page_url in pages_to_scan[:6]:
         try:
             response = requests.get(page_url, headers=headers, timeout=3)
             response.raise_for_status()
@@ -252,11 +239,10 @@ def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
     pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS:
+    for word in SEARCH_WORDS[:4]:
         pages_to_scan.extend([
             f"{base_url}?search={word}",
             f"{base_url}?q={word}",
-            f"{base_url}?keyword={word}",
         ])
 
     return collect_links(base_url, pages_to_scan, "XT-Xarid")
@@ -309,8 +295,8 @@ def save_to_sheet(site, title, url):
             url,
             site,
             "Новый",
-            "Высокий",
-            "Лот связан с перевозкой грузов / транспортно-экспедиционными услугами",
+            "Средний",
+            "Проверить лот: найдено по словам перевозка / транспорт / логистика / груз",
             title,
         ]
 
@@ -324,7 +310,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo Strict V7 Fast is running"}
+    return {"status": "AI Tender Agent Cargo V8 is running"}
 
 
 @app.head("/")
@@ -396,6 +382,10 @@ def test_filter():
             "Написать нам письмо",
             "https://www.tenderweek.com/feedback",
         ),
+        "Доставка товара автотранспортом": is_real_cargo_tender(
+            "Доставка товара автотранспортом",
+            "https://www.tenderweek.com/tender-99999",
+        ),
     }
 
 
@@ -409,7 +399,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo Strict V7 Fast Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V8 Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -423,7 +413,7 @@ def scan():
         try:
             result = parser()
             all_tenders.extend(result)
-            message += f"{source_name}: лотов по перевозке грузов {len(result)}\n"
+            message += f"{source_name}: найдено по грузоперевозкам {len(result)}\n"
         except Exception as e:
             message += f"{source_name}: ERROR\n"
             print(f"{source_name} ERROR:", e)
@@ -448,7 +438,7 @@ def scan():
         if saved:
             new_total += 1
             text = (
-                f"🚚 Новый лот по перевозке грузов\n\n"
+                f"🚚 Новый возможный лот по перевозке / логистике\n\n"
                 f"📌 Источник: {tender['site']}\n\n"
                 f"📋 {title}\n\n"
                 f"🔗 {url}"
@@ -458,7 +448,7 @@ def scan():
             duplicate_total += 1
 
     message += (
-        f"Всего лотов по перевозке грузов: {found_total}\n"
+        f"Всего найдено: {found_total}\n"
         f"Новых сохранено: {new_total}\n"
         f"Дубликатов пропущено: {duplicate_total}"
     )
@@ -467,11 +457,21 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_strict_v7_fast",
+        "version": "cargo_v8",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
     }
+
+
+@app.post("/webhook")
+def webhook():
+    return scan()
+
+
+@app.get("/webhook")
+def webhook_get():
+    return scan()
 
 
 if __name__ == "__main__":
