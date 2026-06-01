@@ -176,19 +176,24 @@ def send_telegram(text):
 
 def collect_links(base_url, pages_to_scan, site_name):
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V8/8.0)"
+        "User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent-Cargo-V9/9.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
     }
 
     tenders = []
     seen_urls = set()
     total_links = 0
+    total_blocks = 0
 
-    for page_url in pages_to_scan[:6]:
+    for page_url in pages_to_scan[:8]:
         try:
-            response = requests.get(page_url, headers=headers, timeout=3)
+            response = requests.get(page_url, headers=headers, timeout=5)
             response.raise_for_status()
+
             soup = BeautifulSoup(response.text, "html.parser")
 
+            # 1) Поиск по ссылкам
             for link in soup.find_all("a"):
                 total_links += 1
 
@@ -214,12 +219,43 @@ def collect_links(base_url, pages_to_scan, site_name):
                     "url": full_url,
                 })
 
+            # 2) Дополнительный поиск по текстовым блокам страницы
+            for tag in soup.find_all(["div", "tr", "li", "article", "section"]):
+                total_blocks += 1
+
+                text = clean_text(tag.get_text(" ", strip=True))
+
+                if not text:
+                    continue
+
+                if len(text) < 20 or len(text) > 300:
+                    continue
+
+                if not is_real_cargo_tender(text, page_url):
+                    continue
+
+                unique_key = f"{site_name}:{text[:120]}"
+
+                if unique_key in seen_urls:
+                    continue
+
+                seen_urls.add(unique_key)
+
+                tenders.append({
+                    "site": site_name,
+                    "title": text[:250],
+                    "url": page_url,
+                })
+
         except Exception as e:
             print(f"{site_name.upper()} ERROR:", e)
 
-    print(f"{site_name}: total_links={total_links}, cargo_tenders={len(tenders)}")
-    return tenders
+    print(
+        f"{site_name}: total_links={total_links}, "
+        f"total_blocks={total_blocks}, cargo_tenders={len(tenders)}"
+    )
 
+    return tenders
 
 def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
