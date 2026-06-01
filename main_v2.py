@@ -56,6 +56,12 @@ REQUIRED_TITLE_PHRASES = [
     "yuklarni tashish",
     "transport xizmati",
     "transport xizmatlari",
+    "оказание транспортных услуг",
+    "транспортные услуги",
+    "услуги автотранспорта",
+    "автотранспортные услуги",
+    "услуги грузового транспорта",
+    "грузовой транспорт",
 ]
 
 BAD_URL_PARTS = [
