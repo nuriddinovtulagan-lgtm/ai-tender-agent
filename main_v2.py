@@ -84,7 +84,17 @@ def clean_text(text):
 
 def is_logistics_tender(text):
     text = (text or "").lower()
-    return any(word.lower() in text for word in KEYWORDS)
+
+    logistics_words = [
+        "перевоз", "транспорт", "достав", "груз",
+        "логист", "экспед", "контейнер", "склад",
+        "погруз", "разгруз", "тамож", "фура",
+        "тягач", "рефриж", "cargo", "freight",
+        "transport", "logistic", "delivery",
+        "yuk", "tashish", "xizmat"
+    ]
+
+    return any(word in text for word in logistics_words)
 
 
 def looks_like_bad_url(url):
