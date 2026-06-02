@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V8")
+app = FastAPI(title="AI Tender Agent Cargo V9")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -46,35 +46,12 @@ GOOD_WORDS = [
 ]
 
 BAD_WORDS = [
-    "арматур",
-    "бетон",
-    "цемент",
-    "лаборатор",
-    "оборудован",
-    "мебел",
-    "пленк",
-    "стретч",
-    "консультац",
-    "технадзор",
-    "строительств",
-    "ремонт",
-    "канцеляр",
-    "компьютер",
-    "принтер",
-    "медицин",
-    "питание",
-    "продукт",
-    "одежд",
-    "обув",
-    "уголь",
-    "газ",
-    "топливо",
-    "дизель",
-    "электро",
-    "юридическ",
-    "аудит",
-    "страхован",
-    "охрана",
+    "арматур", "бетон", "цемент", "лаборатор", "оборудован",
+    "мебел", "пленк", "стретч", "консультац", "технадзор",
+    "строительств", "ремонт", "канцеляр", "компьютер", "принтер",
+    "медицин", "питание", "продукт", "одежд", "обув",
+    "уголь", "газ", "топливо", "дизель", "электро",
+    "юридическ", "аудит", "страхован", "охрана",
 ]
 
 BAD_URL_PARTS = [
@@ -186,14 +163,16 @@ def collect_links(base_url, pages_to_scan, site_name):
     total_links = 0
     total_blocks = 0
 
-    for page_url in pages_to_scan[:8]:
+    for page_url in pages_to_scan[:12]:
         try:
             response = requests.get(page_url, headers=headers, timeout=5)
-            response.raise_for_status()
+            print(f"{site_name} PAGE:", page_url)
+            print(f"{site_name} STATUS:", response.status_code)
+            print(f"{site_name} SIZE:", len(response.text))
 
+            response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # 1) Поиск по ссылкам
             for link in soup.find_all("a"):
                 total_links += 1
 
@@ -219,7 +198,6 @@ def collect_links(base_url, pages_to_scan, site_name):
                     "url": full_url,
                 })
 
-            # 2) Дополнительный поиск по текстовым блокам страницы
             for tag in soup.find_all(["div", "tr", "li", "article", "section"]):
                 total_blocks += 1
 
@@ -257,6 +235,7 @@ def collect_links(base_url, pages_to_scan, site_name):
 
     return tenders
 
+
 def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
     pages_to_scan = [base_url]
@@ -274,13 +253,15 @@ def parse_xt_xarid():
         "https://xt-xarid.uz/procedure/tender",
         "https://xt-xarid.uz/procedure/selection",
         "https://xt-xarid.uz/procedure/reduction",
+        "https://xt-xarid.uz/procedure",
     ]
 
     for proc in ["tender", "selection", "reduction"]:
-        for word in SEARCH_WORDS:
+        for word in SEARCH_WORDS[:6]:
             pages_to_scan.extend([
                 f"https://xt-xarid.uz/procedure/{proc}?queryText={word}",
                 f"https://xt-xarid.uz/procedure/{proc}?search={word}",
+                f"https://xt-xarid.uz/procedure/{proc}?q={word}",
             ])
 
     return collect_links(base_url, pages_to_scan, "XT-Xarid")
@@ -289,19 +270,19 @@ def parse_xt_xarid():
 def parse_uzex():
     base_url = "https://etender.uzex.uz/"
 
-    pages_to_scan = [
-        "https://etender.uzex.uz/lots/1/0",
-        "https://etender.uzex.uz/lots/2/0",
-        "https://etender.uzex.uz/lots/6/0",
-        "https://etender.uzex.uz/",
-    ]
+    pages_to_scan = []
 
-    for lot_type in [1, 2, 6]:
+    for lot_type in [1, 2, 5, 6]:
         for page in range(0, 5):
             pages_to_scan.append(f"https://etender.uzex.uz/lots/{lot_type}/{page}")
 
-    for word in SEARCH_WORDS:
-        for lot_type in [1, 2, 6]:
+    pages_to_scan.extend([
+        "https://etender.uzex.uz/",
+        "https://xarid.uzex.uz/",
+    ])
+
+    for lot_type in [1, 2, 5, 6]:
+        for word in SEARCH_WORDS[:6]:
             pages_to_scan.extend([
                 f"https://etender.uzex.uz/lots/{lot_type}/0?search={word}",
                 f"https://etender.uzex.uz/lots/{lot_type}/0?q={word}",
@@ -309,7 +290,7 @@ def parse_uzex():
 
     return collect_links(base_url, pages_to_scan, "UZEX")
 
-    return all_tenders
+
 def tender_exists(url):
     try:
         sheet = get_sheet()
@@ -349,7 +330,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V8 is running"}
+    return {"status": "AI Tender Agent Cargo V9 is running"}
 
 
 @app.head("/")
@@ -438,7 +419,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V8 Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V9 Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -479,7 +460,6 @@ def scan():
         print("=" * 50)
 
         saved = save_to_sheet(tender["site"], title, url)
-        
 
         if saved:
             new_total += 1
@@ -503,7 +483,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v8",
+        "version": "cargo_v9",
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
