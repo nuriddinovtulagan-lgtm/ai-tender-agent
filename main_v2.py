@@ -269,36 +269,45 @@ def parse_tenderweek():
 
 def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
-    pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS[:6]:
-        pages_to_scan.extend([
-            f"{base_url}?search={word}",
-            f"{base_url}?q={word}",
-        ])
+    pages_to_scan = [
+        "https://xt-xarid.uz/procedure/tender",
+        "https://xt-xarid.uz/procedure/selection",
+        "https://xt-xarid.uz/procedure/reduction",
+    ]
+
+    for proc in ["tender", "selection", "reduction"]:
+        for word in SEARCH_WORDS:
+            pages_to_scan.extend([
+                f"https://xt-xarid.uz/procedure/{proc}?queryText={word}",
+                f"https://xt-xarid.uz/procedure/{proc}?search={word}",
+            ])
 
     return collect_links(base_url, pages_to_scan, "XT-Xarid")
 
 
 def parse_uzex():
-    base_urls = [
+    base_url = "https://etender.uzex.uz/"
+
+    pages_to_scan = [
         "https://etender.uzex.uz/lots/1/0",
+        "https://etender.uzex.uz/lots/2/0",
+        "https://etender.uzex.uz/lots/6/0",
         "https://etender.uzex.uz/",
-        "https://xarid.uzex.uz/",
     ]
 
-    all_tenders = []
+    for lot_type in [1, 2, 6]:
+        for page in range(0, 5):
+            pages_to_scan.append(f"https://etender.uzex.uz/lots/{lot_type}/{page}")
 
-    for base_url in base_urls:
-        pages_to_scan = [base_url]
-
-        for word in SEARCH_WORDS[:6]:
+    for word in SEARCH_WORDS:
+        for lot_type in [1, 2, 6]:
             pages_to_scan.extend([
-                f"{base_url}?search={word}",
-                f"{base_url}?q={word}",
+                f"https://etender.uzex.uz/lots/{lot_type}/0?search={word}",
+                f"https://etender.uzex.uz/lots/{lot_type}/0?q={word}",
             ])
 
-        all_tenders.extend(collect_links(base_url, pages_to_scan, "UZEX"))
+    return collect_links(base_url, pages_to_scan, "UZEX")
 
     return all_tenders
 def tender_exists(url):
