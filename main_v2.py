@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V16 Service Only")
+app = FastAPI(title="AI Tender Agent Cargo V17 Balanced Search")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -17,20 +17,23 @@ SERVICE_PHRASES = [
     "перевозка грузов",
     "перевозке грузов",
     "грузоперевоз",
+    "грузовые перевозки",
     "доставка грузов",
-    "доставка товара автотранспортом",
     "доставка груза",
+    "доставка товара автотранспортом",
     "транспортные услуги",
     "оказание транспортных услуг",
+    "услуги транспорта",
+    "услуги по перевозке",
+    "услуги перевозки",
     "транспортно-экспедиционные услуги",
     "транспортно экспедиционные услуги",
     "экспедиторские услуги",
     "логистические услуги",
     "международные автомобильные перевозки",
     "международная перевозка",
+    "международные перевозки",
     "автомобильные перевозки грузов",
-    "услуги перевозки",
-    "услуги по перевозке",
     "cargo transportation",
     "freight transportation",
     "logistics service",
@@ -50,6 +53,7 @@ SERVICE_PHRASES = [
     "ekspeditorlik xizmatlari",
     "xalqaro yuk tashish",
     "xalqaro tashuv",
+    "xalqaro tashish",
     "avtotransport xizmati",
     "avtotransport xizmatlari",
 ]
@@ -79,6 +83,11 @@ HARD_BAD_WORDS = [
     "yo‘li", "yo'li", "yoʻli", "avtomobil yo",
     "yer uchastkasi", "master-reja", "baholash",
     "service area", "service point", "проект", "лойиҳа",
+]
+
+SOFT_BAD_WORDS = [
+    "товар", "материал", "изделие", "деталь", "агрегат",
+    "насос", "кабель", "труба", "краска", "масло",
 ]
 
 BAD_URL_PARTS = [
@@ -127,20 +136,35 @@ def looks_like_bad_url(url):
     return any(part in url for part in BAD_URL_PARTS)
 
 
-def is_service_cargo_title(title):
+def filter_reason(title, url):
     t = normalize_text(title)
 
+    if not title or not url:
+        return "empty_title_or_url"
+
+    if looks_like_bad_url(url):
+        return "bad_url"
+
+    if title.isdigit():
+        return "only_digits"
+
+    if len(title.split()) < 2:
+        return "too_short"
+
     if len(t) < 10:
-        return False
+        return "too_short_text"
 
-    if any(bad in t for bad in BAD_TITLE_WORDS):
-        return False
+    for bad in BAD_TITLE_WORDS:
+        if bad in t:
+            return "bad_title_word:" + bad
 
-    if any(bad in t for bad in HARD_BAD_WORDS):
-        return False
+    for bad in HARD_BAD_WORDS:
+        if bad in t:
+            return "hard_bad_word:" + bad
 
-    if any(phrase in t for phrase in SERVICE_PHRASES):
-        return True
+    for phrase in SERVICE_PHRASES:
+        if phrase in t:
+            return "accepted_service_phrase:" + phrase
 
     support_count = sum(1 for word in SUPPORT_WORDS if word in t)
 
@@ -148,25 +172,17 @@ def is_service_cargo_title(title):
     has_service = any(x in t for x in ["услуг", "xizmat", "service"])
     has_action = any(x in t for x in ["перевоз", "достав", "tashish", "tashuv", "delivery", "transportation"])
 
-    return support_count >= 3 and has_cargo and has_service and has_action
+    if support_count >= 3 and has_cargo and has_service and has_action:
+        if any(x in t for x in SOFT_BAD_WORDS):
+            return "soft_bad_but_possible"
+        return "accepted_support_combo"
+
+    return "not_service_cargo"
 
 
 def is_real_cargo_tender(title, url):
-    title = clean_text(title)
-
-    if not title or not url:
-        return False
-
-    if looks_like_bad_url(url):
-        return False
-
-    if title.isdigit():
-        return False
-
-    if len(title.split()) < 2:
-        return False
-
-    return is_service_cargo_title(title)
+    reason = filter_reason(title, url)
+    return reason.startswith("accepted_")
 
 
 def get_sheet():
@@ -225,11 +241,34 @@ def add_tender(tenders, seen, site, title, url):
         "site": site,
         "title": title[:300],
         "url": url,
+        "reason": filter_reason(title, url),
     })
 
 
-def collect_links(base_url, pages, site, limit=7):
+def add_raw_candidate(candidates, seen, site, title, url):
+    title = clean_text(title)
+    url = clean_text(url)
+
+    if not title or not url:
+        return
+
+    key = make_key(site, title, url)
+    if key in seen:
+        return
+
+    seen.add(key)
+    candidates.append({
+        "site": site,
+        "title": title[:300],
+        "url": url,
+        "accepted": is_real_cargo_tender(title, url),
+        "reason": filter_reason(title, url),
+    })
+
+
+def collect_links(base_url, pages, site, limit=10, raw=False):
     tenders = []
+    candidates = []
     seen = set()
 
     for page_url in pages[:limit]:
@@ -252,18 +291,24 @@ def collect_links(base_url, pages, site, limit=7):
                     continue
 
                 url = requests.compat.urljoin(base_url, href)
-                add_tender(tenders, seen, site, title, url)
+
+                if raw:
+                    add_raw_candidate(candidates, seen, site, title, url)
+                else:
+                    add_tender(tenders, seen, site, title, url)
 
             for tag in soup.find_all(["div", "tr", "li", "article", "section"]):
                 text = clean_text(tag.get_text(" ", strip=True))
                 if 20 <= len(text) <= 300:
-                    add_tender(tenders, seen, site, text, page_url)
+                    if raw:
+                        add_raw_candidate(candidates, seen, site, text, page_url)
+                    else:
+                        add_tender(tenders, seen, site, text, page_url)
 
         except Exception as e:
             print(f"{site} HTML ERROR:", e)
 
-    print(f"{site} cargo_service_tenders={len(tenders)}")
-    return tenders
+    return candidates if raw else tenders
 
 
 def flatten_items(data):
@@ -346,30 +391,44 @@ def item_title(item):
     return clean_text(" | ".join(parts))
 
 
-def parse_tenderweek():
+def parse_tenderweek(raw=False):
     base_url = "https://www.tenderweek.com/"
     pages = [base_url]
 
-    for page in range(2, 8):
+    search_queries = [
+        "перевозка грузов",
+        "транспортные услуги",
+        "логистические услуги",
+        "транспортно-экспедиционные услуги",
+        "доставка грузов",
+    ]
+
+    for page in range(2, 10):
         pages.append(f"{base_url}?page={page}")
 
-    return collect_links(base_url, pages, "Tenderweek", limit=7)
+    for q in search_queries:
+        pages.append(f"{base_url}?search={requests.utils.quote(q)}")
+        pages.append(f"{base_url}?q={requests.utils.quote(q)}")
+
+    return collect_links(base_url, pages, "Tenderweek", limit=20, raw=raw)
 
 
-def parse_uzex_api():
+def parse_uzex_api(raw=False):
     url = "https://apietender.uzex.uz/api/common/TradeList"
     base_url = "https://etender.uzex.uz/"
     tenders = []
+    candidates = []
     seen = set()
 
     payloads = [
-        {"TypeId": 1, "From": 1, "To": 100, "System_Id": 0},
-        {"TypeId": 2, "From": 1, "To": 100, "System_Id": 0},
+        {"TypeId": 1, "From": 1, "To": 200, "System_Id": 0},
+        {"TypeId": 2, "From": 1, "To": 200, "System_Id": 0},
+        {"TypeId": 3, "From": 1, "To": 200, "System_Id": 0},
     ]
 
     for payload in payloads:
         try:
-            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
+            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=15)
 
             print("UZEX API STATUS:", r.status_code)
             print("UZEX API SIZE:", len(r.text))
@@ -388,51 +447,43 @@ def parse_uzex_api():
 
                 title = item_title(item)
                 tender_url = item_url(item, base_url, "UZEX")
-                add_tender(tenders, seen, "UZEX", title, tender_url)
+
+                if raw:
+                    add_raw_candidate(candidates, seen, "UZEX", title, tender_url)
+                else:
+                    add_tender(tenders, seen, "UZEX", title, tender_url)
 
         except Exception as e:
             print("UZEX API ERROR:", e)
 
-    print("UZEX API cargo_service_tenders=", len(tenders))
-    return tenders
+    return candidates if raw else tenders
 
 
-def parse_xt_xarid_api():
+def parse_xt_xarid_api(raw=False):
     url = "https://api.xt-xarid.uz/rpc"
     base_url = "https://xt-xarid.uz/"
     tenders = []
+    candidates = []
     seen = set()
 
-    payloads = [
-        {
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "ref",
-            "params": {
-                "ref": "ref_tender_public",
-                "op": "read",
-                "limit": 100,
-                "offset": 0,
-                "filters": {},
-            },
-        },
-        {
-            "id": 1,
-            "jsonrpc": "2.0",
-            "method": "ref",
-            "params": {
-                "ref": "ref_tender_public",
-                "op": "read",
-                "limit": 100,
-                "offset": 100,
-                "filters": {},
-            },
-        },
-    ]
+    offsets = [0, 100, 200, 300]
 
-    for payload in payloads:
+    for offset in offsets:
+        payload = {
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "ref",
+            "params": {
+                "ref": "ref_tender_public",
+                "op": "read",
+                "limit": 100,
+                "offset": offset,
+                "filters": {},
+            },
+        }
+
         try:
-            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
+            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=15)
 
             print("XT-Xarid API STATUS:", r.status_code)
             print("XT-Xarid API SIZE:", len(r.text))
@@ -451,21 +502,24 @@ def parse_xt_xarid_api():
 
                 title = item_title(item)
                 tender_url = item_url(item, base_url, "XT-Xarid")
-                add_tender(tenders, seen, "XT-Xarid", title, tender_url)
+
+                if raw:
+                    add_raw_candidate(candidates, seen, "XT-Xarid", title, tender_url)
+                else:
+                    add_tender(tenders, seen, "XT-Xarid", title, tender_url)
 
         except Exception as e:
             print("XT-Xarid API ERROR:", e)
 
-    print("XT-Xarid API cargo_service_tenders=", len(tenders))
-    return tenders
+    return candidates if raw else tenders
 
 
-def parse_xt_xarid():
-    return parse_xt_xarid_api()
+def parse_xt_xarid(raw=False):
+    return parse_xt_xarid_api(raw=raw)
 
 
-def parse_uzex():
-    return parse_uzex_api()
+def parse_uzex(raw=False):
+    return parse_uzex_api(raw=raw)
 
 
 def tender_exists(url):
@@ -493,7 +547,7 @@ def save_to_sheet(site, title, url):
             site,
             "Новый",
             "Средний",
-            "Проверить лот: найдено по фильтру SERVICE ONLY — услуги перевозки / логистика / экспедиция",
+            "Проверить лот: найдено по Cargo V17 Balanced Search",
             title,
         ])
 
@@ -506,7 +560,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V16 Service Only is running"}
+    return {"status": "AI Tender Agent Cargo V17 Balanced Search is running"}
 
 
 @app.head("/")
@@ -516,7 +570,7 @@ def head_home():
 
 @app.get("/version")
 def version():
-    return {"version": "cargo_v16_service_only", "status": "running"}
+    return {"version": "cargo_v17_balanced_search", "status": "running"}
 
 
 @app.get("/health")
@@ -581,7 +635,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v16_service_only",
+        "version": "cargo_v17_balanced_search",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -627,6 +681,7 @@ def debug_items():
                     "site": source_name,
                     "title": item.get("title"),
                     "url": item.get("url"),
+                    "reason": item.get("reason"),
                 })
         except Exception as e:
             all_items.append({
@@ -635,9 +690,40 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v16_service_only",
+        "version": "cargo_v17_balanced_search",
         "count": len(all_items),
         "items": all_items[:30],
+    }
+
+
+@app.get("/debug_raw_candidates")
+def debug_raw_candidates():
+    all_items = []
+
+    for source_name, parser in [
+        ("Tenderweek", parse_tenderweek),
+        ("UZEX", parse_uzex),
+        ("XT-Xarid", parse_xt_xarid),
+    ]:
+        try:
+            result = parser(raw=True)
+            for item in result[:25]:
+                all_items.append(item)
+        except Exception as e:
+            all_items.append({
+                "site": source_name,
+                "error": str(e),
+            })
+
+    accepted = [x for x in all_items if x.get("accepted") is True]
+    rejected = [x for x in all_items if x.get("accepted") is False]
+
+    return {
+        "version": "cargo_v17_balanced_search",
+        "total_candidates_sample": len(all_items),
+        "accepted_sample": len(accepted),
+        "rejected_sample": len(rejected),
+        "items": all_items[:75],
     }
 
 
@@ -649,7 +735,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v16_service_only",
+            "version": "cargo_v17_balanced_search",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -658,7 +744,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v16_service_only", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_balanced_search", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -680,7 +766,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v16_service_only",
+            "version": "cargo_v17_balanced_search",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -689,7 +775,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v16_service_only", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_balanced_search", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -702,7 +788,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V16 Service Only Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V17 Balanced Search Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -764,7 +850,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v16_service_only",
+        "version": "cargo_v17_balanced_search",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
@@ -795,3 +881,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
     )
+    
