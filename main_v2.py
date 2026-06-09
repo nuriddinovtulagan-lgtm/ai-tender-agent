@@ -7,7 +7,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V13")
+app = FastAPI(title="AI Tender Agent Cargo V14 Debug")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -22,6 +22,12 @@ SEARCH_WORDS = [
     "экспедиторские услуги",
     "логистические услуги",
     "транспортно-экспедиционные услуги",
+    "yuk tashish",
+    "transport xizmati",
+    "logistika",
+    "ekspeditorlik",
+    "xalqaro tashuv",
+    "avtomobil tashuv",
 ]
 
 GOOD_WORDS = [
@@ -30,7 +36,9 @@ GOOD_WORDS = [
     "фура", "тягач", "рефриж", "cargo", "freight",
     "delivery", "logistics", "transport",
     "yuk", "yuklarni", "tashish", "tashuvchi",
-    "avtotransport", "avtosisterna", "xizmatlari",
+    "tashuv", "tashuvchi", "avtotransport", "avtomobil",
+    "avtosisterna", "xizmatlari", "xizmati",
+    "logistika", "ekspeditorlik", "xalqaro",
 ]
 
 BAD_WORDS = [
@@ -39,7 +47,7 @@ BAD_WORDS = [
     "строительств", "ремонт", "канцеляр", "компьютер", "принтер",
     "медицин", "питание", "продукт", "одежд", "обув",
     "электро", "юридическ", "аудит", "страхован", "охрана",
-    "дезинфек", "дезинсек", "дерatiz", "овқат", "еда", "питания",
+    "дезинфек", "дезинсек", "deratiz", "овқат", "еда", "питания",
     "payvandlash", "метал конструкц", "metal konstruksiya",
 ]
 
@@ -178,7 +186,7 @@ def collect_links(base_url, pages, site, limit=7):
 
     for page_url in pages[:limit]:
         try:
-            r = requests.get(page_url, headers=get_headers(), timeout=5)
+            r = requests.get(page_url, headers=get_headers(), timeout=12)
 
             print(f"{site} PAGE:", page_url)
             print(f"{site} STATUS:", r.status_code)
@@ -297,13 +305,14 @@ def parse_uzex_api():
 
     for payload in payloads:
         try:
-            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=8)
+            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
 
             print("UZEX API:", url)
             print("UZEX API PAYLOAD:", payload)
             print("UZEX API STATUS:", r.status_code)
             print("UZEX API SIZE:", len(r.text))
             print("UZEX API TYPE:", r.headers.get("content-type", ""))
+            print("UZEX API TEXT START:", r.text[:1000])
 
             if r.status_code != 200:
                 continue
@@ -317,8 +326,7 @@ def parse_uzex_api():
                     continue
 
                 title = item_title(item)
-                item_id = item.get("id") or item.get("display_no")
-                tender_url = f"https://etender.uzex.uz/lot/{item_id}" if item_id else base_url
+                tender_url = item_url(item, base_url, "UZEX")
 
                 add_tender(tenders, seen, "UZEX", title, tender_url)
 
@@ -364,13 +372,14 @@ def parse_xt_xarid_api():
 
     for payload in payloads:
         try:
-            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=8)
+            r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
 
             print("XT-Xarid API:", url)
             print("XT-Xarid API PAYLOAD:", payload)
             print("XT-Xarid API STATUS:", r.status_code)
             print("XT-Xarid API SIZE:", len(r.text))
             print("XT-Xarid API TYPE:", r.headers.get("content-type", ""))
+            print("XT-Xarid API TEXT START:", r.text[:1000])
 
             if r.status_code != 200:
                 continue
@@ -441,7 +450,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V13 is running"}
+    return {"status": "AI Tender Agent Cargo V14 Debug is running"}
 
 
 @app.head("/")
@@ -451,7 +460,7 @@ def head_home():
 
 @app.get("/version")
 def version():
-    return {"version": "cargo_v13", "status": "running"}
+    return {"version": "cargo_v14_debug", "status": "running"}
 
 
 @app.get("/health")
@@ -490,7 +499,122 @@ def test_filter():
             "O’zbekneftgaz yuklarni tashuvchi avtotransporti xizmatlari",
             "https://etender.uzex.uz/lot/488787",
         ),
+        "yuk tashish xizmati": is_real_cargo_tender(
+            "yuk tashish xizmati",
+            "https://etender.uzex.uz/lot/777",
+        ),
+        "xalqaro transport xizmati": is_real_cargo_tender(
+            "xalqaro transport xizmati",
+            "https://xt-xarid.uz/procedure/888",
+        ),
     }
+
+
+@app.get("/debug_sources")
+def debug_sources():
+    result = {
+        "version": "cargo_v14_debug",
+        "Tenderweek": 0,
+        "UZEX": 0,
+        "XT-Xarid": 0,
+        "total": 0,
+        "errors": [],
+    }
+
+    try:
+        tw = parse_tenderweek()
+        result["Tenderweek"] = len(tw)
+    except Exception as e:
+        result["errors"].append("Tenderweek error: " + str(e))
+
+    try:
+        uzex = parse_uzex()
+        result["UZEX"] = len(uzex)
+    except Exception as e:
+        result["errors"].append("UZEX error: " + str(e))
+
+    try:
+        xt = parse_xt_xarid()
+        result["XT-Xarid"] = len(xt)
+    except Exception as e:
+        result["errors"].append("XT-Xarid error: " + str(e))
+
+    result["total"] = result["Tenderweek"] + result["UZEX"] + result["XT-Xarid"]
+    return result
+
+
+@app.get("/debug_uzex")
+def debug_uzex():
+    url = "https://apietender.uzex.uz/api/common/TradeList"
+    payload = {"TypeId": 1, "From": 1, "To": 10, "System_Id": 0}
+
+    try:
+        r = requests.post(
+            url,
+            headers=get_headers(json_mode=True),
+            json=payload,
+            timeout=12,
+        )
+
+        return {
+            "version": "cargo_v14_debug",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "size": len(r.text),
+            "text_start": r.text[:1500],
+        }
+
+    except Exception as e:
+        return {
+            "version": "cargo_v14_debug",
+            "url": url,
+            "error": str(e),
+        }
+
+
+@app.get("/debug_xt")
+def debug_xt():
+    url = "https://api.xt-xarid.uz/rpc"
+
+    payload = {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "ref",
+        "params": {
+            "ref": "ref_tender_public",
+            "op": "read",
+            "limit": 10,
+            "offset": 0,
+            "filters": {},
+        },
+    }
+
+    try:
+        r = requests.post(
+            url,
+            headers=get_headers(json_mode=True),
+            json=payload,
+            timeout=12,
+        )
+
+        return {
+            "version": "cargo_v14_debug",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "size": len(r.text),
+            "text_start": r.text[:1500],
+        }
+
+    except Exception as e:
+        return {
+            "version": "cargo_v14_debug",
+            "url": url,
+            "error": str(e),
+        }
 
 
 @app.get("/scan")
@@ -503,7 +627,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V13 Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V14 Debug Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -511,14 +635,18 @@ def scan():
         ("XT-Xarid", parse_xt_xarid),
     ]
 
+    source_counts = {}
+
     for source_name, parser in sources:
         print("PARSING:", source_name)
 
         try:
             result = parser()
+            source_counts[source_name] = len(result)
             all_tenders.extend(result)
             message += f"{source_name}: найдено по грузоперевозкам {len(result)}\n"
         except Exception as e:
+            source_counts[source_name] = 0
             message += f"{source_name}: ERROR\n"
             print(f"{source_name} ERROR:", e)
 
@@ -566,7 +694,8 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v13",
+        "version": "cargo_v14_debug",
+        "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
         "duplicates": duplicate_total,
