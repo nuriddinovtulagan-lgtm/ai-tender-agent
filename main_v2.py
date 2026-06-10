@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V7 Sheet Autofill")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V8 Tender Manager")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -849,7 +849,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V7 Sheet Autofill is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V8 Tender Manager is running"}
 
 
 @app.head("/")
@@ -860,7 +860,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
         "status": "running"
     }
 
@@ -1327,7 +1327,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v7_sheet_autofill",
+            "version": "document_analyzer_v8_tender_manager",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1372,7 +1372,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v7_sheet_autofill",
+            "version": "document_analyzer_v8_tender_manager",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1476,6 +1476,99 @@ def test_uzex_sheet_analysis(lot_id: str = "494831"):
         }
 
 
+
+TENDER_MANAGER_COLUMNS = [
+    "Подавать",
+    "Ответственный",
+    "Дата решения",
+    "Статус участия",
+    "Комментарий директора",
+]
+
+
+def ensure_tender_manager_columns():
+    """
+    Adds tender management columns to Google Sheet.
+    Does not delete or overwrite existing columns.
+    """
+    sheet = get_sheet()
+    headers = sheet.row_values(1)
+
+    if not headers:
+        ensure_sheet_columns()
+        headers = sheet.row_values(1)
+
+    added = []
+    current_headers = sheet.row_values(1)
+
+    for col_name in TENDER_MANAGER_COLUMNS:
+        if col_name not in current_headers:
+            current_headers.append(col_name)
+            added.append(col_name)
+
+    if added:
+        end_col = len(current_headers)
+        end_a1 = gspread.utils.rowcol_to_a1(1, end_col)
+        end_col_letter = ''.join([c for c in end_a1 if c.isalpha()])
+        sheet.update(f"A1:{end_col_letter}1", [current_headers])
+
+    return {
+        "headers_total": len(current_headers),
+        "added": added,
+        "headers": current_headers,
+    }
+
+
+@app.get("/setup_tender_manager_columns")
+def setup_tender_manager_columns():
+    try:
+        # Keep analytical columns too
+        ensure_sheet_columns()
+        result = ensure_tender_manager_columns()
+
+        return {
+            "status": "ok",
+            "version": "tender_manager_v8",
+            "message": "Tender manager columns checked and updated",
+            **result,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "tender_manager_v8",
+            "error": str(e),
+        }
+
+
+@app.get("/tender_manager_status")
+def tender_manager_status():
+    try:
+        sheet = get_sheet()
+        headers = sheet.row_values(1)
+
+        missing = []
+        for col in EXTRA_SHEET_COLUMNS + TENDER_MANAGER_COLUMNS:
+            if col not in headers:
+                missing.append(col)
+
+        return {
+            "status": "ok" if not missing else "warning",
+            "version": "tender_manager_v8",
+            "headers_total": len(headers),
+            "missing_columns": missing,
+            "manager_columns": TENDER_MANAGER_COLUMNS,
+            "analytics_columns": EXTRA_SHEET_COLUMNS,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "tender_manager_v8",
+            "error": str(e),
+        }
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
@@ -1538,7 +1631,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1593,7 +1686,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1622,7 +1715,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1638,7 +1731,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+            "version": "cargo_v17_doc_analyzer_v8_tender_manager",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1647,7 +1740,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v7_sheet_autofill", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v8_tender_manager", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1669,7 +1762,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+            "version": "cargo_v17_doc_analyzer_v8_tender_manager",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1678,7 +1771,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v7_sheet_autofill", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v8_tender_manager", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1753,7 +1846,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
+        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
