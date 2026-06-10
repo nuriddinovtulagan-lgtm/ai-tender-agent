@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V8 Tender Manager")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V9 Backfill")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -849,7 +849,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V8 Tender Manager is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V9 Backfill is running"}
 
 
 @app.head("/")
@@ -860,7 +860,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+        "version": "cargo_v17_doc_analyzer_v9_backfill",
         "status": "running"
     }
 
@@ -1327,7 +1327,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v8_tender_manager",
+            "version": "document_analyzer_v9_backfill",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1372,7 +1372,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v8_tender_manager",
+            "version": "document_analyzer_v9_backfill",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1569,6 +1569,198 @@ def tender_manager_status():
         }
 
 
+
+def get_header_index_map(headers):
+    """
+    Returns dict: normalized header name -> 1-based column index.
+    Keeps original order from Google Sheets.
+    """
+    result = {}
+    for idx, h in enumerate(headers, start=1):
+        if h:
+            result[h.strip()] = idx
+    return result
+
+
+def update_row_analytics(sheet, row_number, headers_map, analytics):
+    """
+    Updates only analytical columns for one row.
+    """
+    cells = []
+
+    for col_name, value in analytics.items():
+        col_idx = headers_map.get(col_name)
+        if col_idx:
+            cells.append(gspread.Cell(row_number, col_idx, value))
+
+    if cells:
+        sheet.update_cells(cells, value_input_option="USER_ENTERED")
+
+    return len(cells)
+
+
+@app.get("/backfill_existing_tenders")
+def backfill_existing_tenders(limit: int = 50):
+    """
+    Backfills existing Google Sheet rows with UZEX analytical data.
+    It fills only rows with UZEX lot links and empty 'Заказчик'.
+    """
+    try:
+        ensure_sheet_columns()
+        ensure_tender_manager_columns()
+
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "backfill_v9",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        required = [
+            "Ссылка",
+            "Заказчик",
+            "Сумма",
+            "Валюта",
+            "Оплата",
+            "Срок оплаты",
+            "Срок оказания услуг",
+            "Требования",
+            "Рекомендация AI",
+        ]
+
+        missing = [h for h in required if h not in headers_map]
+        if missing:
+            return {
+                "status": "error",
+                "version": "backfill_v9",
+                "error": "Missing columns: " + ", ".join(missing),
+                "headers": headers,
+            }
+
+        processed = 0
+        updated = 0
+        skipped = 0
+        errors = []
+
+        link_col = headers_map["Ссылка"]
+        customer_col = headers_map["Заказчик"]
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if processed >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
+
+            if not link or "etender.uzex.uz/lot/" not in link:
+                skipped += 1
+                continue
+
+            if customer_value:
+                skipped += 1
+                continue
+
+            processed += 1
+
+            try:
+                analytics = analyze_uzex_for_sheet("UZEX", "Backfill UZEX lot", link)
+                cells_updated = update_row_analytics(sheet, row_idx, headers_map, analytics)
+
+                updated += 1
+
+            except Exception as e:
+                errors.append({
+                    "row": row_idx,
+                    "link": link,
+                    "error": str(e)[:250],
+                })
+
+        return {
+            "status": "ok",
+            "version": "backfill_v9",
+            "processed": processed,
+            "updated": updated,
+            "skipped": skipped,
+            "errors_count": len(errors),
+            "errors": errors[:10],
+            "message": "Existing UZEX tenders backfill completed",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "backfill_v9",
+            "error": str(e),
+        }
+
+
+@app.get("/backfill_preview")
+def backfill_preview(limit: int = 20):
+    """
+    Preview rows that would be backfilled without changing the sheet.
+    """
+    try:
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "backfill_v9",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        if "Ссылка" not in headers_map or "Заказчик" not in headers_map:
+            return {
+                "status": "error",
+                "version": "backfill_v9",
+                "error": "Required columns not found",
+                "headers": headers,
+            }
+
+        link_col = headers_map["Ссылка"]
+        customer_col = headers_map["Заказчик"]
+
+        candidates = []
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if len(candidates) >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
+
+            if link and "etender.uzex.uz/lot/" in link and not customer_value:
+                candidates.append({
+                    "row": row_idx,
+                    "link": link,
+                    "lot_id": extract_lot_id_from_url(link),
+                })
+
+        return {
+            "status": "ok",
+            "version": "backfill_v9",
+            "candidates_count": len(candidates),
+            "candidates": candidates,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "backfill_v9",
+            "error": str(e),
+        }
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
@@ -1631,7 +1823,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+        "version": "cargo_v17_doc_analyzer_v9_backfill",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1686,7 +1878,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+        "version": "cargo_v17_doc_analyzer_v9_backfill",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1715,7 +1907,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+        "version": "cargo_v17_doc_analyzer_v9_backfill",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1731,7 +1923,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+            "version": "cargo_v17_doc_analyzer_v9_backfill",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1740,7 +1932,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v8_tender_manager", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v9_backfill", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1762,7 +1954,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+            "version": "cargo_v17_doc_analyzer_v9_backfill",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1771,7 +1963,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v8_tender_manager", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v9_backfill", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1846,7 +2038,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v8_tender_manager",
+        "version": "cargo_v17_doc_analyzer_v9_backfill",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
