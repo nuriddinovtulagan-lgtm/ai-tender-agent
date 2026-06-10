@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V6 Sheet Columns")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V7 Sheet Autofill")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -505,23 +505,222 @@ def tender_exists(url):
         return False
 
 
+def extract_lot_id_from_url(url):
+    if not url:
+        return None
+
+    url = str(url).strip().rstrip("/")
+    parts = url.split("/")
+
+    for part in reversed(parts):
+        if part.isdigit():
+            return part
+
+    return None
+
+
+def safe_json_loads(raw, default=None):
+    if default is None:
+        default = []
+
+    if not raw:
+        return default
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def get_uzex_lot_data(lot_id):
+    api_url = f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0"
+    r = requests.get(api_url, headers=get_headers(json_mode=True), timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def short_requirements_from_trade(trade):
+    parts = []
+
+    budget_products = safe_json_loads(trade.get("budget_products"), [])
+    if budget_products:
+        p = budget_products[0]
+        desc = clean_text(p.get("Description", ""))
+        delivery = p.get("Delivery_Term")
+        category = clean_text(p.get("Category_Name", ""))
+        if desc:
+            parts.append(desc[:350])
+        if category:
+            parts.append("Категория: " + category)
+        if delivery:
+            parts.append(f"Срок оказания: {delivery} дней")
+
+    q_fields = trade.get("js_qualification_fields") or []
+    if isinstance(q_fields, list) and q_fields:
+        q_short = []
+        for q in q_fields[:5]:
+            name = clean_text(q.get("name", ""))
+            if name:
+                q_short.append(name[:120])
+        if q_short:
+            parts.append("Квалификация: " + "; ".join(q_short))
+
+    if not parts:
+        return ""
+
+    return clean_text(" | ".join(parts))[:900]
+
+
+def ai_recommendation_from_trade(trade, title=""):
+    budget_products = safe_json_loads(trade.get("budget_products"), [])
+    description = ""
+    product_name = ""
+
+    if budget_products:
+        product_name = clean_text(budget_products[0].get("Product_Name", ""))
+        description = clean_text(budget_products[0].get("Description", ""))
+
+    text = normalize_text(" ".join([
+        title or "",
+        product_name,
+        description,
+        trade.get("customer_name") or "",
+        trade.get("technical_description") or "",
+    ]))
+
+    very_high_words = [
+        "xalqaro", "международ", "multimodal", "мультимод",
+        "gabarit bo'lmagan", "gabarit bo’lmagan", "негабарит",
+        "og'ir vazn", "og’ir vazn", "тяжеловес",
+        "xitoy", "китай", "qozog", "казахстан",
+    ]
+
+    high_words = [
+        "yuk tashish", "yuklarni tashish", "перевозка грузов",
+        "транспортно-экспедитор", "экспедитор",
+        "логистика", "logistika", "transport",
+    ]
+
+    bad_words = [
+        "лаборатор", "оборудован", "поставка", "закупка",
+        "ремонт", "строитель", "консультац", "типограф",
+    ]
+
+    if any(w in text for w in bad_words):
+        return "Отказаться: не профильная закупка для Trans Ocean Logistics"
+
+    if any(w in text for w in very_high_words):
+        return "Участвовать: высокий приоритет, международная/сложная логистика, нужны партнёры и расчёт себестоимости"
+
+    if any(w in text for w in high_words):
+        return "Рассмотреть участие: профильная логистическая услуга"
+
+    return "Изучить: требуется ручная проверка условий"
+
+
+def analyze_uzex_for_sheet(site, title, url):
+    """
+    Returns values for analytical Google Sheet columns.
+    Only UZEX lots are enriched through API.
+    For other sources returns empty fields.
+    """
+    empty = {
+        "Заказчик": "",
+        "Сумма": "",
+        "Валюта": "",
+        "Оплата": "",
+        "Срок оплаты": "",
+        "Срок оказания услуг": "",
+        "Требования": "",
+        "Рекомендация AI": "",
+    }
+
+    if site != "UZEX":
+        return empty
+
+    lot_id = extract_lot_id_from_url(url)
+    if not lot_id:
+        empty["Рекомендация AI"] = "Не удалось определить ID лота"
+        return empty
+
+    try:
+        trade = get_uzex_lot_data(lot_id)
+        budget_products = safe_json_loads(trade.get("budget_products"), [])
+
+        delivery_term = ""
+        if budget_products:
+            delivery_term = budget_products[0].get("Delivery_Term", "") or ""
+
+        return {
+            "Заказчик": trade.get("customer_name", "") or "",
+            "Сумма": trade.get("start_cost", "") or "",
+            "Валюта": trade.get("currency_codeabc", "") or trade.get("currency_name", "") or "",
+            "Оплата": trade.get("payment_type_name", "") or "",
+            "Срок оплаты": trade.get("term_payment_days", "") or "",
+            "Срок оказания услуг": delivery_term,
+            "Требования": short_requirements_from_trade(trade),
+            "Рекомендация AI": ai_recommendation_from_trade(trade, title),
+        }
+
+    except Exception as e:
+        empty["Рекомендация AI"] = "Ошибка анализа UZEX API: " + str(e)[:180]
+        return empty
+
+
+def make_row_by_headers(headers, base_values, analytics):
+    """
+    Creates a row matching current sheet headers.
+    This avoids mistakes if column order changes.
+    """
+    base_map = {
+        "Дата": base_values.get("Дата", ""),
+        "Отправил": base_values.get("Отправил", ""),
+        "Ссылка": base_values.get("Ссылка", ""),
+        "Источник": base_values.get("Источник", ""),
+        "Статус": base_values.get("Статус", ""),
+        "Приоритет": base_values.get("Приоритет", ""),
+        "Приоритет ": base_values.get("Приоритет", ""),
+        "AI анализ": base_values.get("AI анализ", ""),
+        "Комментарий": base_values.get("Комментарий", ""),
+    }
+
+    row = []
+    for h in headers:
+        clean_h = h.strip()
+        if h in base_map:
+            row.append(base_map[h])
+        elif clean_h in analytics:
+            row.append(analytics[clean_h])
+        else:
+            row.append("")
+
+    return row
+
+
 def save_to_sheet(site, title, url):
     try:
         if tender_exists(url):
             return False
 
+        ensure_sheet_columns()
         sheet = get_sheet()
+        headers = sheet.row_values(1)
 
-        sheet.append_row([
-            datetime.now().strftime("%d.%m.%Y %H:%M"),
-            "AI Agent",
-            url,
-            site,
-            "Новый",
-            "Средний",
-            "Проверить лот: найдено по Cargo V17 Balanced Search",
-            title,
-        ])
+        analytics = analyze_uzex_for_sheet(site, title, url)
+
+        base_values = {
+            "Дата": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            "Отправил": "AI Agent",
+            "Ссылка": url,
+            "Источник": site,
+            "Статус": "Новый",
+            "Приоритет": "Средний",
+            "AI анализ": "Проверить лот: найдено по Cargo V17 + V7 Auto Fill",
+            "Комментарий": title,
+        }
+
+        row = make_row_by_headers(headers, base_values, analytics)
+        sheet.append_row(row)
 
         return True
 
@@ -650,7 +849,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V6 Sheet Columns is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V7 Sheet Autofill is running"}
 
 
 @app.head("/")
@@ -661,7 +860,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
         "status": "running"
     }
 
@@ -1128,7 +1327,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v6_sheet_columns",
+            "version": "document_analyzer_v7_sheet_autofill",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1173,7 +1372,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v6_sheet_columns",
+            "version": "document_analyzer_v7_sheet_autofill",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1254,6 +1453,29 @@ def setup_sheet_columns():
         }
 
 
+
+@app.get("/test_uzex_sheet_analysis")
+def test_uzex_sheet_analysis(lot_id: str = "494831"):
+    try:
+        url = f"https://etender.uzex.uz/lot/{lot_id}"
+        title = f"UZEX lot {lot_id}"
+        data = analyze_uzex_for_sheet("UZEX", title, url)
+        return {
+            "status": "ok",
+            "version": "sheet_autofill_v7",
+            "lot_id": lot_id,
+            "url": url,
+            "analysis": data,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "sheet_autofill_v7",
+            "lot_id": lot_id,
+            "error": str(e),
+        }
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
@@ -1316,7 +1538,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1371,7 +1593,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1400,7 +1622,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1416,7 +1638,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+            "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1425,7 +1647,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v6_sheet_columns", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v7_sheet_autofill", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1447,7 +1669,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+            "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1456,7 +1678,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v6_sheet_columns", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v7_sheet_autofill", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1531,7 +1753,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
+        "version": "cargo_v17_doc_analyzer_v7_sheet_autofill",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
