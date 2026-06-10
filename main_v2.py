@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V4 Read UZEX Docs")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V5 File URL Fallback")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -650,7 +650,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V4 Read UZEX Docs is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V5 File URL Fallback is running"}
 
 
 @app.head("/")
@@ -661,7 +661,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
         "status": "running"
     }
 
@@ -827,25 +827,88 @@ def debug_uzex_lot_api(lot_id: str):
 
 
 def build_file_url(file_path):
+    """
+    Backward-compatible primary URL builder.
+    V5 uses build_file_url_candidates() for fallback downloading.
+    """
+    candidates = build_file_url_candidates(file_path)
+    return candidates[0] if candidates else None
+
+
+def build_file_url_candidates(file_path):
+    """
+    UZEX stores file paths inconsistently.
+    The same path may work from etender.uzex.uz or apietender.uzex.uz.
+    This function returns several safe candidates and downloader tries them one by one.
+    """
     if not file_path:
-        return None
+        return []
 
     file_path = str(file_path).strip()
+    candidates = []
 
     if file_path.startswith("http://") or file_path.startswith("https://"):
-        return file_path
+        return [file_path]
 
-    if file_path.startswith("/"):
-        return "https://apietender.uzex.uz" + file_path
+    clean = file_path.lstrip("/")
 
-    return "https://apietender.uzex.uz/" + file_path
+    # Most likely public file hosts
+    candidates.append("https://etender.uzex.uz/" + clean)
+    candidates.append("https://apietender.uzex.uz/" + clean)
+
+    # Some UZEX paths are returned as /files/..., some as tender/user-files/...
+    if clean.startswith("files/"):
+        candidates.append("https://etender.uzex.uz/" + clean)
+        candidates.append("https://apietender.uzex.uz/" + clean)
+
+    if clean.startswith("tender/user-files/"):
+        candidates.append("https://etender.uzex.uz/" + clean)
+        candidates.append("https://apietender.uzex.uz/" + clean)
+
+    # Deduplicate while preserving order
+    result = []
+    seen = set()
+    for u in candidates:
+        if u not in seen:
+            seen.add(u)
+            result.append(u)
+
+    return result
 
 
-def read_pdf_from_url(file_url, max_pages=12):
-    r = requests.get(file_url, headers=get_headers(), timeout=30)
-    r.raise_for_status()
+def download_file_with_fallback(file_path):
+    """
+    Tries all possible URLs for a file path.
+    Returns: (content_bytes, working_url, attempts)
+    """
+    attempts = []
 
-    reader = PyPDF2.PdfReader(io.BytesIO(r.content))
+    for file_url in build_file_url_candidates(file_path):
+        try:
+            r = requests.get(file_url, headers=get_headers(), timeout=30)
+            info = {
+                "url": file_url,
+                "status_code": r.status_code,
+                "content_type": r.headers.get("content-type", ""),
+                "size": len(r.content or b""),
+            }
+
+            attempts.append(info)
+
+            if r.status_code == 200 and r.content:
+                return r.content, file_url, attempts
+
+        except Exception as e:
+            attempts.append({
+                "url": file_url,
+                "error": str(e),
+            })
+
+    raise Exception("All file URL candidates failed: " + json.dumps(attempts, ensure_ascii=False)[:1200])
+
+
+def read_pdf_from_bytes(file_bytes, max_pages=12):
+    reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
     text_parts = []
 
     for i, page in enumerate(reader.pages[:max_pages]):
@@ -859,11 +922,8 @@ def read_pdf_from_url(file_url, max_pages=12):
     return clean_text("\n".join(text_parts))
 
 
-def read_docx_from_url(file_url):
-    r = requests.get(file_url, headers=get_headers(), timeout=30)
-    r.raise_for_status()
-
-    doc = Document(io.BytesIO(r.content))
+def read_docx_from_bytes(file_bytes):
+    doc = Document(io.BytesIO(file_bytes))
     text_parts = []
 
     for p in doc.paragraphs:
@@ -1002,13 +1062,14 @@ def analyze_uzex_lot(lot_id: str):
             if not path:
                 continue
 
-            file_url = build_file_url(path)
             doc_info = {
                 "type": doc_type,
                 "name": name,
                 "ext": ext,
                 "path": path,
-                "url": file_url,
+                "url_candidates": build_file_url_candidates(path),
+                "working_url": None,
+                "download_attempts": [],
                 "read_status": "not_read",
                 "text_preview": "",
             }
@@ -1016,14 +1077,18 @@ def analyze_uzex_lot(lot_id: str):
             try:
                 ext_norm = (ext or name or path or "").lower()
 
+                file_bytes, working_url, attempts = download_file_with_fallback(path)
+                doc_info["working_url"] = working_url
+                doc_info["download_attempts"] = attempts
+
                 if "pdf" in ext_norm:
-                    text = read_pdf_from_url(file_url)
+                    text = read_pdf_from_bytes(file_bytes)
                     doc_info["read_status"] = "ok"
                     doc_info["text_preview"] = text[:1200]
                     combined_text += "\n" + text
 
                 elif "docx" in ext_norm:
-                    text = read_docx_from_url(file_url)
+                    text = read_docx_from_bytes(file_bytes)
                     doc_info["read_status"] = "ok"
                     doc_info["text_preview"] = text[:1200]
                     combined_text += "\n" + text
@@ -1063,7 +1128,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v4_read_uzex_docs",
+            "version": "document_analyzer_v5_file_url_fallback",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1108,7 +1173,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v4_read_uzex_docs",
+            "version": "document_analyzer_v5_file_url_fallback",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1176,7 +1241,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1231,7 +1296,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1260,7 +1325,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1276,7 +1341,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+            "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1285,7 +1350,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v4_read_uzex_docs", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v5_file_url_fallback", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1307,7 +1372,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+            "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1316,7 +1381,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v4_read_uzex_docs", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v5_file_url_fallback", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1391,7 +1456,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
+        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
