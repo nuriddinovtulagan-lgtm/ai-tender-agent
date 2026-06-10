@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V9 Backfill")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V10 Quality Filter")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -70,6 +70,44 @@ HARD_BAD_WORDS = [
 ]
 
 SOFT_BAD_WORDS = ["товар", "материал", "изделие", "деталь", "агрегат", "насос", "кабель", "труба", "краска", "масло"]
+
+QUALITY_BAD_CONTEXT_WORDS = [
+    # Materials / goods, not logistics service
+    "инерт материал", "инертные материалы", "щебень", "песок", "гравий",
+    "бетон", "цемент", "арматура", "кирпич", "строительный материал",
+    "қум", "шағал", "цемент", "бетон", "inert material", "qum", "shag'al",
+
+    # Waste / utility / non-core
+    "утилизация", "чиқинди", "отход", "maishiy chiqindi", "qattiq chiqindi",
+    "мусор", "вывоз мусора",
+
+    # Printing, food, medical, office, consulting
+    "типограф", "печать", "газет", "bosmaxona", "chop etish",
+    "овқат", "питание", "еда", "медицин", "лаборатор",
+    "консультац", "технадзор", "аудит", "юридическ",
+
+    # Purchase of vehicles/spare parts/equipment
+    "закупка", "поставка", "приобретение", "сотиб олиш",
+    "запчаст", "запасн", "ось", "шасси", "двигател", "оборудован",
+    "смесительно-заряд", "инструмент", "набор инструментов",
+]
+
+QUALITY_GOOD_CONTEXT_WORDS = [
+    "перевозка грузов", "перевозке грузов", "услуга перевозка грузов",
+    "транспортно-экспедитор", "экспедиторские услуги",
+    "логистические услуги", "международная перевозка", "международные перевозки",
+    "мультимодальная", "мультимодальные", "негабарит", "тяжеловес",
+    "yuk tashish", "yuklarni tashish", "yuk tashish xizmati",
+    "xalqaro yuk tashish", "xalqaro", "logistika xizmatlari",
+    "ekspeditorlik", "multimodal", "gabarit bo", "og'ir vazn", "og’ir vazn",
+]
+
+QUALITY_STRONG_GOOD_WORDS = [
+    "xalqaro", "международ", "multimodal", "мультимод",
+    "негабарит", "тяжеловес", "gabarit bo", "og'ir vazn", "og’ir vazn",
+    "экспедитор", "logistika",
+]
+
 
 BAD_URL_PARTS = [
     "register", "login", "logout", "signin", "signup", "cabinet", "profile",
@@ -571,51 +609,90 @@ def short_requirements_from_trade(trade):
     return clean_text(" | ".join(parts))[:900]
 
 
-def ai_recommendation_from_trade(trade, title=""):
+def quality_decision_from_trade(trade, title=""):
+    """
+    Decides if tender is real logistics for Trans Ocean Logistics.
+    Uses UZEX API fields, not only parser title.
+    """
     budget_products = safe_json_loads(trade.get("budget_products"), [])
     description = ""
     product_name = ""
+    category_name = ""
 
     if budget_products:
         product_name = clean_text(budget_products[0].get("Product_Name", ""))
         description = clean_text(budget_products[0].get("Description", ""))
+        category_name = clean_text(budget_products[0].get("Category_Name", ""))
 
     text = normalize_text(" ".join([
         title or "",
         product_name,
         description,
+        category_name,
         trade.get("customer_name") or "",
         trade.get("technical_description") or "",
     ]))
 
-    very_high_words = [
-        "xalqaro", "международ", "multimodal", "мультимод",
-        "gabarit bo'lmagan", "gabarit bo’lmagan", "негабарит",
-        "og'ir vazn", "og’ir vazn", "тяжеловес",
-        "xitoy", "китай", "qozog", "казахстан",
-    ]
+    bad_hits = [w for w in QUALITY_BAD_CONTEXT_WORDS if w in text]
+    good_hits = [w for w in QUALITY_GOOD_CONTEXT_WORDS if w in text]
+    strong_hits = [w for w in QUALITY_STRONG_GOOD_WORDS if w in text]
 
-    high_words = [
-        "yuk tashish", "yuklarni tashish", "перевозка грузов",
-        "транспортно-экспедитор", "экспедитор",
-        "логистика", "logistika", "transport",
-    ]
+    # Strong international/expedition context overrides generic "material" words only if service is clearly logistics.
+    if strong_hits and any(w in text for w in ["yuk tashish", "перевоз", "transport", "логист", "экспедитор"]):
+        return {
+            "logistics": "Да",
+            "priority": "Очень высокий",
+            "risk": "Средний",
+            "win_chance": "Высокий",
+            "reason": "Сильный профиль логистики: " + ", ".join(strong_hits[:4]),
+            "decision": "Участвовать: высокий приоритет, международная/сложная логистика, нужны партнёры и расчёт себестоимости",
+        }
 
-    bad_words = [
-        "лаборатор", "оборудован", "поставка", "закупка",
-        "ремонт", "строитель", "консультац", "типограф",
-    ]
+    # If bad context exists and there is no strong logistics service context, reject.
+    if bad_hits and not strong_hits:
+        return {
+            "logistics": "Нет",
+            "priority": "Низкий",
+            "risk": "Высокий",
+            "win_chance": "Низкий",
+            "reason": "Непрофильный контекст: " + ", ".join(bad_hits[:5]),
+            "decision": "Отказаться: непрофильная закупка или не транспортная услуга для Trans Ocean Logistics",
+        }
 
-    if any(w in text for w in bad_words):
-        return "Отказаться: не профильная закупка для Trans Ocean Logistics"
+    # Service cargo tender, normal case.
+    if good_hits:
+        return {
+            "logistics": "Да",
+            "priority": "Высокий",
+            "risk": "Средний",
+            "win_chance": "Средний",
+            "reason": "Профильная логистическая услуга: " + ", ".join(good_hits[:5]),
+            "decision": "Рассмотреть участие: профильная логистическая услуга",
+        }
 
-    if any(w in text for w in very_high_words):
-        return "Участвовать: высокий приоритет, международная/сложная логистика, нужны партнёры и расчёт себестоимости"
+    # Weak wording with "transport" but unclear.
+    if any(w in text for w in ["transport", "транспорт", "avtotransport", "yuk"]):
+        return {
+            "logistics": "Сомнительно",
+            "priority": "Средний",
+            "risk": "Средний",
+            "win_chance": "Средний",
+            "reason": "Есть транспортные слова, но требуется ручная проверка",
+            "decision": "Изучить: требуется ручная проверка условий",
+        }
 
-    if any(w in text for w in high_words):
-        return "Рассмотреть участие: профильная логистическая услуга"
+    return {
+        "logistics": "Нет",
+        "priority": "Низкий",
+        "risk": "Высокий",
+        "win_chance": "Низкий",
+        "reason": "Нет достаточных признаков логистической услуги",
+        "decision": "Отказаться: недостаточно признаков профильной логистики",
+    }
 
-    return "Изучить: требуется ручная проверка условий"
+
+def ai_recommendation_from_trade(trade, title=""):
+    return quality_decision_from_trade(trade, title).get("decision", "Изучить")
 
 
 def analyze_uzex_for_sheet(site, title, url):
@@ -625,6 +702,12 @@ def analyze_uzex_for_sheet(site, title, url):
     For other sources returns empty fields.
     """
     empty = {
+        "Логистика": "",
+        "Приоритет": "",
+        "Приоритет ": "",
+        "Риск": "",
+        "Риск ": "",
+        "Шанс победы": "",
         "Заказчик": "",
         "Сумма": "",
         "Валюта": "",
@@ -651,7 +734,15 @@ def analyze_uzex_for_sheet(site, title, url):
         if budget_products:
             delivery_term = budget_products[0].get("Delivery_Term", "") or ""
 
+        quality = quality_decision_from_trade(trade, title)
+
         return {
+            "Логистика": quality.get("logistics", ""),
+            "Приоритет": quality.get("priority", ""),
+            "Приоритет ": quality.get("priority", ""),
+            "Риск": quality.get("risk", ""),
+            "Риск ": quality.get("risk", ""),
+            "Шанс победы": quality.get("win_chance", ""),
             "Заказчик": trade.get("customer_name", "") or "",
             "Сумма": trade.get("start_cost", "") or "",
             "Валюта": trade.get("currency_codeabc", "") or trade.get("currency_name", "") or "",
@@ -659,7 +750,7 @@ def analyze_uzex_for_sheet(site, title, url):
             "Срок оплаты": trade.get("term_payment_days", "") or "",
             "Срок оказания услуг": delivery_term,
             "Требования": short_requirements_from_trade(trade),
-            "Рекомендация AI": ai_recommendation_from_trade(trade, title),
+            "Рекомендация AI": quality.get("decision", ""),
         }
 
     except Exception as e:
@@ -849,7 +940,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V9 Backfill is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V10 Quality Filter is running"}
 
 
 @app.head("/")
@@ -860,7 +951,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v9_backfill",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "status": "running"
     }
 
@@ -1327,7 +1418,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v9_backfill",
+            "version": "document_analyzer_v10_quality_filter",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1372,7 +1463,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v9_backfill",
+            "version": "document_analyzer_v10_quality_filter",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1761,6 +1852,120 @@ def backfill_preview(limit: int = 20):
         }
 
 
+
+@app.get("/test_quality_filter")
+def test_quality_filter():
+    samples = {
+        "Услуга по перевозке грузов": "Услуга по перевозке грузов",
+        "Международная мультимодальная перевозка негабаритных грузов": "Xitoy-Qozog’iston-O’zbekiston yo’nalishi bo’yicha gabarit bo’lmagan va og’ir vaznli yuklarni tashish",
+        "Инертные материалы": "Инертные материалы с доставкой",
+        "Вывоз мусора": "qattiq va maishiy chiqindilarni olib chiqib ketish",
+        "Печать газет": "gazetalarni chop etish uchun bosmaxona xizmatlari",
+        "Закупка осей": "Ось грузовых автотранспортных средств",
+    }
+
+    result = {}
+    for name, text in samples.items():
+        fake_trade = {
+            "budget_products": json.dumps([{
+                "Product_Name": text,
+                "Description": text,
+                "Category_Name": "Услуги сухопутного и трубопроводного транспорта",
+                "Delivery_Term": 10,
+            }], ensure_ascii=False),
+            "customer_name": "TEST",
+            "technical_description": text,
+        }
+        result[name] = quality_decision_from_trade(fake_trade, text)
+
+    return {
+        "status": "ok",
+        "version": "quality_filter_v10",
+        "samples": result,
+    }
+
+
+@app.get("/quality_backfill_existing_tenders")
+def quality_backfill_existing_tenders(limit: int = 100):
+    """
+    Recalculates quality columns for existing UZEX rows:
+    Логистика, Приоритет, Риск, Шанс победы, Рекомендация AI.
+    Also refreshes analytical fields.
+    """
+    try:
+        ensure_sheet_columns()
+        ensure_tender_manager_columns()
+
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "quality_filter_v10",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        if "Ссылка" not in headers_map:
+            return {
+                "status": "error",
+                "version": "quality_filter_v10",
+                "error": "Missing column: Ссылка",
+            }
+
+        processed = 0
+        updated = 0
+        skipped = 0
+        errors = []
+
+        link_col = headers_map["Ссылка"]
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if processed >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+
+            if not link or "etender.uzex.uz/lot/" not in link:
+                skipped += 1
+                continue
+
+            processed += 1
+
+            try:
+                analytics = analyze_uzex_for_sheet("UZEX", "Quality backfill UZEX lot", link)
+                cells_updated = update_row_analytics(sheet, row_idx, headers_map, analytics)
+                updated += 1
+
+            except Exception as e:
+                errors.append({
+                    "row": row_idx,
+                    "link": link,
+                    "error": str(e)[:250],
+                })
+
+        return {
+            "status": "ok",
+            "version": "quality_filter_v10",
+            "processed": processed,
+            "updated": updated,
+            "skipped": skipped,
+            "errors_count": len(errors),
+            "errors": errors[:10],
+            "message": "Quality filter backfill completed",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "quality_filter_v10",
+            "error": str(e),
+        }
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
@@ -1823,7 +2028,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v9_backfill",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1878,7 +2083,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v9_backfill",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1907,7 +2112,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v9_backfill",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1923,7 +2128,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v9_backfill",
+            "version": "cargo_v17_doc_analyzer_v10_quality_filter",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1932,7 +2137,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v9_backfill", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v10_quality_filter", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1954,7 +2159,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v9_backfill",
+            "version": "cargo_v17_doc_analyzer_v10_quality_filter",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1963,7 +2168,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v9_backfill", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v10_quality_filter", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -2038,7 +2243,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v9_backfill",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
