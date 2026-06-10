@@ -1,5 +1,6 @@
 import os
 import json
+import io
 import requests
 from datetime import datetime
 from urllib.parse import urljoin
@@ -14,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V3 UZEX API Debug")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V4 Read UZEX Docs")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -649,7 +650,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V3 UZEX API Debug is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V4 Read UZEX Docs is running"}
 
 
 @app.head("/")
@@ -660,7 +661,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
         "status": "running"
     }
 
@@ -824,6 +825,295 @@ def debug_uzex_lot_api(lot_id: str):
     }
 
 
+
+def build_file_url(file_path):
+    if not file_path:
+        return None
+
+    file_path = str(file_path).strip()
+
+    if file_path.startswith("http://") or file_path.startswith("https://"):
+        return file_path
+
+    if file_path.startswith("/"):
+        return "https://apietender.uzex.uz" + file_path
+
+    return "https://apietender.uzex.uz/" + file_path
+
+
+def read_pdf_from_url(file_url, max_pages=12):
+    r = requests.get(file_url, headers=get_headers(), timeout=30)
+    r.raise_for_status()
+
+    reader = PyPDF2.PdfReader(io.BytesIO(r.content))
+    text_parts = []
+
+    for i, page in enumerate(reader.pages[:max_pages]):
+        try:
+            page_text = page.extract_text() or ""
+            if page_text:
+                text_parts.append(page_text)
+        except Exception as e:
+            text_parts.append(f"[PDF PAGE {i + 1} READ ERROR: {e}]")
+
+    return clean_text("\n".join(text_parts))
+
+
+def read_docx_from_url(file_url):
+    r = requests.get(file_url, headers=get_headers(), timeout=30)
+    r.raise_for_status()
+
+    doc = Document(io.BytesIO(r.content))
+    text_parts = []
+
+    for p in doc.paragraphs:
+        txt = clean_text(p.text)
+        if txt:
+            text_parts.append(txt)
+
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = " | ".join(clean_text(cell.text) for cell in row.cells)
+            if row_text.strip():
+                text_parts.append(row_text)
+
+    return clean_text("\n".join(text_parts))
+
+
+def get_uzex_trade(lot_id):
+    url = f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0"
+    r = requests.get(url, headers=get_headers(json_mode=True), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_budget_products(trade):
+    raw = trade.get("budget_products")
+    if not raw:
+        return []
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
+def analyze_text_for_logistics(title, text):
+    t = normalize_text(title + " " + text)
+
+    high_priority_words = [
+        "негабарит", "тяжеловес", "og'ir vazn", "og’ir vazn", "gabarit bo'lmagan",
+        "мультимодаль", "multimodal", "международн", "xalqaro",
+        "китай", "xitoy", "тяньцзинь", "tyantszin", "хоргос", "xorgos",
+        "казахстан", "qozog", "qozog'iston", "qozog’iston",
+        "электропоезд", "высокоскоростн", "poezd",
+    ]
+
+    medium_priority_words = [
+        "перевозка грузов", "yuk tashish", "транспортно-экспедитор",
+        "экспедитор", "transport", "logistika", "доставка",
+    ]
+
+    risk_words = [
+        "goldhofer", "gantry", "500", "745", "8x4", "низкорам", "модуль",
+        "специальные дорожные разрешения", "обследование дорог",
+        "страхование", "перестрах", "10 лет", "фото", "видео",
+    ]
+
+    priority = "Средний"
+    chance = "Средний"
+    risk = "Средний"
+    logistics = "Да"
+
+    if any(w in t for w in high_priority_words):
+        priority = "Очень высокий"
+        chance = "Высокий"
+
+    elif any(w in t for w in medium_priority_words):
+        priority = "Высокий"
+        chance = "Средний"
+
+    if any(w in t for w in risk_words):
+        risk = "Высокий" if "goldhofer" in t or "gantry" in t else "Средний"
+
+    if any(w in t for w in ["типограф", "лаборатор", "консультац", "оборудован", "ремонт"]):
+        logistics = "Нет"
+        priority = "Низкий"
+        chance = "Низкий"
+        risk = "Высокий"
+
+    if priority == "Очень высокий":
+        decision = "Изучить ТЗ и готовить участие с партнёрами"
+    elif priority == "Высокий":
+        decision = "Рассмотреть участие"
+    elif logistics == "Нет":
+        decision = "Отказаться"
+    else:
+        decision = "Изучить"
+
+    return {
+        "priority": priority,
+        "win_chance": chance,
+        "risk": risk,
+        "logistics": logistics,
+        "decision": decision,
+    }
+
+
+def pick_text_snippet(text, keywords, limit=700):
+    t = text or ""
+    low = t.lower()
+
+    for kw in keywords:
+        pos = low.find(kw.lower())
+        if pos >= 0:
+            start = max(0, pos - 250)
+            end = min(len(t), pos + limit)
+            return clean_text(t[start:end])
+
+    return clean_text(t[:limit])
+
+
+@app.get("/analyze_uzex_lot")
+def analyze_uzex_lot(lot_id: str):
+    try:
+        trade = get_uzex_trade(lot_id)
+
+        budget_products = extract_budget_products(trade)
+        product_name = ""
+        product_description = ""
+
+        if budget_products:
+            product_name = budget_products[0].get("Product_Name", "") or ""
+            product_description = budget_products[0].get("Description", "") or ""
+
+        documents = []
+
+        file_fields = [
+            ("tech_file", trade.get("tech_file_name"), trade.get("tech_file_path"), trade.get("tech_file_ext")),
+            ("tech_doc_file", trade.get("tech_doc_file_name"), trade.get("tech_doc_file_path"), trade.get("tech_doc_file_ext")),
+            ("contract_proform_file", trade.get("contract_proform_file_name"), trade.get("contract_proform_file_path"), trade.get("contract_proform_file_ext")),
+            ("prolong_file", trade.get("prolong_file_name"), trade.get("prolong_file_path"), trade.get("prolong_file_ext")),
+        ]
+
+        combined_text = ""
+
+        for doc_type, name, path, ext in file_fields:
+            if not path:
+                continue
+
+            file_url = build_file_url(path)
+            doc_info = {
+                "type": doc_type,
+                "name": name,
+                "ext": ext,
+                "path": path,
+                "url": file_url,
+                "read_status": "not_read",
+                "text_preview": "",
+            }
+
+            try:
+                ext_norm = (ext or name or path or "").lower()
+
+                if "pdf" in ext_norm:
+                    text = read_pdf_from_url(file_url)
+                    doc_info["read_status"] = "ok"
+                    doc_info["text_preview"] = text[:1200]
+                    combined_text += "\n" + text
+
+                elif "docx" in ext_norm:
+                    text = read_docx_from_url(file_url)
+                    doc_info["read_status"] = "ok"
+                    doc_info["text_preview"] = text[:1200]
+                    combined_text += "\n" + text
+
+                else:
+                    doc_info["read_status"] = "unsupported_ext"
+
+            except Exception as e:
+                doc_info["read_status"] = "error"
+                doc_info["error"] = str(e)
+
+            documents.append(doc_info)
+
+        base_title = " | ".join([
+            str(trade.get("customer_name") or ""),
+            str(product_name or ""),
+            str(product_description or ""),
+            str(trade.get("technical_description") or ""),
+        ])
+
+        scoring = analyze_text_for_logistics(base_title, combined_text)
+
+        route_snippet = pick_text_snippet(
+            combined_text,
+            ["маршрут", "тяньцзинь", "хоргос", "яллама", "ташкент", "tyantszin", "xorgos", "yallama"]
+        )
+
+        requirements_snippet = pick_text_snippet(
+            combined_text,
+            ["требования к участнику", "тягач", "goldhofer", "gantry", "требования к персоналу"]
+        )
+
+        payment_snippet = pick_text_snippet(
+            combined_text,
+            ["условия оплаты", "оплата", "payment", "30 календарных дней", "15 дней"]
+        )
+
+        result = {
+            "status": "ok",
+            "version": "document_analyzer_v4_read_uzex_docs",
+            "lot_id": lot_id,
+            "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
+            "lot": {
+                "id": trade.get("id"),
+                "display_no": trade.get("display_no"),
+                "customer_name": trade.get("customer_name"),
+                "customer_tin": trade.get("customer_tin"),
+                "start_date": trade.get("start_date"),
+                "end_date": trade.get("end_date"),
+                "start_cost": trade.get("start_cost"),
+                "currency": trade.get("currency_codeabc") or trade.get("currency_name"),
+                "valuation_name": trade.get("valuation_name"),
+                "payment_type_name": trade.get("payment_type_name"),
+                "term_payment_days": trade.get("term_payment_days"),
+                "delivery_term_days": budget_products[0].get("Delivery_Term") if budget_products else None,
+                "product_name": product_name,
+                "product_description": product_description,
+                "category_name": budget_products[0].get("Category_Name") if budget_products else None,
+            },
+            "documents_count": len(documents),
+            "documents": documents,
+            "analysis": {
+                "priority": scoring["priority"],
+                "win_chance": scoring["win_chance"],
+                "risk": scoring["risk"],
+                "logistics": scoring["logistics"],
+                "decision": scoring["decision"],
+                "route_snippet": route_snippet,
+                "requirements_snippet": requirements_snippet,
+                "payment_snippet": payment_snippet,
+                "summary": (
+                    f"Заказчик: {trade.get('customer_name')}. "
+                    f"Предмет: {product_name}. "
+                    f"Стартовая цена: {trade.get('start_cost')} {trade.get('currency_codeabc') or trade.get('currency_name')}. "
+                    f"Рекомендация: {scoring['decision']}."
+                ),
+            },
+        }
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "document_analyzer_v4_read_uzex_docs",
+            "lot_id": lot_id,
+            "error": str(e),
+        }
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
@@ -886,7 +1176,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -941,7 +1231,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -970,7 +1260,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -986,7 +1276,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+            "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -995,7 +1285,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v3_uzex_api_debug", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v4_read_uzex_docs", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1017,7 +1307,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+            "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1026,7 +1316,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v3_uzex_api_debug", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v4_read_uzex_docs", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1101,7 +1391,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
+        "version": "cargo_v17_doc_analyzer_v4_read_uzex_docs",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
@@ -1132,5 +1422,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
     )
-
-    
