@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V5 File URL Fallback")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V6 Sheet Columns")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -650,7 +650,7 @@ def try_post_json(url, payload):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V5 File URL Fallback is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V6 Sheet Columns is running"}
 
 
 @app.head("/")
@@ -661,7 +661,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
         "status": "running"
     }
 
@@ -1128,7 +1128,7 @@ def analyze_uzex_lot(lot_id: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v5_file_url_fallback",
+            "version": "document_analyzer_v6_sheet_columns",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1173,8 +1173,83 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v5_file_url_fallback",
+            "version": "document_analyzer_v6_sheet_columns",
             "lot_id": lot_id,
+            "error": str(e),
+        }
+
+
+
+EXTRA_SHEET_COLUMNS = [
+    "Заказчик",
+    "Сумма",
+    "Валюта",
+    "Оплата",
+    "Срок оплаты",
+    "Срок оказания услуг",
+    "Требования",
+    "Рекомендация AI",
+]
+
+
+def ensure_sheet_columns():
+    """
+    Adds missing analytical columns to the first row of Google Sheet.
+    Does not delete or overwrite existing columns.
+    """
+    sheet = get_sheet()
+    headers = sheet.row_values(1)
+
+    # If row 1 is empty, keep basic structure.
+    if not headers:
+        headers = [
+            "Дата",
+            "Отправил",
+            "Ссылка",
+            "Источник",
+            "Статус",
+            "Приоритет",
+            "AI анализ",
+            "Комментарий",
+        ]
+        sheet.update("A1:H1", [headers])
+
+    added = []
+    current_headers = sheet.row_values(1)
+
+    for col_name in EXTRA_SHEET_COLUMNS:
+        if col_name not in current_headers:
+            current_headers.append(col_name)
+            added.append(col_name)
+
+    if added:
+        end_col = len(current_headers)
+        sheet.update(
+            f"A1:{gspread.utils.rowcol_to_a1(1, end_col).replace('1', '')}1",
+            [current_headers]
+        )
+
+    return {
+        "headers_total": len(current_headers),
+        "added": added,
+        "headers": current_headers,
+    }
+
+
+@app.get("/setup_sheet_columns")
+def setup_sheet_columns():
+    try:
+        result = ensure_sheet_columns()
+        return {
+            "status": "ok",
+            "version": "sheet_setup_v1",
+            "message": "Google Sheets columns checked and updated",
+            **result,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "sheet_setup_v1",
             "error": str(e),
         }
 
@@ -1241,7 +1316,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1296,7 +1371,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1325,7 +1400,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1341,7 +1416,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+            "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1350,7 +1425,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v5_file_url_fallback", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v6_sheet_columns", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -1372,7 +1447,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+            "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -1381,7 +1456,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v5_file_url_fallback", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v6_sheet_columns", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1456,7 +1531,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v5_file_url_fallback",
+        "version": "cargo_v17_doc_analyzer_v6_sheet_columns",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
