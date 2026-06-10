@@ -2,17 +2,19 @@ import os
 import json
 import requests
 from datetime import datetime
+from urllib.parse import urljoin
+
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Document analyzer libraries
 import PyPDF2
 from docx import Document
 import openpyxl
 
-app = FastAPI(title="AI Tender Agent Cargo V17 Balanced Search + Document Analyzer Test")
+
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V2 Debug Files")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -20,48 +22,23 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 
 SERVICE_PHRASES = [
-    "перевозка грузов",
-    "перевозке грузов",
-    "грузоперевоз",
-    "грузовые перевозки",
-    "доставка грузов",
-    "доставка груза",
-    "доставка товара автотранспортом",
-    "транспортные услуги",
-    "оказание транспортных услуг",
-    "услуги транспорта",
-    "услуги по перевозке",
-    "услуги перевозки",
-    "транспортно-экспедиционные услуги",
-    "транспортно экспедиционные услуги",
-    "экспедиторские услуги",
-    "логистические услуги",
-    "международные автомобильные перевозки",
-    "международная перевозка",
-    "международные перевозки",
-    "автомобильные перевозки грузов",
-    "cargo transportation",
-    "freight transportation",
-    "logistics service",
-    "transport service",
-    "delivery service",
-    "yuk tashish",
-    "yuklarni tashish",
-    "yuk tashish xizmati",
-    "yuklarni tashish xizmati",
-    "yuk tashuvchi xizmatlari",
-    "yuklarni tashuvchi",
-    "transport xizmati",
-    "transport xizmatlari",
-    "logistika xizmati",
-    "logistika xizmatlari",
-    "ekspeditorlik xizmati",
-    "ekspeditorlik xizmatlari",
-    "xalqaro yuk tashish",
-    "xalqaro tashuv",
-    "xalqaro tashish",
-    "avtotransport xizmati",
-    "avtotransport xizmatlari",
+    "перевозка грузов", "перевозке грузов", "грузоперевоз", "грузовые перевозки",
+    "доставка грузов", "доставка груза", "доставка товара автотранспортом",
+    "транспортные услуги", "оказание транспортных услуг", "услуги транспорта",
+    "услуги по перевозке", "услуги перевозки",
+    "транспортно-экспедиционные услуги", "транспортно экспедиционные услуги",
+    "экспедиторские услуги", "логистические услуги",
+    "международные автомобильные перевозки", "международная перевозка",
+    "международные перевозки", "автомобильные перевозки грузов",
+    "cargo transportation", "freight transportation", "logistics service",
+    "transport service", "delivery service",
+    "yuk tashish", "yuklarni tashish", "yuk tashish xizmati",
+    "yuklarni tashish xizmati", "yuk tashuvchi xizmatlari",
+    "yuklarni tashuvchi", "transport xizmati", "transport xizmatlari",
+    "logistika xizmati", "logistika xizmatlari",
+    "ekspeditorlik xizmati", "ekspeditorlik xizmatlari",
+    "xalqaro yuk tashish", "xalqaro tashuv", "xalqaro tashish",
+    "avtotransport xizmati", "avtotransport xizmatlari",
 ]
 
 SUPPORT_WORDS = [
@@ -79,40 +56,33 @@ HARD_BAD_WORDS = [
     "инструмент", "набор инструментов", "оборудован", "техника",
     "смесительно-заряд", "зарядных машин", "спецтехника",
     "автокран", "погрузчик", "экскаватор", "трактор",
-    "арматур", "бетон", "цемент", "лаборатор",
-    "мебел", "пленк", "стретч", "консультац", "технадзор",
-    "строительств", "ремонт", "канцеляр", "компьютер", "принтер",
-    "медицин", "питание", "продукт", "одежд", "обув",
-    "электро", "юридическ", "аудит", "страхован", "охрана",
-    "дезинфек", "дезинсек", "deratiz", "овқат", "еда", "питания",
-    "payvandlash", "метал конструкц", "metal konstruksiya",
+    "арматур", "бетон", "цемент", "лаборатор", "мебел", "пленк",
+    "стретч", "консультац", "технадзор", "строительств", "ремонт",
+    "канцеляр", "компьютер", "принтер", "медицин", "питание",
+    "продукт", "одежд", "обув", "электро", "юридическ", "аудит",
+    "страхован", "охрана", "дезинфек", "дезинсек", "deratiz",
+    "овқат", "еда", "питания", "payvandlash",
+    "метал конструкц", "metal konstruksiya",
     "yo‘li", "yo'li", "yoʻli", "avtomobil yo",
     "yer uchastkasi", "master-reja", "baholash",
     "service area", "service point", "проект", "лойиҳа",
 ]
 
-SOFT_BAD_WORDS = [
-    "товар", "материал", "изделие", "деталь", "агрегат",
-    "насос", "кабель", "труба", "краска", "масло",
-]
+SOFT_BAD_WORDS = ["товар", "материал", "изделие", "деталь", "агрегат", "насос", "кабель", "труба", "краска", "масло"]
 
 BAD_URL_PARTS = [
-    "register", "login", "logout", "signin", "signup",
-    "cabinet", "profile", "account", "user", "my",
-    "add.html", "/add", "create", "invited", "invitation",
-    "english", "/en/", "news", "blog", "faq", "help",
-    "contact", "about", "rules", "terms", "privacy",
-    "advertising", "banner", "calendar", "archive",
-    "feedback", "javascript:", "mailto:", "tel:",
+    "register", "login", "logout", "signin", "signup", "cabinet", "profile",
+    "account", "user", "my", "add.html", "/add", "create", "invited",
+    "invitation", "english", "/en/", "news", "blog", "faq", "help",
+    "contact", "about", "rules", "terms", "privacy", "advertising",
+    "banner", "calendar", "archive", "feedback", "javascript:", "mailto:", "tel:",
 ]
 
 BAD_TITLE_WORDS = [
     "регистрация", "зарегистрироваться", "войти", "выход",
-    "стать заказчиком", "стать поставщиком",
-    "english", "русский", "ўзбекча",
-    "приглашение", "мои заявки", "моих заявок",
-    "вопрос", "ответ", "помощь", "контакты",
-    "написать нам письмо", "о сайте", "правила",
+    "стать заказчиком", "стать поставщиком", "english", "русский", "ўзбекча",
+    "приглашение", "мои заявки", "моих заявок", "вопрос", "ответ",
+    "помощь", "контакты", "написать нам письмо", "о сайте", "правила",
     "дата публикации", "личный кабинет", "кабинет", "профиль",
 ]
 
@@ -147,16 +117,12 @@ def filter_reason(title, url):
 
     if not title or not url:
         return "empty_title_or_url"
-
     if looks_like_bad_url(url):
         return "bad_url"
-
     if title.isdigit():
         return "only_digits"
-
     if len(title.split()) < 2:
         return "too_short"
-
     if len(t) < 10:
         return "too_short_text"
 
@@ -187,8 +153,7 @@ def filter_reason(title, url):
 
 
 def is_real_cargo_tender(title, url):
-    reason = filter_reason(title, url)
-    return reason.startswith("accepted_")
+    return filter_reason(title, url).startswith("accepted_")
 
 
 def get_sheet():
@@ -296,7 +261,7 @@ def collect_links(base_url, pages, site, limit=10, raw=False):
                 if not title or not href:
                     continue
 
-                url = requests.compat.urljoin(base_url, href)
+                url = urljoin(base_url, href)
 
                 if raw:
                     add_raw_candidate(candidates, seen, site, title, url)
@@ -342,7 +307,7 @@ def flatten_items(data):
 def item_url(item, base_url, site):
     for key in ["url", "link", "href"]:
         if item.get(key):
-            return requests.compat.urljoin(base_url, str(item.get(key)))
+            return urljoin(base_url, str(item.get(key)))
 
     lot_id = (
         item.get("id")
@@ -564,9 +529,46 @@ def save_to_sheet(site, title, url):
         return False
 
 
+def extract_file_links_from_html(page_url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    seen = set()
+
+    keywords = [
+        "pdf", "doc", "docx", "xls", "xlsx", "zip", "download", "file",
+        "тех", "техничес", "документац", "задание", "контракт",
+        "протокол", "скачать", "fayl", "hujjat", "tex", "shartnoma"
+    ]
+
+    for a in soup.find_all("a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = a.get("href") or ""
+
+        if not href:
+            continue
+
+        full_url = urljoin(page_url, href)
+        check = (text + " " + href + " " + full_url).lower()
+
+        is_file = any(ext in check for ext in [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip"])
+        is_keyword = any(k in check for k in keywords)
+
+        if is_file or is_keyword:
+            if full_url not in seen:
+                seen.add(full_url)
+                found.append({
+                    "text": text[:200],
+                    "url": full_url,
+                    "is_file": is_file,
+                    "looks_relevant": is_keyword,
+                })
+
+    return found
+
+
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 Balanced Search + Document Analyzer Test is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V2 Debug Files is running"}
 
 
 @app.head("/")
@@ -577,7 +579,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_balanced_search_doc_test",
+        "version": "cargo_v17_doc_analyzer_v2_debug_files",
         "status": "running"
     }
 
@@ -596,6 +598,48 @@ def analyze_doc_test():
             "openpyxl": True
         }
     }
+
+
+@app.get("/debug_lot_files")
+def debug_lot_files(url: str):
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=20)
+
+        result = {
+            "status": "ok",
+            "version": "document_analyzer_v2_debug_files",
+            "lot_url": url,
+            "http_status": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "html_size": len(r.text),
+            "files_found": [],
+            "files_count": 0,
+            "page_title": "",
+            "html_start": r.text[:500],
+        }
+
+        if r.status_code != 200:
+            result["status"] = "http_error"
+            return result
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        title_tag = soup.find("title")
+        if title_tag:
+            result["page_title"] = clean_text(title_tag.get_text())
+
+        files = extract_file_links_from_html(url, r.text)
+        result["files_found"] = files[:50]
+        result["files_count"] = len(files)
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "document_analyzer_v2_debug_files",
+            "lot_url": url,
+            "error": str(e)
+        }
 
 
 @app.get("/health")
@@ -660,7 +704,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_balanced_search_doc_test",
+        "version": "cargo_v17_doc_analyzer_v2_debug_files",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -715,7 +759,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_balanced_search_doc_test",
+        "version": "cargo_v17_doc_analyzer_v2_debug_files",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -744,7 +788,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_balanced_search_doc_test",
+        "version": "cargo_v17_doc_analyzer_v2_debug_files",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -760,7 +804,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_balanced_search_doc_test",
+            "version": "cargo_v17_doc_analyzer_v2_debug_files",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -769,7 +813,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_balanced_search_doc_test", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v2_debug_files", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -791,7 +835,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_balanced_search_doc_test",
+            "version": "cargo_v17_doc_analyzer_v2_debug_files",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -800,7 +844,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_balanced_search_doc_test", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v2_debug_files", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -875,7 +919,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_balanced_search_doc_test",
+        "version": "cargo_v17_doc_analyzer_v2_debug_files",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
@@ -906,6 +950,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
     )
-
-    
     
