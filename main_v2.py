@@ -14,7 +14,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V2 Debug Files")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V3 UZEX API Debug")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -566,9 +566,90 @@ def extract_file_links_from_html(page_url, html):
     return found
 
 
+def try_get_json(url, params=None):
+    try:
+        r = requests.get(url, headers=get_headers(json_mode=True), params=params, timeout=15)
+        content_type = r.headers.get("content-type", "")
+        text_start = r.text[:1200]
+
+        parsed = None
+        keys = []
+        is_json = False
+
+        try:
+            parsed = r.json()
+            is_json = True
+            if isinstance(parsed, dict):
+                keys = list(parsed.keys())[:30]
+            elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                keys = list(parsed[0].keys())[:30]
+        except Exception:
+            pass
+
+        return {
+            "method": "GET",
+            "url": r.url,
+            "status_code": r.status_code,
+            "content_type": content_type,
+            "size": len(r.text),
+            "is_json": is_json,
+            "json_keys": keys,
+            "text_start": text_start,
+        }
+
+    except Exception as e:
+        return {
+            "method": "GET",
+            "url": url,
+            "params": params,
+            "error": str(e),
+        }
+
+
+def try_post_json(url, payload):
+    try:
+        r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=15)
+        content_type = r.headers.get("content-type", "")
+        text_start = r.text[:1200]
+
+        parsed = None
+        keys = []
+        is_json = False
+
+        try:
+            parsed = r.json()
+            is_json = True
+            if isinstance(parsed, dict):
+                keys = list(parsed.keys())[:30]
+            elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                keys = list(parsed[0].keys())[:30]
+        except Exception:
+            pass
+
+        return {
+            "method": "POST",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": content_type,
+            "size": len(r.text),
+            "is_json": is_json,
+            "json_keys": keys,
+            "text_start": text_start,
+        }
+
+    except Exception as e:
+        return {
+            "method": "POST",
+            "url": url,
+            "payload": payload,
+            "error": str(e),
+        }
+
+
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V2 Debug Files is running"}
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V3 UZEX API Debug is running"}
 
 
 @app.head("/")
@@ -579,7 +660,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v17_doc_analyzer_v2_debug_files",
+        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
         "status": "running"
     }
 
@@ -640,6 +721,107 @@ def debug_lot_files(url: str):
             "lot_url": url,
             "error": str(e)
         }
+
+
+@app.get("/debug_uzex_lot_api")
+def debug_uzex_lot_api(lot_id: str):
+    """
+    Diagnostic endpoint.
+    It does not change scan logic.
+    It tries common UZEX API patterns to discover which endpoint returns lot details/files.
+    """
+    candidates = []
+
+    get_urls = [
+        f"https://apietender.uzex.uz/api/common/Trade/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeInfo/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeDetail/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeLot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/Lot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotInfo/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotDetail/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/GetLot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeFiles/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotFiles/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/Files/{lot_id}",
+    ]
+
+    get_urls_with_params = [
+        ("https://apietender.uzex.uz/api/common/Trade", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeInfo", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeDetail", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/Lot", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotInfo", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotDetail", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeFiles", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotFiles", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/FileList", {"id": lot_id}),
+    ]
+
+    post_tests = [
+        ("https://apietender.uzex.uz/api/common/TradeList", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeInfo", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeDetail", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotInfo", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotDetail", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeFiles", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotFiles", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+    ]
+
+    for u in get_urls:
+        candidates.append(try_get_json(u))
+
+    for u, p in get_urls_with_params:
+        candidates.append(try_get_json(u, params=p))
+
+    for u, payload in post_tests:
+        candidates.append(try_post_json(u, payload))
+
+    useful = []
+    for c in candidates:
+        txt = (c.get("text_start") or "").lower()
+        keys = " ".join(c.get("json_keys") or []).lower()
+        status_ok = c.get("status_code") == 200
+        if status_ok and (
+            "494831" in txt
+            or "тяньцзинь" in txt
+            or "tyantszin" in txt
+            or "xorgos" in txt
+            or "pdf" in txt
+            or "doc" in txt
+            or "file" in txt
+            or "document" in txt
+            or "файл" in txt
+            or "hujjat" in txt
+            or "trade" in keys
+            or "lot" in keys
+            or "file" in keys
+        ):
+            useful.append(c)
+
+    return {
+        "status": "ok",
+        "version": "document_analyzer_v3_uzex_api_debug",
+        "lot_id": lot_id,
+        "tested_total": len(candidates),
+        "useful_count": len(useful),
+        "useful": useful[:10],
+        "all_results_short": [
+            {
+                "method": c.get("method"),
+                "url": c.get("url"),
+                "status_code": c.get("status_code"),
+                "content_type": c.get("content_type"),
+                "size": c.get("size"),
+                "is_json": c.get("is_json"),
+                "json_keys": c.get("json_keys"),
+                "error": c.get("error"),
+                "text_start": (c.get("text_start") or "")[:250],
+            }
+            for c in candidates
+        ],
+    }
 
 
 @app.get("/health")
@@ -704,7 +886,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_doc_analyzer_v2_debug_files",
+        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -759,7 +941,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_doc_analyzer_v2_debug_files",
+        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -788,7 +970,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_doc_analyzer_v2_debug_files",
+        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -804,7 +986,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v2_debug_files",
+            "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -813,7 +995,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v2_debug_files", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v3_uzex_api_debug", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -835,7 +1017,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_doc_analyzer_v2_debug_files",
+            "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -844,7 +1026,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_doc_analyzer_v2_debug_files", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_doc_analyzer_v3_uzex_api_debug", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -919,7 +1101,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_doc_analyzer_v2_debug_files",
+        "version": "cargo_v17_doc_analyzer_v3_uzex_api_debug",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
@@ -950,4 +1132,5 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
     )
+
     
