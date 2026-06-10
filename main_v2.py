@@ -7,11 +7,17 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V17 Balanced Search")
+# Document analyzer libraries
+import PyPDF2
+from docx import Document
+import openpyxl
+
+app = FastAPI(title="AI Tender Agent Cargo V17 Balanced Search + Document Analyzer Test")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+
 
 SERVICE_PHRASES = [
     "перевозка грузов",
@@ -560,7 +566,7 @@ def save_to_sheet(site, title, url):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V17 Balanced Search is running"}
+    return {"status": "AI Tender Agent Cargo V17 Balanced Search + Document Analyzer Test is running"}
 
 
 @app.head("/")
@@ -570,7 +576,26 @@ def head_home():
 
 @app.get("/version")
 def version():
-    return {"version": "cargo_v17_balanced_search", "status": "running"}
+    return {
+        "version": "cargo_v17_balanced_search_doc_test",
+        "status": "running"
+    }
+
+
+@app.get("/analyze_doc_test")
+def analyze_doc_test():
+    return {
+        "status": "ok",
+        "version": "document_analyzer_v1",
+        "pdf_reader": True,
+        "docx_reader": True,
+        "xlsx_reader": True,
+        "modules": {
+            "PyPDF2": True,
+            "python_docx": True,
+            "openpyxl": True
+        }
+    }
 
 
 @app.get("/health")
@@ -635,7 +660,7 @@ def test_filter():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v17_balanced_search",
+        "version": "cargo_v17_balanced_search_doc_test",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -690,7 +715,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v17_balanced_search",
+        "version": "cargo_v17_balanced_search_doc_test",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -719,7 +744,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v17_balanced_search",
+        "version": "cargo_v17_balanced_search_doc_test",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -735,7 +760,7 @@ def debug_uzex():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_balanced_search",
+            "version": "cargo_v17_balanced_search_doc_test",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -744,7 +769,7 @@ def debug_uzex():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_balanced_search", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_balanced_search_doc_test", "url": url, "error": str(e)}
 
 
 @app.get("/debug_xt")
@@ -766,7 +791,7 @@ def debug_xt():
     try:
         r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
         return {
-            "version": "cargo_v17_balanced_search",
+            "version": "cargo_v17_balanced_search_doc_test",
             "url": url,
             "payload": payload,
             "status_code": r.status_code,
@@ -775,7 +800,7 @@ def debug_xt():
             "text_start": r.text[:1500],
         }
     except Exception as e:
-        return {"version": "cargo_v17_balanced_search", "url": url, "error": str(e)}
+        return {"version": "cargo_v17_balanced_search_doc_test", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -850,7 +875,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v17_balanced_search",
+        "version": "cargo_v17_balanced_search_doc_test",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
@@ -881,4 +906,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", 10000)),
     )
+
+    
     
