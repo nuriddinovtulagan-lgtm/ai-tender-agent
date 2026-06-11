@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V20 Document Fix")
+app = FastAPI(title="AI Tender Agent Cargo V21 Smart API Analysis")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -898,7 +898,7 @@ def save_to_sheet(site, title, url):
             "Источник": site,
             "Статус": "Новый",
             "Приоритет": "Средний",
-            "AI анализ": "Проверить лот: найдено по Cargo V20 Document Fix",
+            "AI анализ": "Проверить лот: найдено по Cargo V21 Smart API Analysis",
             "Комментарий": title,
         }
 
@@ -1224,7 +1224,7 @@ def pick_text_snippet(text, keywords, limit=700):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V20 Document Fix is running"}
+    return {"status": "AI Tender Agent Cargo V21 Smart API Analysis is running"}
 
 
 @app.head("/")
@@ -1235,7 +1235,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v20_document_fix",
+        "version": "cargo_v21_smart_api_analysis",
         "status": "running"
     }
 
@@ -1311,7 +1311,7 @@ def test_filter():
 def analyze_doc_test():
     return {
         "status": "ok",
-        "version": "document_analyzer_v20",
+        "version": "document_analyzer_v21",
         "pdf_reader": True,
         "docx_reader": True,
         "xlsx_reader": True,
@@ -1326,7 +1326,7 @@ def analyze_doc_test():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v20_document_fix",
+        "version": "cargo_v21_smart_api_analysis",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1381,7 +1381,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v20_document_fix",
+        "version": "cargo_v21_smart_api_analysis",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1410,7 +1410,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v20_document_fix",
+        "version": "cargo_v21_smart_api_analysis",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1424,14 +1424,14 @@ def setup_sheet_columns():
         result = ensure_sheet_columns()
         return {
             "status": "ok",
-            "version": "sheet_setup_v20",
+            "version": "sheet_setup_v21",
             "message": "Google Sheets columns checked and updated",
             **result,
         }
     except Exception as e:
         return {
             "status": "error",
-            "version": "sheet_setup_v20",
+            "version": "sheet_setup_v21",
             "error": str(e),
         }
 
@@ -1444,7 +1444,7 @@ def setup_tender_manager_columns():
 
         return {
             "status": "ok",
-            "version": "tender_manager_v20",
+            "version": "tender_manager_v21",
             "message": "Tender manager columns checked and updated",
             **result,
         }
@@ -1452,7 +1452,7 @@ def setup_tender_manager_columns():
     except Exception as e:
         return {
             "status": "error",
-            "version": "tender_manager_v20",
+            "version": "tender_manager_v21",
             "error": str(e),
         }
 
@@ -1470,7 +1470,7 @@ def tender_manager_status():
 
         return {
             "status": "ok" if not missing else "warning",
-            "version": "tender_manager_v20",
+            "version": "tender_manager_v21",
             "headers_total": len(headers),
             "missing_columns": missing,
             "manager_columns": TENDER_MANAGER_COLUMNS,
@@ -1480,7 +1480,7 @@ def tender_manager_status():
     except Exception as e:
         return {
             "status": "error",
-            "version": "tender_manager_v20",
+            "version": "tender_manager_v21",
             "error": str(e),
         }
 
@@ -1494,7 +1494,7 @@ def backfill_preview(limit: int = 20):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "backfill_v20",
+                "version": "backfill_v21",
                 "message": "Sheet is empty",
             }
 
@@ -1504,7 +1504,7 @@ def backfill_preview(limit: int = 20):
         if "Ссылка" not in headers_map or "Заказчик" not in headers_map:
             return {
                 "status": "error",
-                "version": "backfill_v20",
+                "version": "backfill_v21",
                 "error": "Required columns not found",
                 "headers": headers,
             }
@@ -1530,7 +1530,7 @@ def backfill_preview(limit: int = 20):
 
         return {
             "status": "ok",
-            "version": "backfill_v20",
+            "version": "backfill_v21",
             "candidates_count": len(candidates),
             "candidates": candidates,
         }
@@ -1538,7 +1538,7 @@ def backfill_preview(limit: int = 20):
     except Exception as e:
         return {
             "status": "error",
-            "version": "backfill_v20",
+            "version": "backfill_v21",
             "error": str(e),
         }
 
@@ -1555,7 +1555,7 @@ def backfill_existing_tenders(limit: int = 50):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "backfill_v20",
+                "version": "backfill_v21",
                 "message": "Sheet is empty",
             }
 
@@ -1578,7 +1578,7 @@ def backfill_existing_tenders(limit: int = 50):
         if missing:
             return {
                 "status": "error",
-                "version": "backfill_v20",
+                "version": "backfill_v21",
                 "error": "Missing columns: " + ", ".join(missing),
                 "headers": headers,
             }
@@ -1622,7 +1622,7 @@ def backfill_existing_tenders(limit: int = 50):
 
         return {
             "status": "ok",
-            "version": "backfill_v20",
+            "version": "backfill_v21",
             "processed": processed,
             "updated": updated,
             "skipped": skipped,
@@ -1634,7 +1634,7 @@ def backfill_existing_tenders(limit: int = 50):
     except Exception as e:
         return {
             "status": "error",
-            "version": "backfill_v20",
+            "version": "backfill_v21",
             "error": str(e),
         }
 
@@ -1651,7 +1651,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "quality_filter_v20",
+                "version": "quality_filter_v21",
                 "message": "Sheet is empty",
             }
 
@@ -1661,7 +1661,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
         if "Ссылка" not in headers_map:
             return {
                 "status": "error",
-                "version": "quality_filter_v20",
+                "version": "quality_filter_v21",
                 "error": "Missing column: Ссылка",
             }
 
@@ -1698,7 +1698,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
 
         return {
             "status": "ok",
-            "version": "quality_filter_v20",
+            "version": "quality_filter_v21",
             "processed": processed,
             "updated": updated,
             "skipped": skipped,
@@ -1710,7 +1710,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
     except Exception as e:
         return {
             "status": "error",
-            "version": "quality_filter_v20",
+            "version": "quality_filter_v21",
             "error": str(e),
         }
 
@@ -1743,27 +1743,209 @@ def test_quality_filter():
 
     return {
         "status": "ok",
-        "version": "quality_filter_v20",
+        "version": "quality_filter_v21",
         "samples": result,
     }
 
 
+
+
+def smart_api_analysis_from_trade(trade, title=""):
+    """V21: умный анализ тендера по API-полям UZEX без зависимости от PDF/DOCX."""
+    budget_products = extract_budget_products(trade)
+    product_name = ""
+    description = ""
+    category_name = ""
+    delivery_term = ""
+
+    if budget_products:
+        first = budget_products[0]
+        product_name = clean_text(first.get("Product_Name", ""))
+        description = clean_text(first.get("Description", ""))
+        category_name = clean_text(first.get("Category_Name", ""))
+        delivery_term = first.get("Delivery_Term", "") or ""
+
+    q_fields = trade.get("js_qualification_fields") or []
+    q_texts = []
+    if isinstance(q_fields, list):
+        for q in q_fields:
+            if isinstance(q, dict):
+                for key in ["name", "title", "description", "label"]:
+                    value = q.get(key)
+                    if value:
+                        q_texts.append(str(value))
+
+    text = normalize_text(" ".join([
+        title or "",
+        str(trade.get("customer_name") or ""),
+        product_name,
+        description,
+        category_name,
+        str(trade.get("technical_description") or ""),
+        " ".join(q_texts),
+    ]))
+
+    start_cost = trade.get("start_cost") or 0
+    try:
+        amount = float(start_cost)
+    except Exception:
+        amount = 0.0
+
+    payment_type = clean_text(trade.get("payment_type_name", ""))
+    term_payment_days = trade.get("term_payment_days", "") or ""
+
+    score = 40
+    reasons = []
+    risks = []
+
+    def add(points, reason):
+        nonlocal score
+        score += points
+        reasons.append(reason)
+
+    def sub(points, reason):
+        nonlocal score
+        score -= points
+        risks.append(reason)
+
+    if any(w in text for w in ["xalqaro", "международ"]):
+        add(25, "международная перевозка / xalqaro yo‘nalish")
+    if any(w in text for w in ["logistika", "логист"]):
+        add(18, "логистическая услуга")
+    if any(w in text for w in ["экспедитор", "ekspeditor"]):
+        add(18, "экспедиторская услуга")
+    if any(w in text for w in ["перевозка грузов", "перевозке грузов", "yuk tashish", "yuklarni tashish"]):
+        add(20, "перевозка грузов")
+    if any(w in text for w in ["мультимод", "multimodal", "негабарит", "тяжеловес", "og'ir vazn", "og’ir vazn", "gabarit bo"]):
+        add(18, "сложная/дорогая логистика")
+    if any(w in normalize_text(payment_type) for w in ["олдиндан", "предоплат", "аванс"]):
+        add(10, "есть предоплата")
+    if amount >= 1_000_000_000:
+        add(20, "крупная сумма больше 1 млрд UZS")
+    elif amount >= 500_000_000:
+        add(14, "сумма больше 500 млн UZS")
+    elif amount >= 100_000_000:
+        add(8, "сумма от 100 млн UZS")
+    elif amount and amount < 50_000_000:
+        sub(10, "маленькая сумма для международной логистики")
+
+    if str(delivery_term).isdigit() and int(delivery_term) >= 180:
+        add(8, "длинный срок договора")
+
+    if any(w in text for w in ["погруз", "разгруз", "yuklash", "tushirish", "склад", "ombor"]):
+        sub(8, "есть признаки погрузочно-складских работ, не чистая перевозка")
+    if any(w in text for w in QUALITY_BAD_CONTEXT_WORDS):
+        sub(25, "есть непрофильные слова из стоп-листа")
+    if any(w in text for w in ["банк", "кредит", "программ", "автоматизац", "оборудован", "ремонт", "строительств"]):
+        sub(30, "похоже на непрофильную закупку")
+
+    score = max(0, min(100, score))
+
+    if score >= 80:
+        priority = "Очень высокий"
+        win_chance = "Высокий"
+        decision = "Участвовать: высокий приоритет. Подготовить расчёт себестоимости и проверить ТЗ вручную на UZEX."
+    elif score >= 65:
+        priority = "Высокий"
+        win_chance = "Средний/Высокий"
+        decision = "Рассмотреть участие: профильный тендер, нужна проверка маршрута, транспорта и документов."
+    elif score >= 45:
+        priority = "Средний"
+        win_chance = "Средний"
+        decision = "Изучить вручную: есть признаки логистики, но нужна проверка деталей."
+    else:
+        priority = "Низкий"
+        win_chance = "Низкий"
+        decision = "Скорее отказаться: недостаточно профильных признаков или высокий риск мусорного лота."
+
+    risk = "Средний"
+    if risks and score < 65:
+        risk = "Высокий"
+    elif risks:
+        risk = "Средний"
+    elif score >= 80:
+        risk = "Низкий/Средний"
+
+    logistics = "Да" if score >= 55 else "Сомнительно" if score >= 40 else "Нет"
+
+    doc_note = "Документы UZEX часто закрыты прямым скачиванием; ТЗ нужно открыть вручную на странице лота."
+
+    requirements_short = short_requirements_from_trade(trade)
+    reason_text = "; ".join(reasons[:6]) if reasons else "нет сильных положительных факторов"
+    risk_text = "; ".join(risks[:5]) if risks else "критических рисков по API не найдено"
+
+    return {
+        "score": score,
+        "priority": priority,
+        "win_chance": win_chance,
+        "risk": risk,
+        "logistics": logistics,
+        "decision": decision,
+        "reasons": reasons,
+        "risks": risks,
+        "reason_text": reason_text,
+        "risk_text": risk_text,
+        "document_note": doc_note,
+        "requirements_short": requirements_short,
+        "api_text_used": clean_text(" | ".join([product_name, description, category_name, " ".join(q_texts[:5])]))[:1200],
+    }
+
+
+def smart_api_analysis_for_url(site, title, url):
+    """Возвращает V21-анализ для UZEX URL или базовый анализ для других источников."""
+    if site != "UZEX":
+        return {
+            "score": 50,
+            "priority": "Средний",
+            "win_chance": "Требуется проверка",
+            "risk": "Средний",
+            "logistics": "Сомнительно",
+            "decision": "Проверить вручную: для этого источника нет глубокого UZEX API-анализа.",
+            "reason_text": "источник не UZEX",
+            "risk_text": "нет API-деталей",
+            "document_note": "Документы нужно открыть вручную.",
+            "requirements_short": "",
+        }
+
+    lot_id = extract_lot_id_from_url(url)
+    if not lot_id:
+        return {
+            "score": 0,
+            "priority": "Низкий",
+            "win_chance": "Низкий",
+            "risk": "Высокий",
+            "logistics": "Нет",
+            "decision": "Не удалось определить ID лота.",
+            "reason_text": "нет lot_id",
+            "risk_text": "невозможно получить API-данные",
+            "document_note": "",
+            "requirements_short": "",
+        }
+    trade = get_uzex_lot_data(lot_id)
+    return smart_api_analysis_from_trade(trade, title)
+
+
 @app.get("/analyze_uzex_lot")
 def analyze_uzex_lot(lot_id: str):
+    """V21: анализирует лот по API-полям. Документы проверяет, но не зависит от них."""
     try:
         trade = get_uzex_trade(lot_id)
 
         budget_products = extract_budget_products(trade)
         product_name = ""
         product_description = ""
+        category_name = ""
+        delivery_term_days = None
 
         if budget_products:
             product_name = budget_products[0].get("Product_Name", "") or ""
             product_description = budget_products[0].get("Description", "") or ""
+            category_name = budget_products[0].get("Category_Name", "") or ""
+            delivery_term_days = budget_products[0].get("Delivery_Term")
+
+        smart = smart_api_analysis_from_trade(trade, " | ".join([product_name, product_description]))
 
         documents = []
-        combined_text = ""
-
         file_fields = [
             ("tech_file", trade.get("tech_file_name"), trade.get("tech_file_path"), trade.get("tech_file_ext")),
             ("tech_doc_file", trade.get("tech_doc_file_name"), trade.get("tech_doc_file_path"), trade.get("tech_doc_file_ext")),
@@ -1771,6 +1953,7 @@ def analyze_uzex_lot(lot_id: str):
             ("prolong_file", trade.get("prolong_file_name"), trade.get("prolong_file_path"), trade.get("prolong_file_ext")),
         ]
 
+        combined_text = ""
         for doc_type, name, path, ext in file_fields:
             if not path:
                 continue
@@ -1785,11 +1968,11 @@ def analyze_uzex_lot(lot_id: str):
                 "download_attempts": [],
                 "read_status": "not_read",
                 "text_preview": "",
+                "note": "V21: API-анализ работает даже если документ закрыт прямым скачиванием",
             }
 
             try:
                 ext_norm = (ext or name or path or "").lower()
-
                 file_bytes, working_url, attempts = download_file_with_fallback(path)
                 doc_info["working_url"] = working_url
                 doc_info["download_attempts"] = attempts
@@ -1799,41 +1982,29 @@ def analyze_uzex_lot(lot_id: str):
                     doc_info["read_status"] = "ok"
                     doc_info["text_preview"] = text[:1200]
                     combined_text += "\n" + text
-
                 elif "docx" in ext_norm:
                     text = read_docx_from_bytes(file_bytes)
                     doc_info["read_status"] = "ok"
                     doc_info["text_preview"] = text[:1200]
                     combined_text += "\n" + text
-
                 else:
                     doc_info["read_status"] = "unsupported_ext"
-
             except Exception as e:
-                doc_info["read_status"] = "error"
-                doc_info["error"] = str(e)
+                doc_info["read_status"] = "closed_or_unavailable"
+                doc_info["error"] = str(e)[:900]
 
             documents.append(doc_info)
 
-        base_title = " | ".join([
-            str(trade.get("customer_name") or ""),
-            str(product_name or ""),
-            str(product_description or ""),
-            str(trade.get("technical_description") or ""),
-        ])
-
-        scoring = analyze_text_for_logistics(base_title, combined_text)
+        document_ok_count = sum(1 for d in documents if d.get("read_status") == "ok")
 
         route_snippet = pick_text_snippet(
             combined_text,
             ["маршрут", "тяньцзинь", "хоргос", "яллама", "ташкент", "tyantszin", "xorgos", "yallama"]
         )
-
         requirements_snippet = pick_text_snippet(
             combined_text,
             ["требования к участнику", "тягач", "goldhofer", "gantry", "требования к персоналу"]
         )
-
         payment_snippet = pick_text_snippet(
             combined_text,
             ["условия оплаты", "оплата", "payment", "30 календарных дней", "15 дней"]
@@ -1841,7 +2012,7 @@ def analyze_uzex_lot(lot_id: str):
 
         return {
             "status": "ok",
-            "version": "document_analyzer_v20",
+            "version": "document_analyzer_v21",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1856,27 +2027,43 @@ def analyze_uzex_lot(lot_id: str):
                 "valuation_name": trade.get("valuation_name"),
                 "payment_type_name": trade.get("payment_type_name"),
                 "term_payment_days": trade.get("term_payment_days"),
-                "delivery_term_days": budget_products[0].get("Delivery_Term") if budget_products else None,
+                "delivery_term_days": delivery_term_days,
                 "product_name": product_name,
                 "product_description": product_description,
-                "category_name": budget_products[0].get("Category_Name") if budget_products else None,
+                "category_name": category_name,
+            },
+            "smart_api_analysis": {
+                "ai_score": smart["score"],
+                "priority": smart["priority"],
+                "win_chance": smart["win_chance"],
+                "risk": smart["risk"],
+                "logistics": smart["logistics"],
+                "decision": smart["decision"],
+                "reasons": smart["reasons"],
+                "risks": smart["risks"],
+                "reason_text": smart["reason_text"],
+                "risk_text": smart["risk_text"],
+                "requirements_short": smart["requirements_short"],
+                "document_note": smart["document_note"],
             },
             "documents_count": len(documents),
+            "documents_read_ok": document_ok_count,
             "documents": documents,
             "analysis": {
-                "priority": scoring["priority"],
-                "win_chance": scoring["win_chance"],
-                "risk": scoring["risk"],
-                "logistics": scoring["logistics"],
-                "decision": scoring["decision"],
+                "priority": smart["priority"],
+                "win_chance": smart["win_chance"],
+                "risk": smart["risk"],
+                "logistics": smart["logistics"],
+                "decision": smart["decision"],
                 "route_snippet": route_snippet,
-                "requirements_snippet": requirements_snippet,
-                "payment_snippet": payment_snippet,
+                "requirements_snippet": requirements_snippet or smart["requirements_short"],
+                "payment_snippet": payment_snippet or clean_text(f"{trade.get('payment_type_name') or ''}; срок оплаты: {trade.get('term_payment_days') or ''} дней"),
                 "summary": (
+                    f"AI Score: {smart['score']}/100. "
                     f"Заказчик: {trade.get('customer_name')}. "
                     f"Предмет: {product_name}. "
                     f"Стартовая цена: {trade.get('start_cost')} {trade.get('currency_codeabc') or trade.get('currency_name')}. "
-                    f"Рекомендация: {scoring['decision']}."
+                    f"Рекомендация: {smart['decision']}"
                 ),
             },
         }
@@ -1884,7 +2071,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v20",
+            "version": "document_analyzer_v21",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1916,7 +2103,7 @@ def debug_uzex_lot_api(lot_id: str):
 
     return {
         "status": "ok",
-        "version": "debug_uzex_lot_v20",
+        "version": "debug_uzex_lot_v21",
         "lot_id": lot_id,
         "results": candidates,
     }
@@ -1929,7 +2116,7 @@ def debug_lot_files(url: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v20_debug_files",
+            "version": "document_analyzer_v21_debug_files",
             "lot_url": url,
             "http_status": r.status_code,
             "content_type": r.headers.get("content-type", ""),
@@ -1958,7 +2145,7 @@ def debug_lot_files(url: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v20_debug_files",
+            "version": "document_analyzer_v21_debug_files",
             "lot_url": url,
             "error": str(e)
         }
@@ -1971,7 +2158,7 @@ def debug_file_download(path: str):
         file_bytes, working_url, attempts = download_file_with_fallback(path)
         return {
             "status": "ok",
-            "version": "document_downloader_v20",
+            "version": "document_downloader_v21",
             "path": path,
             "working_url": working_url,
             "size": len(file_bytes or b""),
@@ -1981,7 +2168,7 @@ def debug_file_download(path: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_downloader_v20",
+            "version": "document_downloader_v21",
             "path": path,
             "error": str(e),
         }
@@ -2011,7 +2198,7 @@ def debug_uzex_lot_files_api(lot_id: str):
             })
         return {
             "status": "ok",
-            "version": "document_downloader_v20",
+            "version": "document_downloader_v21",
             "lot_id": lot_id,
             "documents_count": len(docs),
             "documents": docs,
@@ -2019,7 +2206,7 @@ def debug_uzex_lot_files_api(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_downloader_v20",
+            "version": "document_downloader_v21",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -2065,15 +2252,30 @@ def extract_priority_label(analytics, title=""):
 
 
 def format_tender_message(tender):
-    """Формирует расширенное Telegram-сообщение с AI-анализом."""
+    """V21: расширенное Telegram-сообщение с AI Score и объяснением оценки."""
     site = tender.get("site", "")
     title = tender.get("title", "")
     url = tender.get("url", "")
 
     analytics = {}
+    smart = None
 
     if site == "UZEX":
         analytics = analyze_uzex_for_sheet(site, title, url)
+        try:
+            smart = smart_api_analysis_for_url(site, title, url)
+        except Exception as e:
+            smart = {
+                "score": 50,
+                "priority": analytics.get("Приоритет") or "Средний",
+                "win_chance": analytics.get("Шанс победы") or "Требуется проверка",
+                "risk": analytics.get("Риск") or "Средний",
+                "decision": analytics.get("Рекомендация AI") or "Проверить вручную",
+                "reason_text": "ошибка V21 smart API: " + str(e)[:150],
+                "risk_text": "нужно открыть лот вручную",
+                "document_note": "Документы нужно открыть вручную на UZEX.",
+                "requirements_short": analytics.get("Требования") or "",
+            }
     else:
         analytics = {
             "Заказчик": "-",
@@ -2085,16 +2287,21 @@ def format_tender_message(tender):
             "Шанс победы": "Требуется проверка",
             "Рекомендация AI": "Проверить вручную: для этого источника нет глубокого API-анализа",
         }
+        smart = smart_api_analysis_for_url(site, title, url)
 
-    priority = extract_priority_label(analytics, title)
+    priority = smart.get("priority") or extract_priority_label(analytics, title)
     amount = format_money(analytics.get("Сумма", ""))
     currency = analytics.get("Валюта") or "-"
     customer = analytics.get("Заказчик") or "-"
     delivery_term = analytics.get("Срок оказания услуг") or "-"
-    risk = analytics.get("Риск") or analytics.get("Риск ") or "-"
-    win_chance = analytics.get("Шанс победы") or "-"
-    recommendation = analytics.get("Рекомендация AI") or "Проверить вручную"
-    requirements = analytics.get("Требования") or ""
+    risk = smart.get("risk") or analytics.get("Риск") or analytics.get("Риск ") or "-"
+    win_chance = smart.get("win_chance") or analytics.get("Шанс победы") or "-"
+    recommendation = smart.get("decision") or analytics.get("Рекомендация AI") or "Проверить вручную"
+    requirements = smart.get("requirements_short") or analytics.get("Требования") or ""
+    score = smart.get("score", "-")
+    reason_text = smart.get("reason_text") or "-"
+    risk_text = smart.get("risk_text") or "-"
+    document_note = smart.get("document_note") or ""
 
     if delivery_term not in ["-", ""]:
         delivery_term = str(delivery_term)
@@ -2104,6 +2311,7 @@ def format_tender_message(tender):
     message = (
         f"🚚 Новый логистический тендер\n\n"
         f"📌 Источник: {site}\n"
+        f"🧠 AI Score: {score}/100\n"
         f"🎯 Приоритет: {priority}\n\n"
         f"📋 {title}\n\n"
         f"🏢 Заказчик: {customer}\n"
@@ -2112,11 +2320,16 @@ def format_tender_message(tender):
         f"📅 Срок оказания: {delivery_term}\n\n"
         f"📈 Шанс победы: {win_chance}\n"
         f"⚠️ Риск: {risk}\n\n"
+        f"✅ Почему интересно:\n{reason_text}\n\n"
+        f"⚠️ Что проверить:\n{risk_text}\n\n"
         f"🤖 AI рекомендация:\n{recommendation}\n"
     )
 
     if requirements:
-        message += f"\n📄 Требования кратко:\n{requirements[:700]}\n"
+        message += f"\n📄 Требования/API кратко:\n{requirements[:650]}\n"
+
+    if document_note:
+        message += f"\n📎 Документы: {document_note}\n"
 
     message += f"\n🔗 {url}"
 
@@ -2133,7 +2346,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V20 Document Fix Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V21 Smart API Analysis Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -2190,7 +2403,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v20_document_fix",
+        "version": "cargo_v21_smart_api_analysis",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
