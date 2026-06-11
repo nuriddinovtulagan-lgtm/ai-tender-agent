@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V19 Telegram Analytics")
+app = FastAPI(title="AI Tender Agent Cargo V20 Document Fix")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -898,7 +898,7 @@ def save_to_sheet(site, title, url):
             "Источник": site,
             "Статус": "Новый",
             "Приоритет": "Средний",
-            "AI анализ": "Проверить лот: найдено по Cargo V19 Telegram Analytics",
+            "AI анализ": "Проверить лот: найдено по Cargo V20 Document Fix",
             "Комментарий": title,
         }
 
@@ -961,6 +961,11 @@ def extract_file_links_from_html(page_url, html):
 
 
 def build_file_url_candidates(file_path):
+    """
+    UZEX sometimes stores file paths in API as /files/... or tender/user-files/...
+    The public Angular page can return 200 text/html for those paths.
+    V20 tries several host/path variants and later validates real file bytes.
+    """
     if not file_path:
         return []
 
@@ -968,12 +973,35 @@ def build_file_url_candidates(file_path):
     candidates = []
 
     if file_path.startswith("http://") or file_path.startswith("https://"):
-        return [file_path]
+        candidates.append(file_path)
+    else:
+        clean = file_path.lstrip("/")
 
-    clean = file_path.lstrip("/")
+        host_variants = [
+            "https://etender.uzex.uz/",
+            "https://apietender.uzex.uz/",
+        ]
 
-    candidates.append("https://etender.uzex.uz/" + clean)
-    candidates.append("https://apietender.uzex.uz/" + clean)
+        path_variants = [clean]
+
+        # Some API paths come as files/... while real storage can be tender/user-files/...
+        if clean.startswith("files/"):
+            path_variants.append("tender/user-files/" + clean[len("files/"):])
+            path_variants.append("user-files/" + clean[len("files/"):])
+
+        if clean.startswith("tender/user-files/"):
+            tail = clean[len("tender/user-files/"):]
+            path_variants.append("files/" + tail)
+            path_variants.append("user-files/" + tail)
+
+        if clean.startswith("user-files/"):
+            tail = clean[len("user-files/"):]
+            path_variants.append("files/" + tail)
+            path_variants.append("tender/user-files/" + tail)
+
+        for host in host_variants:
+            for path in path_variants:
+                candidates.append(host + path)
 
     result = []
     seen = set()
@@ -985,23 +1013,79 @@ def build_file_url_candidates(file_path):
     return result
 
 
+def is_html_response(content, content_type=""):
+    head = (content or b"")[:500].lower()
+    ctype = (content_type or "").lower()
+    return (
+        "text/html" in ctype
+        or b"<!doctype html" in head
+        or b"<html" in head
+        or b"<app-root" in head
+    )
+
+
+def detect_file_kind(content, content_type="", url=""):
+    """Returns pdf/docx/xlsx/zip/html/unknown based on headers and magic bytes."""
+    content = content or b""
+    ctype = (content_type or "").lower()
+    url_low = (url or "").lower()
+
+    if is_html_response(content, ctype):
+        return "html"
+    if content.startswith(b"%PDF") or "application/pdf" in ctype or url_low.endswith(".pdf"):
+        return "pdf" if content.startswith(b"%PDF") else "maybe_pdf"
+    if content.startswith(b"PK"):
+        if url_low.endswith(".docx") or "wordprocessingml" in ctype:
+            return "docx"
+        if url_low.endswith(".xlsx") or "spreadsheetml" in ctype:
+            return "xlsx"
+        return "zip"
+    return "unknown"
+
+
 def download_file_with_fallback(file_path):
+    """
+    Downloads only a real binary document.
+    V19 bug: any HTTP 200 response was accepted, including Angular HTML shell.
+    V20: reject HTML, validate magic bytes, then continue to the next candidate URL.
+    """
     attempts = []
 
     for file_url in build_file_url_candidates(file_path):
         try:
-            r = requests.get(file_url, headers=get_headers(), timeout=30)
+            r = requests.get(
+                file_url,
+                headers={
+                    **get_headers(),
+                    "Accept": "application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*",
+                    "Referer": "https://etender.uzex.uz/",
+                },
+                timeout=30,
+                allow_redirects=True,
+            )
+            content_type = r.headers.get("content-type", "")
+            kind = detect_file_kind(r.content, content_type, file_url)
+
             info = {
                 "url": file_url,
                 "status_code": r.status_code,
-                "content_type": r.headers.get("content-type", ""),
+                "content_type": content_type,
                 "size": len(r.content or b""),
+                "detected_kind": kind,
             }
+
+            if kind == "html":
+                info["rejected"] = "html_page_not_document"
+                info["html_start"] = (r.text or "")[:300]
 
             attempts.append(info)
 
-            if r.status_code == 200 and r.content:
+            if r.status_code == 200 and r.content and kind in ["pdf", "docx", "xlsx", "zip"]:
                 return r.content, file_url, attempts
+
+            # Do not accept fake PDF/DOCX URL if body is not a real file.
+            if r.status_code == 200 and kind in ["maybe_pdf", "unknown"]:
+                attempts[-1]["rejected"] = "not_real_document_bytes"
 
         except Exception as e:
             attempts.append({
@@ -1009,7 +1093,7 @@ def download_file_with_fallback(file_path):
                 "error": str(e),
             })
 
-    raise Exception("All file URL candidates failed: " + json.dumps(attempts, ensure_ascii=False)[:1200])
+    raise Exception("No real document downloaded. Attempts: " + json.dumps(attempts, ensure_ascii=False)[:1800])
 
 
 def read_pdf_from_bytes(file_bytes, max_pages=12):
@@ -1140,7 +1224,7 @@ def pick_text_snippet(text, keywords, limit=700):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V19 Telegram Analytics is running"}
+    return {"status": "AI Tender Agent Cargo V20 Document Fix is running"}
 
 
 @app.head("/")
@@ -1151,7 +1235,7 @@ def head_home():
 @app.get("/version")
 def version():
     return {
-        "version": "cargo_v19_telegram_analytics",
+        "version": "cargo_v20_document_fix",
         "status": "running"
     }
 
@@ -1227,7 +1311,7 @@ def test_filter():
 def analyze_doc_test():
     return {
         "status": "ok",
-        "version": "document_analyzer_v18",
+        "version": "document_analyzer_v20",
         "pdf_reader": True,
         "docx_reader": True,
         "xlsx_reader": True,
@@ -1242,7 +1326,7 @@ def analyze_doc_test():
 @app.get("/debug_sources")
 def debug_sources():
     result = {
-        "version": "cargo_v19_telegram_analytics",
+        "version": "cargo_v20_document_fix",
         "Tenderweek": 0,
         "UZEX": 0,
         "XT-Xarid": 0,
@@ -1297,7 +1381,7 @@ def debug_items():
             })
 
     return {
-        "version": "cargo_v19_telegram_analytics",
+        "version": "cargo_v20_document_fix",
         "count": len(all_items),
         "items": all_items[:30],
     }
@@ -1326,7 +1410,7 @@ def debug_raw_candidates():
     rejected = [x for x in all_items if x.get("accepted") is False]
 
     return {
-        "version": "cargo_v19_telegram_analytics",
+        "version": "cargo_v20_document_fix",
         "total_candidates_sample": len(all_items),
         "accepted_sample": len(accepted),
         "rejected_sample": len(rejected),
@@ -1340,14 +1424,14 @@ def setup_sheet_columns():
         result = ensure_sheet_columns()
         return {
             "status": "ok",
-            "version": "sheet_setup_v18",
+            "version": "sheet_setup_v20",
             "message": "Google Sheets columns checked and updated",
             **result,
         }
     except Exception as e:
         return {
             "status": "error",
-            "version": "sheet_setup_v18",
+            "version": "sheet_setup_v20",
             "error": str(e),
         }
 
@@ -1360,7 +1444,7 @@ def setup_tender_manager_columns():
 
         return {
             "status": "ok",
-            "version": "tender_manager_v18",
+            "version": "tender_manager_v20",
             "message": "Tender manager columns checked and updated",
             **result,
         }
@@ -1368,7 +1452,7 @@ def setup_tender_manager_columns():
     except Exception as e:
         return {
             "status": "error",
-            "version": "tender_manager_v18",
+            "version": "tender_manager_v20",
             "error": str(e),
         }
 
@@ -1386,7 +1470,7 @@ def tender_manager_status():
 
         return {
             "status": "ok" if not missing else "warning",
-            "version": "tender_manager_v18",
+            "version": "tender_manager_v20",
             "headers_total": len(headers),
             "missing_columns": missing,
             "manager_columns": TENDER_MANAGER_COLUMNS,
@@ -1396,7 +1480,7 @@ def tender_manager_status():
     except Exception as e:
         return {
             "status": "error",
-            "version": "tender_manager_v18",
+            "version": "tender_manager_v20",
             "error": str(e),
         }
 
@@ -1410,7 +1494,7 @@ def backfill_preview(limit: int = 20):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "backfill_v18",
+                "version": "backfill_v20",
                 "message": "Sheet is empty",
             }
 
@@ -1420,7 +1504,7 @@ def backfill_preview(limit: int = 20):
         if "Ссылка" not in headers_map or "Заказчик" not in headers_map:
             return {
                 "status": "error",
-                "version": "backfill_v18",
+                "version": "backfill_v20",
                 "error": "Required columns not found",
                 "headers": headers,
             }
@@ -1446,7 +1530,7 @@ def backfill_preview(limit: int = 20):
 
         return {
             "status": "ok",
-            "version": "backfill_v18",
+            "version": "backfill_v20",
             "candidates_count": len(candidates),
             "candidates": candidates,
         }
@@ -1454,7 +1538,7 @@ def backfill_preview(limit: int = 20):
     except Exception as e:
         return {
             "status": "error",
-            "version": "backfill_v18",
+            "version": "backfill_v20",
             "error": str(e),
         }
 
@@ -1471,7 +1555,7 @@ def backfill_existing_tenders(limit: int = 50):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "backfill_v18",
+                "version": "backfill_v20",
                 "message": "Sheet is empty",
             }
 
@@ -1494,7 +1578,7 @@ def backfill_existing_tenders(limit: int = 50):
         if missing:
             return {
                 "status": "error",
-                "version": "backfill_v18",
+                "version": "backfill_v20",
                 "error": "Missing columns: " + ", ".join(missing),
                 "headers": headers,
             }
@@ -1538,7 +1622,7 @@ def backfill_existing_tenders(limit: int = 50):
 
         return {
             "status": "ok",
-            "version": "backfill_v18",
+            "version": "backfill_v20",
             "processed": processed,
             "updated": updated,
             "skipped": skipped,
@@ -1550,7 +1634,7 @@ def backfill_existing_tenders(limit: int = 50):
     except Exception as e:
         return {
             "status": "error",
-            "version": "backfill_v18",
+            "version": "backfill_v20",
             "error": str(e),
         }
 
@@ -1567,7 +1651,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
         if not all_values:
             return {
                 "status": "warning",
-                "version": "quality_filter_v18",
+                "version": "quality_filter_v20",
                 "message": "Sheet is empty",
             }
 
@@ -1577,7 +1661,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
         if "Ссылка" not in headers_map:
             return {
                 "status": "error",
-                "version": "quality_filter_v18",
+                "version": "quality_filter_v20",
                 "error": "Missing column: Ссылка",
             }
 
@@ -1614,7 +1698,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
 
         return {
             "status": "ok",
-            "version": "quality_filter_v18",
+            "version": "quality_filter_v20",
             "processed": processed,
             "updated": updated,
             "skipped": skipped,
@@ -1626,7 +1710,7 @@ def quality_backfill_existing_tenders(limit: int = 100):
     except Exception as e:
         return {
             "status": "error",
-            "version": "quality_filter_v18",
+            "version": "quality_filter_v20",
             "error": str(e),
         }
 
@@ -1659,7 +1743,7 @@ def test_quality_filter():
 
     return {
         "status": "ok",
-        "version": "quality_filter_v18",
+        "version": "quality_filter_v20",
         "samples": result,
     }
 
@@ -1757,7 +1841,7 @@ def analyze_uzex_lot(lot_id: str):
 
         return {
             "status": "ok",
-            "version": "document_analyzer_v18",
+            "version": "document_analyzer_v20",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1800,7 +1884,7 @@ def analyze_uzex_lot(lot_id: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v18",
+            "version": "document_analyzer_v20",
             "lot_id": lot_id,
             "error": str(e),
         }
@@ -1832,7 +1916,7 @@ def debug_uzex_lot_api(lot_id: str):
 
     return {
         "status": "ok",
-        "version": "debug_uzex_lot_v18",
+        "version": "debug_uzex_lot_v20",
         "lot_id": lot_id,
         "results": candidates,
     }
@@ -1845,7 +1929,7 @@ def debug_lot_files(url: str):
 
         result = {
             "status": "ok",
-            "version": "document_analyzer_v18_debug_files",
+            "version": "document_analyzer_v20_debug_files",
             "lot_url": url,
             "http_status": r.status_code,
             "content_type": r.headers.get("content-type", ""),
@@ -1874,9 +1958,70 @@ def debug_lot_files(url: str):
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v18_debug_files",
+            "version": "document_analyzer_v20_debug_files",
             "lot_url": url,
             "error": str(e)
+        }
+
+
+@app.get("/debug_file_download")
+def debug_file_download(path: str):
+    """Debug one UZEX file path from GetTrade API and show why it works/fails."""
+    try:
+        file_bytes, working_url, attempts = download_file_with_fallback(path)
+        return {
+            "status": "ok",
+            "version": "document_downloader_v20",
+            "path": path,
+            "working_url": working_url,
+            "size": len(file_bytes or b""),
+            "detected_kind": detect_file_kind(file_bytes, "", working_url),
+            "attempts": attempts,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "document_downloader_v20",
+            "path": path,
+            "error": str(e),
+        }
+
+
+@app.get("/debug_uzex_lot_files_api")
+def debug_uzex_lot_files_api(lot_id: str):
+    """Shows UZEX document fields and candidate URLs without trying to parse the files."""
+    try:
+        trade = get_uzex_trade(lot_id)
+        file_fields = [
+            ("tech_file", trade.get("tech_file_name"), trade.get("tech_file_path"), trade.get("tech_file_ext")),
+            ("tech_doc_file", trade.get("tech_doc_file_name"), trade.get("tech_doc_file_path"), trade.get("tech_doc_file_ext")),
+            ("contract_proform_file", trade.get("contract_proform_file_name"), trade.get("contract_proform_file_path"), trade.get("contract_proform_file_ext")),
+            ("prolong_file", trade.get("prolong_file_name"), trade.get("prolong_file_path"), trade.get("prolong_file_ext")),
+        ]
+        docs = []
+        for doc_type, name, path, ext in file_fields:
+            if not path:
+                continue
+            docs.append({
+                "type": doc_type,
+                "name": name,
+                "ext": ext,
+                "path": path,
+                "url_candidates": build_file_url_candidates(path),
+            })
+        return {
+            "status": "ok",
+            "version": "document_downloader_v20",
+            "lot_id": lot_id,
+            "documents_count": len(docs),
+            "documents": docs,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "document_downloader_v20",
+            "lot_id": lot_id,
+            "error": str(e),
         }
 
 
@@ -1988,7 +2133,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V19 Telegram Analytics Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V20 Document Fix Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -2045,7 +2190,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v19_telegram_analytics",
+        "version": "cargo_v20_document_fix",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
