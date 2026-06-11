@@ -15,7 +15,7 @@ from docx import Document
 import openpyxl
 
 
-app = FastAPI(title="AI Tender Agent Cargo V18 Strict Final")
+app = FastAPI(title="AI Tender Agent Cargo V17 + Document Analyzer V10 Quality Filter")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -23,11 +23,10 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
 
 SERVICE_PHRASES = [
-    "перевозка грузов", "перевозке грузов", "перевозки грузов",
-    "грузоперевоз", "грузовые перевозки",
+    "перевозка грузов", "перевозке грузов", "грузоперевоз", "грузовые перевозки",
     "доставка грузов", "доставка груза", "доставка товара автотранспортом",
-    "транспортные услуги", "оказание транспортных услуг",
-    "услуги транспорта", "услуги по перевозке", "услуги перевозки",
+    "транспортные услуги", "оказание транспортных услуг", "услуги транспорта",
+    "услуги по перевозке", "услуги перевозки",
     "транспортно-экспедиционные услуги", "транспортно экспедиционные услуги",
     "экспедиторские услуги", "логистические услуги",
     "международные автомобильные перевозки", "международная перевозка",
@@ -68,36 +67,29 @@ HARD_BAD_WORDS = [
     "yo‘li", "yo'li", "yoʻli", "avtomobil yo",
     "yer uchastkasi", "master-reja", "baholash",
     "service area", "service point", "проект", "лойиҳа",
-
-    # V18: жёсткая отсечка IT / банковских / автоматизации / ПО
-    "автоматизац", "кредит", "кредитного конвейера", "банк", "банковск",
-    "финанс", "программ", "программного обеспечения", "по для",
-    "система принятия решений", "принятия решений", "внедрение системы",
-    "внедрению системы", "it", "информационн", "цифров",
-    "software", "sap", "oracle", "crm", "erp", "сервер",
-    "лиценз", "лицензи", "разработк", "поддержк программ",
-    "интеграц", "модернизац системы", "сопровождение системы",
-    "кибербезопас", "телеком", "интернет", "сайт", "портал",
 ]
 
-SOFT_BAD_WORDS = [
-    "товар", "материал", "изделие", "деталь", "агрегат", "насос",
-    "кабель", "труба", "краска", "масло"
-]
+SOFT_BAD_WORDS = ["товар", "материал", "изделие", "деталь", "агрегат", "насос", "кабель", "труба", "краска", "масло"]
 
 QUALITY_BAD_CONTEXT_WORDS = [
+    # Materials / goods, not logistics service
     "инерт материал", "инертные материалы", "щебень", "песок", "гравий",
     "бетон", "цемент", "арматура", "кирпич", "строительный материал",
-    "қум", "шағал", "inert material", "qum", "shag'al",
-    "утилизация", "чиқинди", "отход", "maishiy chiqindi",
-    "qattiq chiqindi", "мусор", "вывоз мусора",
+    "қум", "шағал", "цемент", "бетон", "inert material", "qum", "shag'al",
+
+    # Waste / utility / non-core
+    "утилизация", "чиқинди", "отход", "maishiy chiqindi", "qattiq chiqindi",
+    "мусор", "вывоз мусора",
+
+    # Printing, food, medical, office, consulting
     "типограф", "печать", "газет", "bosmaxona", "chop etish",
     "овқат", "питание", "еда", "медицин", "лаборатор",
     "консультац", "технадзор", "аудит", "юридическ",
+
+    # Purchase of vehicles/spare parts/equipment
     "закупка", "поставка", "приобретение", "сотиб олиш",
     "запчаст", "запасн", "ось", "шасси", "двигател", "оборудован",
     "смесительно-заряд", "инструмент", "набор инструментов",
-    "автоматизац", "кредит", "банк", "программ", "система принятия решений",
 ]
 
 QUALITY_GOOD_CONTEXT_WORDS = [
@@ -115,6 +107,7 @@ QUALITY_STRONG_GOOD_WORDS = [
     "негабарит", "тяжеловес", "gabarit bo", "og'ir vazn", "og’ir vazn",
     "экспедитор", "logistika",
 ]
+
 
 BAD_URL_PARTS = [
     "register", "login", "logout", "signin", "signup", "cabinet", "profile",
@@ -190,7 +183,6 @@ def filter_reason(title, url):
     has_service = any(x in t for x in ["услуг", "xizmat", "service"])
     has_action = any(x in t for x in ["перевоз", "достав", "tashish", "tashuv", "delivery", "transportation"])
 
-    # V18: минимум 3 опорных слова + груз + услуга + действие
     if support_count >= 3 and has_cargo and has_service and has_action:
         if any(x in t for x in SOFT_BAD_WORDS):
             return "soft_bad_but_possible"
@@ -611,10 +603,17 @@ def short_requirements_from_trade(trade):
         if q_short:
             parts.append("Квалификация: " + "; ".join(q_short))
 
+    if not parts:
+        return ""
+
     return clean_text(" | ".join(parts))[:900]
 
 
 def quality_decision_from_trade(trade, title=""):
+    """
+    Decides if tender is real logistics for Trans Ocean Logistics.
+    Uses UZEX API fields, not only parser title.
+    """
     budget_products = safe_json_loads(trade.get("budget_products"), [])
     description = ""
     product_name = ""
@@ -638,6 +637,7 @@ def quality_decision_from_trade(trade, title=""):
     good_hits = [w for w in QUALITY_GOOD_CONTEXT_WORDS if w in text]
     strong_hits = [w for w in QUALITY_STRONG_GOOD_WORDS if w in text]
 
+    # Strong international/expedition context overrides generic "material" words only if service is clearly logistics.
     if strong_hits and any(w in text for w in ["yuk tashish", "перевоз", "transport", "логист", "экспедитор"]):
         return {
             "logistics": "Да",
@@ -648,6 +648,7 @@ def quality_decision_from_trade(trade, title=""):
             "decision": "Участвовать: высокий приоритет, международная/сложная логистика, нужны партнёры и расчёт себестоимости",
         }
 
+    # If bad context exists and there is no strong logistics service context, reject.
     if bad_hits and not strong_hits:
         return {
             "logistics": "Нет",
@@ -658,6 +659,7 @@ def quality_decision_from_trade(trade, title=""):
             "decision": "Отказаться: непрофильная закупка или не транспортная услуга для Trans Ocean Logistics",
         }
 
+    # Service cargo tender, normal case.
     if good_hits:
         return {
             "logistics": "Да",
@@ -668,6 +670,7 @@ def quality_decision_from_trade(trade, title=""):
             "decision": "Рассмотреть участие: профильная логистическая услуга",
         }
 
+    # Weak wording with "transport" but unclear.
     if any(w in text for w in ["transport", "транспорт", "avtotransport", "yuk"]):
         return {
             "logistics": "Сомнительно",
@@ -688,7 +691,16 @@ def quality_decision_from_trade(trade, title=""):
     }
 
 
+def ai_recommendation_from_trade(trade, title=""):
+    return quality_decision_from_trade(trade, title).get("decision", "Изучить")
+
+
 def analyze_uzex_for_sheet(site, title, url):
+    """
+    Returns values for analytical Google Sheet columns.
+    Only UZEX lots are enriched through API.
+    For other sources returns empty fields.
+    """
     empty = {
         "Логистика": "",
         "Приоритет": "",
@@ -746,115 +758,11 @@ def analyze_uzex_for_sheet(site, title, url):
         return empty
 
 
-EXTRA_SHEET_COLUMNS = [
-    "Заказчик",
-    "Сумма",
-    "Валюта",
-    "Оплата",
-    "Срок оплаты",
-    "Срок оказания услуг",
-    "Требования",
-    "Рекомендация AI",
-]
-
-TENDER_MANAGER_COLUMNS = [
-    "Подавать",
-    "Ответственный",
-    "Дата решения",
-    "Статус участия",
-    "Комментарий директора",
-]
-
-
-def ensure_sheet_columns():
-    sheet = get_sheet()
-    headers = sheet.row_values(1)
-
-    if not headers:
-        headers = [
-            "Дата",
-            "Отправил",
-            "Ссылка",
-            "Источник",
-            "Статус",
-            "Приоритет",
-            "AI анализ",
-            "Комментарий",
-        ]
-        sheet.update("A1:H1", [headers])
-
-    current_headers = sheet.row_values(1)
-    added = []
-
-    for col_name in EXTRA_SHEET_COLUMNS:
-        if col_name not in current_headers:
-            current_headers.append(col_name)
-            added.append(col_name)
-
-    if added:
-        end_col = len(current_headers)
-        end_a1 = gspread.utils.rowcol_to_a1(1, end_col)
-        end_col_letter = ''.join([c for c in end_a1 if c.isalpha()])
-        sheet.update(f"A1:{end_col_letter}1", [current_headers])
-
-    return {
-        "headers_total": len(current_headers),
-        "added": added,
-        "headers": current_headers,
-    }
-
-
-def ensure_tender_manager_columns():
-    sheet = get_sheet()
-    headers = sheet.row_values(1)
-
-    if not headers:
-        ensure_sheet_columns()
-
-    current_headers = sheet.row_values(1)
-    added = []
-
-    for col_name in TENDER_MANAGER_COLUMNS:
-        if col_name not in current_headers:
-            current_headers.append(col_name)
-            added.append(col_name)
-
-    if added:
-        end_col = len(current_headers)
-        end_a1 = gspread.utils.rowcol_to_a1(1, end_col)
-        end_col_letter = ''.join([c for c in end_a1 if c.isalpha()])
-        sheet.update(f"A1:{end_col_letter}1", [current_headers])
-
-    return {
-        "headers_total": len(current_headers),
-        "added": added,
-        "headers": current_headers,
-    }
-
-
-def get_header_index_map(headers):
-    result = {}
-    for idx, h in enumerate(headers, start=1):
-        if h:
-            result[h.strip()] = idx
-    return result
-
-
-def update_row_analytics(sheet, row_number, headers_map, analytics):
-    cells = []
-
-    for col_name, value in analytics.items():
-        col_idx = headers_map.get(col_name)
-        if col_idx:
-            cells.append(gspread.Cell(row_number, col_idx, value))
-
-    if cells:
-        sheet.update_cells(cells, value_input_option="USER_ENTERED")
-
-    return len(cells)
-
-
 def make_row_by_headers(headers, base_values, analytics):
+    """
+    Creates a row matching current sheet headers.
+    This avoids mistakes if column order changes.
+    """
     base_map = {
         "Дата": base_values.get("Дата", ""),
         "Отправил": base_values.get("Отправил", ""),
@@ -898,7 +806,7 @@ def save_to_sheet(site, title, url):
             "Источник": site,
             "Статус": "Новый",
             "Приоритет": "Средний",
-            "AI анализ": "Проверить лот: найдено по Cargo V18 Strict Final",
+            "AI анализ": "Проверить лот: найдено по Cargo V17 + V7 Auto Fill",
             "Комментарий": title,
         }
 
@@ -909,17 +817,6 @@ def save_to_sheet(site, title, url):
 
     except Exception as e:
         print("GOOGLE SHEETS ERROR:", e)
-        return False
-
-
-def tender_exists(url):
-    try:
-        sheet = get_sheet()
-        urls_col_c = sheet.col_values(3)
-        urls_col_d = sheet.col_values(4)
-        return url in urls_col_c or url in urls_col_d
-    except Exception as e:
-        print("CHECK ERROR:", e)
         return False
 
 
@@ -960,7 +857,280 @@ def extract_file_links_from_html(page_url, html):
     return found
 
 
+def try_get_json(url, params=None):
+    try:
+        r = requests.get(url, headers=get_headers(json_mode=True), params=params, timeout=15)
+        content_type = r.headers.get("content-type", "")
+        text_start = r.text[:1200]
+
+        parsed = None
+        keys = []
+        is_json = False
+
+        try:
+            parsed = r.json()
+            is_json = True
+            if isinstance(parsed, dict):
+                keys = list(parsed.keys())[:30]
+            elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                keys = list(parsed[0].keys())[:30]
+        except Exception:
+            pass
+
+        return {
+            "method": "GET",
+            "url": r.url,
+            "status_code": r.status_code,
+            "content_type": content_type,
+            "size": len(r.text),
+            "is_json": is_json,
+            "json_keys": keys,
+            "text_start": text_start,
+        }
+
+    except Exception as e:
+        return {
+            "method": "GET",
+            "url": url,
+            "params": params,
+            "error": str(e),
+        }
+
+
+def try_post_json(url, payload):
+    try:
+        r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=15)
+        content_type = r.headers.get("content-type", "")
+        text_start = r.text[:1200]
+
+        parsed = None
+        keys = []
+        is_json = False
+
+        try:
+            parsed = r.json()
+            is_json = True
+            if isinstance(parsed, dict):
+                keys = list(parsed.keys())[:30]
+            elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                keys = list(parsed[0].keys())[:30]
+        except Exception:
+            pass
+
+        return {
+            "method": "POST",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": content_type,
+            "size": len(r.text),
+            "is_json": is_json,
+            "json_keys": keys,
+            "text_start": text_start,
+        }
+
+    except Exception as e:
+        return {
+            "method": "POST",
+            "url": url,
+            "payload": payload,
+            "error": str(e),
+        }
+
+
+@app.get("/")
+def home():
+    return {"status": "AI Tender Agent Cargo V17 + Document Analyzer V10 Quality Filter is running"}
+
+
+@app.head("/")
+def head_home():
+    return {}
+
+
+@app.get("/version")
+def version():
+    return {
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+        "status": "running"
+    }
+
+
+@app.get("/analyze_doc_test")
+def analyze_doc_test():
+    return {
+        "status": "ok",
+        "version": "document_analyzer_v1",
+        "pdf_reader": True,
+        "docx_reader": True,
+        "xlsx_reader": True,
+        "modules": {
+            "PyPDF2": True,
+            "python_docx": True,
+            "openpyxl": True
+        }
+    }
+
+
+@app.get("/debug_lot_files")
+def debug_lot_files(url: str):
+    try:
+        r = requests.get(url, headers=get_headers(), timeout=20)
+
+        result = {
+            "status": "ok",
+            "version": "document_analyzer_v2_debug_files",
+            "lot_url": url,
+            "http_status": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "html_size": len(r.text),
+            "files_found": [],
+            "files_count": 0,
+            "page_title": "",
+            "html_start": r.text[:500],
+        }
+
+        if r.status_code != 200:
+            result["status"] = "http_error"
+            return result
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        title_tag = soup.find("title")
+        if title_tag:
+            result["page_title"] = clean_text(title_tag.get_text())
+
+        files = extract_file_links_from_html(url, r.text)
+        result["files_found"] = files[:50]
+        result["files_count"] = len(files)
+
+        return result
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "document_analyzer_v2_debug_files",
+            "lot_url": url,
+            "error": str(e)
+        }
+
+
+@app.get("/debug_uzex_lot_api")
+def debug_uzex_lot_api(lot_id: str):
+    """
+    Diagnostic endpoint.
+    It does not change scan logic.
+    It tries common UZEX API patterns to discover which endpoint returns lot details/files.
+    """
+    candidates = []
+
+    get_urls = [
+        f"https://apietender.uzex.uz/api/common/Trade/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeInfo/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeDetail/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeLot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/Lot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotInfo/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotDetail/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/GetLot/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/TradeFiles/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/LotFiles/{lot_id}",
+        f"https://apietender.uzex.uz/api/common/Files/{lot_id}",
+    ]
+
+    get_urls_with_params = [
+        ("https://apietender.uzex.uz/api/common/Trade", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeInfo", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeDetail", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/Lot", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotInfo", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotDetail", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeFiles", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotFiles", {"id": lot_id}),
+        ("https://apietender.uzex.uz/api/common/FileList", {"id": lot_id}),
+    ]
+
+    post_tests = [
+        ("https://apietender.uzex.uz/api/common/TradeList", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeInfo", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeDetail", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotInfo", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotDetail", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/TradeFiles", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+        ("https://apietender.uzex.uz/api/common/LotFiles", {"id": int(lot_id) if str(lot_id).isdigit() else lot_id}),
+    ]
+
+    for u in get_urls:
+        candidates.append(try_get_json(u))
+
+    for u, p in get_urls_with_params:
+        candidates.append(try_get_json(u, params=p))
+
+    for u, payload in post_tests:
+        candidates.append(try_post_json(u, payload))
+
+    useful = []
+    for c in candidates:
+        txt = (c.get("text_start") or "").lower()
+        keys = " ".join(c.get("json_keys") or []).lower()
+        status_ok = c.get("status_code") == 200
+        if status_ok and (
+            "494831" in txt
+            or "тяньцзинь" in txt
+            or "tyantszin" in txt
+            or "xorgos" in txt
+            or "pdf" in txt
+            or "doc" in txt
+            or "file" in txt
+            or "document" in txt
+            or "файл" in txt
+            or "hujjat" in txt
+            or "trade" in keys
+            or "lot" in keys
+            or "file" in keys
+        ):
+            useful.append(c)
+
+    return {
+        "status": "ok",
+        "version": "document_analyzer_v3_uzex_api_debug",
+        "lot_id": lot_id,
+        "tested_total": len(candidates),
+        "useful_count": len(useful),
+        "useful": useful[:10],
+        "all_results_short": [
+            {
+                "method": c.get("method"),
+                "url": c.get("url"),
+                "status_code": c.get("status_code"),
+                "content_type": c.get("content_type"),
+                "size": c.get("size"),
+                "is_json": c.get("is_json"),
+                "json_keys": c.get("json_keys"),
+                "error": c.get("error"),
+                "text_start": (c.get("text_start") or "")[:250],
+            }
+            for c in candidates
+        ],
+    }
+
+
+
+def build_file_url(file_path):
+    """
+    Backward-compatible primary URL builder.
+    V5 uses build_file_url_candidates() for fallback downloading.
+    """
+    candidates = build_file_url_candidates(file_path)
+    return candidates[0] if candidates else None
+
+
 def build_file_url_candidates(file_path):
+    """
+    UZEX stores file paths inconsistently.
+    The same path may work from etender.uzex.uz or apietender.uzex.uz.
+    This function returns several safe candidates and downloader tries them one by one.
+    """
     if not file_path:
         return []
 
@@ -972,9 +1142,20 @@ def build_file_url_candidates(file_path):
 
     clean = file_path.lstrip("/")
 
+    # Most likely public file hosts
     candidates.append("https://etender.uzex.uz/" + clean)
     candidates.append("https://apietender.uzex.uz/" + clean)
 
+    # Some UZEX paths are returned as /files/..., some as tender/user-files/...
+    if clean.startswith("files/"):
+        candidates.append("https://etender.uzex.uz/" + clean)
+        candidates.append("https://apietender.uzex.uz/" + clean)
+
+    if clean.startswith("tender/user-files/"):
+        candidates.append("https://etender.uzex.uz/" + clean)
+        candidates.append("https://apietender.uzex.uz/" + clean)
+
+    # Deduplicate while preserving order
     result = []
     seen = set()
     for u in candidates:
@@ -986,6 +1167,10 @@ def build_file_url_candidates(file_path):
 
 
 def download_file_with_fallback(file_path):
+    """
+    Tries all possible URLs for a file path.
+    Returns: (content_bytes, working_url, attempts)
+    """
     attempts = []
 
     for file_url in build_file_url_candidates(file_path):
@@ -1093,6 +1278,7 @@ def analyze_text_for_logistics(title, text):
     if any(w in t for w in high_priority_words):
         priority = "Очень высокий"
         chance = "Высокий"
+
     elif any(w in t for w in medium_priority_words):
         priority = "Высокий"
         chance = "Средний"
@@ -1138,532 +1324,6 @@ def pick_text_snippet(text, keywords, limit=700):
     return clean_text(t[:limit])
 
 
-@app.get("/")
-def home():
-    return {"status": "AI Tender Agent Cargo V18 Strict Final is running"}
-
-
-@app.head("/")
-def head_home():
-    return {}
-
-
-@app.get("/version")
-def version():
-    return {
-        "version": "cargo_v18_strict_final",
-        "status": "running"
-    }
-
-
-@app.get("/health")
-def health():
-    result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
-
-    try:
-        tg = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=8)
-        result["telegram"] = tg.status_code == 200
-    except Exception as e:
-        result["errors"].append("Telegram error: " + str(e))
-
-    try:
-        sheet = get_sheet()
-        sheet.row_values(1)
-        result["google_sheets"] = True
-    except Exception as e:
-        result["errors"].append("Google Sheets error: " + str(e))
-
-    if result["errors"]:
-        result["status"] = "warning"
-
-    return result
-
-
-@app.get("/test_filter")
-def test_filter():
-    return {
-        "Услуга по перевозке грузов": is_real_cargo_tender("Услуга по перевозке грузов", "https://etender.uzex.uz/lot/123"),
-        "Оказание транспортных услуг": is_real_cargo_tender("Оказание транспортных услуг", "https://xarid.uzex.uz/tender/456"),
-        "Транспортно-экспедиционные услуги": is_real_cargo_tender("Транспортно-экспедиционные услуги", "https://etender.uzex.uz/lot/999"),
-        "Лабораторное оборудование": is_real_cargo_tender("Лабораторное оборудование", "https://www.tenderweek.com/tender-35921"),
-        "Закупка арматуры для АЭС": is_real_cargo_tender("Закупка арматуры для АЭС", "https://www.tenderweek.com/tender-35911"),
-        "Доставка товара автотранспортом": is_real_cargo_tender("Доставка товара автотранспортом", "https://www.tenderweek.com/tender-99999"),
-        "O’zbekneftgaz yuklarni tashuvchi avtotransporti xizmatlari": is_real_cargo_tender(
-            "O’zbekneftgaz yuklarni tashuvchi avtotransporti xizmatlari",
-            "https://etender.uzex.uz/lot/488787",
-        ),
-        "xalqaro avtomobil yo‘lining master-reja ishlab chiqish": is_real_cargo_tender(
-            "xalqaro avtomobil yo‘lining master-reja ishlab chiqish",
-            "https://etender.uzex.uz/lot/494429",
-        ),
-        "Набор инструментов": is_real_cargo_tender(
-            "Набор инструментов",
-            "https://xt-xarid.uz/tender/7477544",
-        ),
-        "Закупка смесительно-зарядных машин грузоподъёмностью 20 тонн": is_real_cargo_tender(
-            "Закупка смесительно-зарядных машин грузоподъёмностью 20 тонн",
-            "https://xt-xarid.uz/tender/7389067",
-        ),
-        "Ось грузовых автотранспортных средств": is_real_cargo_tender(
-            "Ось грузовых автотранспортных средств",
-            "https://xt-xarid.uz/tender/29.32.30.219_00012",
-        ),
-        "xalqaro yuk tashish xizmati": is_real_cargo_tender(
-            "xalqaro yuk tashish xizmati",
-            "https://xt-xarid.uz/tender/999",
-        ),
-        "Автоматизация кредитного конвейера": is_real_cargo_tender(
-            "Предоставление услуг по автоматизации кредитного конвейера",
-            "https://xt-xarid.uz/tender/111",
-        ),
-        "Внедрение системы принятия решений": is_real_cargo_tender(
-            "Предоставление услуг по внедрению Системы принятия решений",
-            "https://xt-xarid.uz/tender/222",
-        ),
-    }
-
-
-@app.get("/analyze_doc_test")
-def analyze_doc_test():
-    return {
-        "status": "ok",
-        "version": "document_analyzer_v18",
-        "pdf_reader": True,
-        "docx_reader": True,
-        "xlsx_reader": True,
-        "modules": {
-            "PyPDF2": True,
-            "python_docx": True,
-            "openpyxl": True
-        }
-    }
-
-
-@app.get("/debug_sources")
-def debug_sources():
-    result = {
-        "version": "cargo_v18_strict_final",
-        "Tenderweek": 0,
-        "UZEX": 0,
-        "XT-Xarid": 0,
-        "total": 0,
-        "errors": [],
-    }
-
-    try:
-        tw = parse_tenderweek()
-        result["Tenderweek"] = len(tw)
-    except Exception as e:
-        result["errors"].append("Tenderweek error: " + str(e))
-
-    try:
-        uzex = parse_uzex()
-        result["UZEX"] = len(uzex)
-    except Exception as e:
-        result["errors"].append("UZEX error: " + str(e))
-
-    try:
-        xt = parse_xt_xarid()
-        result["XT-Xarid"] = len(xt)
-    except Exception as e:
-        result["errors"].append("XT-Xarid error: " + str(e))
-
-    result["total"] = result["Tenderweek"] + result["UZEX"] + result["XT-Xarid"]
-    return result
-
-
-@app.get("/debug_items")
-def debug_items():
-    all_items = []
-
-    for source_name, parser in [
-        ("Tenderweek", parse_tenderweek),
-        ("UZEX", parse_uzex),
-        ("XT-Xarid", parse_xt_xarid),
-    ]:
-        try:
-            result = parser()
-            for item in result[:10]:
-                all_items.append({
-                    "site": source_name,
-                    "title": item.get("title"),
-                    "url": item.get("url"),
-                    "reason": item.get("reason"),
-                })
-        except Exception as e:
-            all_items.append({
-                "site": source_name,
-                "error": str(e),
-            })
-
-    return {
-        "version": "cargo_v18_strict_final",
-        "count": len(all_items),
-        "items": all_items[:30],
-    }
-
-
-@app.get("/debug_raw_candidates")
-def debug_raw_candidates():
-    all_items = []
-
-    for source_name, parser in [
-        ("Tenderweek", parse_tenderweek),
-        ("UZEX", parse_uzex),
-        ("XT-Xarid", parse_xt_xarid),
-    ]:
-        try:
-            result = parser(raw=True)
-            for item in result[:25]:
-                all_items.append(item)
-        except Exception as e:
-            all_items.append({
-                "site": source_name,
-                "error": str(e),
-            })
-
-    accepted = [x for x in all_items if x.get("accepted") is True]
-    rejected = [x for x in all_items if x.get("accepted") is False]
-
-    return {
-        "version": "cargo_v18_strict_final",
-        "total_candidates_sample": len(all_items),
-        "accepted_sample": len(accepted),
-        "rejected_sample": len(rejected),
-        "items": all_items[:75],
-    }
-
-
-@app.get("/setup_sheet_columns")
-def setup_sheet_columns():
-    try:
-        result = ensure_sheet_columns()
-        return {
-            "status": "ok",
-            "version": "sheet_setup_v18",
-            "message": "Google Sheets columns checked and updated",
-            **result,
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "sheet_setup_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/setup_tender_manager_columns")
-def setup_tender_manager_columns():
-    try:
-        ensure_sheet_columns()
-        result = ensure_tender_manager_columns()
-
-        return {
-            "status": "ok",
-            "version": "tender_manager_v18",
-            "message": "Tender manager columns checked and updated",
-            **result,
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "tender_manager_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/tender_manager_status")
-def tender_manager_status():
-    try:
-        sheet = get_sheet()
-        headers = sheet.row_values(1)
-
-        missing = []
-        for col in EXTRA_SHEET_COLUMNS + TENDER_MANAGER_COLUMNS:
-            if col not in headers:
-                missing.append(col)
-
-        return {
-            "status": "ok" if not missing else "warning",
-            "version": "tender_manager_v18",
-            "headers_total": len(headers),
-            "missing_columns": missing,
-            "manager_columns": TENDER_MANAGER_COLUMNS,
-            "analytics_columns": EXTRA_SHEET_COLUMNS,
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "tender_manager_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/backfill_preview")
-def backfill_preview(limit: int = 20):
-    try:
-        sheet = get_sheet()
-        all_values = sheet.get_all_values()
-
-        if not all_values:
-            return {
-                "status": "warning",
-                "version": "backfill_v18",
-                "message": "Sheet is empty",
-            }
-
-        headers = all_values[0]
-        headers_map = get_header_index_map(headers)
-
-        if "Ссылка" not in headers_map or "Заказчик" not in headers_map:
-            return {
-                "status": "error",
-                "version": "backfill_v18",
-                "error": "Required columns not found",
-                "headers": headers,
-            }
-
-        link_col = headers_map["Ссылка"]
-        customer_col = headers_map["Заказчик"]
-
-        candidates = []
-
-        for row_idx, row in enumerate(all_values[1:], start=2):
-            if len(candidates) >= limit:
-                break
-
-            link = row[link_col - 1] if len(row) >= link_col else ""
-            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
-
-            if link and "etender.uzex.uz/lot/" in link and not customer_value:
-                candidates.append({
-                    "row": row_idx,
-                    "link": link,
-                    "lot_id": extract_lot_id_from_url(link),
-                })
-
-        return {
-            "status": "ok",
-            "version": "backfill_v18",
-            "candidates_count": len(candidates),
-            "candidates": candidates,
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "backfill_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/backfill_existing_tenders")
-def backfill_existing_tenders(limit: int = 50):
-    try:
-        ensure_sheet_columns()
-        ensure_tender_manager_columns()
-
-        sheet = get_sheet()
-        all_values = sheet.get_all_values()
-
-        if not all_values:
-            return {
-                "status": "warning",
-                "version": "backfill_v18",
-                "message": "Sheet is empty",
-            }
-
-        headers = all_values[0]
-        headers_map = get_header_index_map(headers)
-
-        required = [
-            "Ссылка",
-            "Заказчик",
-            "Сумма",
-            "Валюта",
-            "Оплата",
-            "Срок оплаты",
-            "Срок оказания услуг",
-            "Требования",
-            "Рекомендация AI",
-        ]
-
-        missing = [h for h in required if h not in headers_map]
-        if missing:
-            return {
-                "status": "error",
-                "version": "backfill_v18",
-                "error": "Missing columns: " + ", ".join(missing),
-                "headers": headers,
-            }
-
-        processed = 0
-        updated = 0
-        skipped = 0
-        errors = []
-
-        link_col = headers_map["Ссылка"]
-        customer_col = headers_map["Заказчик"]
-
-        for row_idx, row in enumerate(all_values[1:], start=2):
-            if processed >= limit:
-                break
-
-            link = row[link_col - 1] if len(row) >= link_col else ""
-            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
-
-            if not link or "etender.uzex.uz/lot/" not in link:
-                skipped += 1
-                continue
-
-            if customer_value:
-                skipped += 1
-                continue
-
-            processed += 1
-
-            try:
-                analytics = analyze_uzex_for_sheet("UZEX", "Backfill UZEX lot", link)
-                update_row_analytics(sheet, row_idx, headers_map, analytics)
-                updated += 1
-
-            except Exception as e:
-                errors.append({
-                    "row": row_idx,
-                    "link": link,
-                    "error": str(e)[:250],
-                })
-
-        return {
-            "status": "ok",
-            "version": "backfill_v18",
-            "processed": processed,
-            "updated": updated,
-            "skipped": skipped,
-            "errors_count": len(errors),
-            "errors": errors[:10],
-            "message": "Existing UZEX tenders backfill completed",
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "backfill_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/quality_backfill_existing_tenders")
-def quality_backfill_existing_tenders(limit: int = 100):
-    try:
-        ensure_sheet_columns()
-        ensure_tender_manager_columns()
-
-        sheet = get_sheet()
-        all_values = sheet.get_all_values()
-
-        if not all_values:
-            return {
-                "status": "warning",
-                "version": "quality_filter_v18",
-                "message": "Sheet is empty",
-            }
-
-        headers = all_values[0]
-        headers_map = get_header_index_map(headers)
-
-        if "Ссылка" not in headers_map:
-            return {
-                "status": "error",
-                "version": "quality_filter_v18",
-                "error": "Missing column: Ссылка",
-            }
-
-        processed = 0
-        updated = 0
-        skipped = 0
-        errors = []
-
-        link_col = headers_map["Ссылка"]
-
-        for row_idx, row in enumerate(all_values[1:], start=2):
-            if processed >= limit:
-                break
-
-            link = row[link_col - 1] if len(row) >= link_col else ""
-
-            if not link or "etender.uzex.uz/lot/" not in link:
-                skipped += 1
-                continue
-
-            processed += 1
-
-            try:
-                analytics = analyze_uzex_for_sheet("UZEX", "Quality backfill UZEX lot", link)
-                update_row_analytics(sheet, row_idx, headers_map, analytics)
-                updated += 1
-
-            except Exception as e:
-                errors.append({
-                    "row": row_idx,
-                    "link": link,
-                    "error": str(e)[:250],
-                })
-
-        return {
-            "status": "ok",
-            "version": "quality_filter_v18",
-            "processed": processed,
-            "updated": updated,
-            "skipped": skipped,
-            "errors_count": len(errors),
-            "errors": errors[:10],
-            "message": "Quality filter backfill completed",
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "quality_filter_v18",
-            "error": str(e),
-        }
-
-
-@app.get("/test_quality_filter")
-def test_quality_filter():
-    samples = {
-        "Услуга по перевозке грузов": "Услуга по перевозке грузов",
-        "Международная мультимодальная перевозка негабаритных грузов": "Xitoy-Qozog’iston-O’zbekiston yo’nalishi bo’yicha gabarit bo’lmagan va og’ir vaznli yuklarni tashish",
-        "Инертные материалы": "Инертные материалы с доставкой",
-        "Вывоз мусора": "qattiq va maishiy chiqindilarni olib chiqib ketish",
-        "Печать газет": "gazetalarni chop etish uchun bosmaxona xizmatlari",
-        "Закупка осей": "Ось грузовых автотранспортных средств",
-        "Автоматизация кредитного конвейера": "Предоставление услуг по автоматизации кредитного конвейера",
-    }
-
-    result = {}
-    for name, text in samples.items():
-        fake_trade = {
-            "budget_products": json.dumps([{
-                "Product_Name": text,
-                "Description": text,
-                "Category_Name": "Услуги сухопутного и трубопроводного транспорта",
-                "Delivery_Term": 10,
-            }], ensure_ascii=False),
-            "customer_name": "TEST",
-            "technical_description": text,
-        }
-        result[name] = quality_decision_from_trade(fake_trade, text)
-
-    return {
-        "status": "ok",
-        "version": "quality_filter_v18",
-        "samples": result,
-    }
-
-
 @app.get("/analyze_uzex_lot")
 def analyze_uzex_lot(lot_id: str):
     try:
@@ -1678,7 +1338,6 @@ def analyze_uzex_lot(lot_id: str):
             product_description = budget_products[0].get("Description", "") or ""
 
         documents = []
-        combined_text = ""
 
         file_fields = [
             ("tech_file", trade.get("tech_file_name"), trade.get("tech_file_path"), trade.get("tech_file_ext")),
@@ -1686,6 +1345,8 @@ def analyze_uzex_lot(lot_id: str):
             ("contract_proform_file", trade.get("contract_proform_file_name"), trade.get("contract_proform_file_path"), trade.get("contract_proform_file_ext")),
             ("prolong_file", trade.get("prolong_file_name"), trade.get("prolong_file_path"), trade.get("prolong_file_ext")),
         ]
+
+        combined_text = ""
 
         for doc_type, name, path, ext in file_fields:
             if not path:
@@ -1755,9 +1416,9 @@ def analyze_uzex_lot(lot_id: str):
             ["условия оплаты", "оплата", "payment", "30 календарных дней", "15 дней"]
         )
 
-        return {
+        result = {
             "status": "ok",
-            "version": "document_analyzer_v18",
+            "version": "document_analyzer_v10_quality_filter",
             "lot_id": lot_id,
             "api_url": f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
             "lot": {
@@ -1797,87 +1458,717 @@ def analyze_uzex_lot(lot_id: str):
             },
         }
 
-    except Exception as e:
-        return {
-            "status": "error",
-            "version": "document_analyzer_v18",
-            "lot_id": lot_id,
-            "error": str(e),
-        }
-
-
-@app.get("/debug_uzex_lot_api")
-def debug_uzex_lot_api(lot_id: str):
-    candidates = []
-
-    get_urls = [
-        f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}/0",
-        f"https://apietender.uzex.uz/api/common/GetTrade/{lot_id}",
-        f"https://apietender.uzex.uz/api/common/Trade/{lot_id}",
-        f"https://apietender.uzex.uz/api/common/Lot/{lot_id}",
-    ]
-
-    for u in get_urls:
-        try:
-            r = requests.get(u, headers=get_headers(json_mode=True), timeout=15)
-            candidates.append({
-                "url": u,
-                "status_code": r.status_code,
-                "content_type": r.headers.get("content-type", ""),
-                "size": len(r.text),
-                "text_start": r.text[:500],
-            })
-        except Exception as e:
-            candidates.append({"url": u, "error": str(e)})
-
-    return {
-        "status": "ok",
-        "version": "debug_uzex_lot_v18",
-        "lot_id": lot_id,
-        "results": candidates,
-    }
-
-
-@app.get("/debug_lot_files")
-def debug_lot_files(url: str):
-    try:
-        r = requests.get(url, headers=get_headers(), timeout=20)
-
-        result = {
-            "status": "ok",
-            "version": "document_analyzer_v18_debug_files",
-            "lot_url": url,
-            "http_status": r.status_code,
-            "content_type": r.headers.get("content-type", ""),
-            "html_size": len(r.text),
-            "files_found": [],
-            "files_count": 0,
-            "page_title": "",
-            "html_start": r.text[:500],
-        }
-
-        if r.status_code != 200:
-            result["status"] = "http_error"
-            return result
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        title_tag = soup.find("title")
-        if title_tag:
-            result["page_title"] = clean_text(title_tag.get_text())
-
-        files = extract_file_links_from_html(url, r.text)
-        result["files_found"] = files[:50]
-        result["files_count"] = len(files)
-
         return result
 
     except Exception as e:
         return {
             "status": "error",
-            "version": "document_analyzer_v18_debug_files",
-            "lot_url": url,
-            "error": str(e)
+            "version": "document_analyzer_v10_quality_filter",
+            "lot_id": lot_id,
+            "error": str(e),
         }
+
+
+
+EXTRA_SHEET_COLUMNS = [
+    "Заказчик",
+    "Сумма",
+    "Валюта",
+    "Оплата",
+    "Срок оплаты",
+    "Срок оказания услуг",
+    "Требования",
+    "Рекомендация AI",
+]
+
+
+def ensure_sheet_columns():
+    """
+    Adds missing analytical columns to the first row of Google Sheet.
+    Does not delete or overwrite existing columns.
+    """
+    sheet = get_sheet()
+    headers = sheet.row_values(1)
+
+    # If row 1 is empty, keep basic structure.
+    if not headers:
+        headers = [
+            "Дата",
+            "Отправил",
+            "Ссылка",
+            "Источник",
+            "Статус",
+            "Приоритет",
+            "AI анализ",
+            "Комментарий",
+        ]
+        sheet.update("A1:H1", [headers])
+
+    added = []
+    current_headers = sheet.row_values(1)
+
+    for col_name in EXTRA_SHEET_COLUMNS:
+        if col_name not in current_headers:
+            current_headers.append(col_name)
+            added.append(col_name)
+
+    if added:
+        end_col = len(current_headers)
+        sheet.update(
+            f"A1:{gspread.utils.rowcol_to_a1(1, end_col).replace('1', '')}1",
+            [current_headers]
+        )
+
+    return {
+        "headers_total": len(current_headers),
+        "added": added,
+        "headers": current_headers,
+    }
+
+
+@app.get("/setup_sheet_columns")
+def setup_sheet_columns():
+    try:
+        result = ensure_sheet_columns()
+        return {
+            "status": "ok",
+            "version": "sheet_setup_v1",
+            "message": "Google Sheets columns checked and updated",
+            **result,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "sheet_setup_v1",
+            "error": str(e),
+        }
+
+
+
+@app.get("/test_uzex_sheet_analysis")
+def test_uzex_sheet_analysis(lot_id: str = "494831"):
+    try:
+        url = f"https://etender.uzex.uz/lot/{lot_id}"
+        title = f"UZEX lot {lot_id}"
+        data = analyze_uzex_for_sheet("UZEX", title, url)
+        return {
+            "status": "ok",
+            "version": "sheet_autofill_v7",
+            "lot_id": lot_id,
+            "url": url,
+            "analysis": data,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "sheet_autofill_v7",
+            "lot_id": lot_id,
+            "error": str(e),
+        }
+
+
+
+TENDER_MANAGER_COLUMNS = [
+    "Подавать",
+    "Ответственный",
+    "Дата решения",
+    "Статус участия",
+    "Комментарий директора",
+]
+
+
+def ensure_tender_manager_columns():
+    """
+    Adds tender management columns to Google Sheet.
+    Does not delete or overwrite existing columns.
+    """
+    sheet = get_sheet()
+    headers = sheet.row_values(1)
+
+    if not headers:
+        ensure_sheet_columns()
+        headers = sheet.row_values(1)
+
+    added = []
+    current_headers = sheet.row_values(1)
+
+    for col_name in TENDER_MANAGER_COLUMNS:
+        if col_name not in current_headers:
+            current_headers.append(col_name)
+            added.append(col_name)
+
+    if added:
+        end_col = len(current_headers)
+        end_a1 = gspread.utils.rowcol_to_a1(1, end_col)
+        end_col_letter = ''.join([c for c in end_a1 if c.isalpha()])
+        sheet.update(f"A1:{end_col_letter}1", [current_headers])
+
+    return {
+        "headers_total": len(current_headers),
+        "added": added,
+        "headers": current_headers,
+    }
+
+
+@app.get("/setup_tender_manager_columns")
+def setup_tender_manager_columns():
+    try:
+        # Keep analytical columns too
+        ensure_sheet_columns()
+        result = ensure_tender_manager_columns()
+
+        return {
+            "status": "ok",
+            "version": "tender_manager_v8",
+            "message": "Tender manager columns checked and updated",
+            **result,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "tender_manager_v8",
+            "error": str(e),
+        }
+
+
+@app.get("/tender_manager_status")
+def tender_manager_status():
+    try:
+        sheet = get_sheet()
+        headers = sheet.row_values(1)
+
+        missing = []
+        for col in EXTRA_SHEET_COLUMNS + TENDER_MANAGER_COLUMNS:
+            if col not in headers:
+                missing.append(col)
+
+        return {
+            "status": "ok" if not missing else "warning",
+            "version": "tender_manager_v8",
+            "headers_total": len(headers),
+            "missing_columns": missing,
+            "manager_columns": TENDER_MANAGER_COLUMNS,
+            "analytics_columns": EXTRA_SHEET_COLUMNS,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "tender_manager_v8",
+            "error": str(e),
+        }
+
+
+
+def get_header_index_map(headers):
+    """
+    Returns dict: normalized header name -> 1-based column index.
+    Keeps original order from Google Sheets.
+    """
+    result = {}
+    for idx, h in enumerate(headers, start=1):
+        if h:
+            result[h.strip()] = idx
+    return result
+
+
+def update_row_analytics(sheet, row_number, headers_map, analytics):
+    """
+    Updates only analytical columns for one row.
+    """
+    cells = []
+
+    for col_name, value in analytics.items():
+        col_idx = headers_map.get(col_name)
+        if col_idx:
+            cells.append(gspread.Cell(row_number, col_idx, value))
+
+    if cells:
+        sheet.update_cells(cells, value_input_option="USER_ENTERED")
+
+    return len(cells)
+
+
+@app.get("/backfill_existing_tenders")
+def backfill_existing_tenders(limit: int = 50):
+    """
+    Backfills existing Google Sheet rows with UZEX analytical data.
+    It fills only rows with UZEX lot links and empty 'Заказчик'.
+    """
+    try:
+        ensure_sheet_columns()
+        ensure_tender_manager_columns()
+
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "backfill_v9",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        required = [
+            "Ссылка",
+            "Заказчик",
+            "Сумма",
+            "Валюта",
+            "Оплата",
+            "Срок оплаты",
+            "Срок оказания услуг",
+            "Требования",
+            "Рекомендация AI",
+        ]
+
+        missing = [h for h in required if h not in headers_map]
+        if missing:
+            return {
+                "status": "error",
+                "version": "backfill_v9",
+                "error": "Missing columns: " + ", ".join(missing),
+                "headers": headers,
+            }
+
+        processed = 0
+        updated = 0
+        skipped = 0
+        errors = []
+
+        link_col = headers_map["Ссылка"]
+        customer_col = headers_map["Заказчик"]
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if processed >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
+
+            if not link or "etender.uzex.uz/lot/" not in link:
+                skipped += 1
+                continue
+
+            if customer_value:
+                skipped += 1
+                continue
+
+            processed += 1
+
+            try:
+                analytics = analyze_uzex_for_sheet("UZEX", "Backfill UZEX lot", link)
+                cells_updated = update_row_analytics(sheet, row_idx, headers_map, analytics)
+
+                updated += 1
+
+            except Exception as e:
+                errors.append({
+                    "row": row_idx,
+                    "link": link,
+                    "error": str(e)[:250],
+                })
+
+        return {
+            "status": "ok",
+            "version": "backfill_v9",
+            "processed": processed,
+            "updated": updated,
+            "skipped": skipped,
+            "errors_count": len(errors),
+            "errors": errors[:10],
+            "message": "Existing UZEX tenders backfill completed",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "backfill_v9",
+            "error": str(e),
+        }
+
+
+@app.get("/backfill_preview")
+def backfill_preview(limit: int = 20):
+    """
+    Preview rows that would be backfilled without changing the sheet.
+    """
+    try:
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "backfill_v9",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        if "Ссылка" not in headers_map or "Заказчик" not in headers_map:
+            return {
+                "status": "error",
+                "version": "backfill_v9",
+                "error": "Required columns not found",
+                "headers": headers,
+            }
+
+        link_col = headers_map["Ссылка"]
+        customer_col = headers_map["Заказчик"]
+
+        candidates = []
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if len(candidates) >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+            customer_value = row[customer_col - 1] if len(row) >= customer_col else ""
+
+            if link and "etender.uzex.uz/lot/" in link and not customer_value:
+                candidates.append({
+                    "row": row_idx,
+                    "link": link,
+                    "lot_id": extract_lot_id_from_url(link),
+                })
+
+        return {
+            "status": "ok",
+            "version": "backfill_v9",
+            "candidates_count": len(candidates),
+            "candidates": candidates,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "backfill_v9",
+            "error": str(e),
+        }
+
+
+
+@app.get("/test_quality_filter")
+def test_quality_filter():
+    samples = {
+        "Услуга по перевозке грузов": "Услуга по перевозке грузов",
+        "Международная мультимодальная перевозка негабаритных грузов": "Xitoy-Qozog’iston-O’zbekiston yo’nalishi bo’yicha gabarit bo’lmagan va og’ir vaznli yuklarni tashish",
+        "Инертные материалы": "Инертные материалы с доставкой",
+        "Вывоз мусора": "qattiq va maishiy chiqindilarni olib chiqib ketish",
+        "Печать газет": "gazetalarni chop etish uchun bosmaxona xizmatlari",
+        "Закупка осей": "Ось грузовых автотранспортных средств",
+    }
+
+    result = {}
+    for name, text in samples.items():
+        fake_trade = {
+            "budget_products": json.dumps([{
+                "Product_Name": text,
+                "Description": text,
+                "Category_Name": "Услуги сухопутного и трубопроводного транспорта",
+                "Delivery_Term": 10,
+            }], ensure_ascii=False),
+            "customer_name": "TEST",
+            "technical_description": text,
+        }
+        result[name] = quality_decision_from_trade(fake_trade, text)
+
+    return {
+        "status": "ok",
+        "version": "quality_filter_v10",
+        "samples": result,
+    }
+
+
+@app.get("/quality_backfill_existing_tenders")
+def quality_backfill_existing_tenders(limit: int = 100):
+    """
+    Recalculates quality columns for existing UZEX rows:
+    Логистика, Приоритет, Риск, Шанс победы, Рекомендация AI.
+    Also refreshes analytical fields.
+    """
+    try:
+        ensure_sheet_columns()
+        ensure_tender_manager_columns()
+
+        sheet = get_sheet()
+        all_values = sheet.get_all_values()
+
+        if not all_values:
+            return {
+                "status": "warning",
+                "version": "quality_filter_v10",
+                "message": "Sheet is empty",
+            }
+
+        headers = all_values[0]
+        headers_map = get_header_index_map(headers)
+
+        if "Ссылка" not in headers_map:
+            return {
+                "status": "error",
+                "version": "quality_filter_v10",
+                "error": "Missing column: Ссылка",
+            }
+
+        processed = 0
+        updated = 0
+        skipped = 0
+        errors = []
+
+        link_col = headers_map["Ссылка"]
+
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            if processed >= limit:
+                break
+
+            link = row[link_col - 1] if len(row) >= link_col else ""
+
+            if not link or "etender.uzex.uz/lot/" not in link:
+                skipped += 1
+                continue
+
+            processed += 1
+
+            try:
+                analytics = analyze_uzex_for_sheet("UZEX", "Quality backfill UZEX lot", link)
+                cells_updated = update_row_analytics(sheet, row_idx, headers_map, analytics)
+                updated += 1
+
+            except Exception as e:
+                errors.append({
+                    "row": row_idx,
+                    "link": link,
+                    "error": str(e)[:250],
+                })
+
+        return {
+            "status": "ok",
+            "version": "quality_filter_v10",
+            "processed": processed,
+            "updated": updated,
+            "skipped": skipped,
+            "errors_count": len(errors),
+            "errors": errors[:10],
+            "message": "Quality filter backfill completed",
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "version": "quality_filter_v10",
+            "error": str(e),
+        }
+
+
+@app.get("/health")
+def health():
+    result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
+
+    try:
+        tg = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=8)
+        result["telegram"] = tg.status_code == 200
+    except Exception as e:
+        result["errors"].append("Telegram error: " + str(e))
+
+    try:
+        sheet = get_sheet()
+        sheet.row_values(1)
+        result["google_sheets"] = True
+    except Exception as e:
+        result["errors"].append("Google Sheets error: " + str(e))
+
+    if result["errors"]:
+        result["status"] = "warning"
+
+    return result
+
+
+@app.get("/test_filter")
+def test_filter():
+    return {
+        "Услуга по перевозке грузов": is_real_cargo_tender("Услуга по перевозке грузов", "https://etender.uzex.uz/lot/123"),
+        "Оказание транспортных услуг": is_real_cargo_tender("Оказание транспортных услуг", "https://xarid.uzex.uz/tender/456"),
+        "Транспортно-экспедиционные услуги": is_real_cargo_tender("Транспортно-экспедиционные услуги", "https://etender.uzex.uz/lot/999"),
+        "Лабораторное оборудование": is_real_cargo_tender("Лабораторное оборудование", "https://www.tenderweek.com/tender-35921"),
+        "Закупка арматуры для АЭС": is_real_cargo_tender("Закупка арматуры для АЭС", "https://www.tenderweek.com/tender-35911"),
+        "Доставка товара автотранспортом": is_real_cargo_tender("Доставка товара автотранспортом", "https://www.tenderweek.com/tender-99999"),
+        "O’zbekneftgaz yuklarni tashuvchi avtotransporti xizmatlari": is_real_cargo_tender(
+            "O’zbekneftgaz yuklarni tashuvchi avtotransporti xizmatlari",
+            "https://etender.uzex.uz/lot/488787",
+        ),
+        "xalqaro avtomobil yo‘lining master-reja ishlab chiqish": is_real_cargo_tender(
+            "xalqaro avtomobil yo‘lining master-reja ishlab chiqish",
+            "https://etender.uzex.uz/lot/494429",
+        ),
+        "Набор инструментов": is_real_cargo_tender(
+            "Набор инструментов",
+            "https://xt-xarid.uz/tender/7477544",
+        ),
+        "Закупка смесительно-зарядных машин грузоподъёмностью 20 тонн": is_real_cargo_tender(
+            "Закупка смесительно-зарядных машин грузоподъёмностью 20 тонн",
+            "https://xt-xarid.uz/tender/7389067",
+        ),
+        "Ось грузовых автотранспортных средств": is_real_cargo_tender(
+            "Ось грузовых автотранспортных средств",
+            "https://xt-xarid.uz/tender/29.32.30.219_00012",
+        ),
+        "xalqaro yuk tashish xizmati": is_real_cargo_tender(
+            "xalqaro yuk tashish xizmati",
+            "https://xt-xarid.uz/tender/999",
+        ),
+    }
+
+
+@app.get("/debug_sources")
+def debug_sources():
+    result = {
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+        "Tenderweek": 0,
+        "UZEX": 0,
+        "XT-Xarid": 0,
+        "total": 0,
+        "errors": [],
+    }
+
+    try:
+        tw = parse_tenderweek()
+        result["Tenderweek"] = len(tw)
+    except Exception as e:
+        result["errors"].append("Tenderweek error: " + str(e))
+
+    try:
+        uzex = parse_uzex()
+        result["UZEX"] = len(uzex)
+    except Exception as e:
+        result["errors"].append("UZEX error: " + str(e))
+
+    try:
+        xt = parse_xt_xarid()
+        result["XT-Xarid"] = len(xt)
+    except Exception as e:
+        result["errors"].append("XT-Xarid error: " + str(e))
+
+    result["total"] = result["Tenderweek"] + result["UZEX"] + result["XT-Xarid"]
+    return result
+
+
+@app.get("/debug_items")
+def debug_items():
+    all_items = []
+
+    for source_name, parser in [
+        ("Tenderweek", parse_tenderweek),
+        ("UZEX", parse_uzex),
+        ("XT-Xarid", parse_xt_xarid),
+    ]:
+        try:
+            result = parser()
+            for item in result[:10]:
+                all_items.append({
+                    "site": source_name,
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "reason": item.get("reason"),
+                })
+        except Exception as e:
+            all_items.append({
+                "site": source_name,
+                "error": str(e),
+            })
+
+    return {
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+        "count": len(all_items),
+        "items": all_items[:30],
+    }
+
+
+@app.get("/debug_raw_candidates")
+def debug_raw_candidates():
+    all_items = []
+
+    for source_name, parser in [
+        ("Tenderweek", parse_tenderweek),
+        ("UZEX", parse_uzex),
+        ("XT-Xarid", parse_xt_xarid),
+    ]:
+        try:
+            result = parser(raw=True)
+            for item in result[:25]:
+                all_items.append(item)
+        except Exception as e:
+            all_items.append({
+                "site": source_name,
+                "error": str(e),
+            })
+
+    accepted = [x for x in all_items if x.get("accepted") is True]
+    rejected = [x for x in all_items if x.get("accepted") is False]
+
+    return {
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+        "total_candidates_sample": len(all_items),
+        "accepted_sample": len(accepted),
+        "rejected_sample": len(rejected),
+        "items": all_items[:75],
+    }
+
+
+@app.get("/debug_uzex")
+def debug_uzex():
+    url = "https://apietender.uzex.uz/api/common/TradeList"
+    payload = {"TypeId": 1, "From": 1, "To": 10, "System_Id": 0}
+
+    try:
+        r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
+        return {
+            "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "size": len(r.text),
+            "text_start": r.text[:1500],
+        }
+    except Exception as e:
+        return {"version": "cargo_v17_doc_analyzer_v10_quality_filter", "url": url, "error": str(e)}
+
+
+@app.get("/debug_xt")
+def debug_xt():
+    url = "https://api.xt-xarid.uz/rpc"
+    payload = {
+        "id": 1,
+        "jsonrpc": "2.0",
+        "method": "ref",
+        "params": {
+            "ref": "ref_tender_public",
+            "op": "read",
+            "limit": 10,
+            "offset": 0,
+            "filters": {},
+        },
+    }
+
+    try:
+        r = requests.post(url, headers=get_headers(json_mode=True), json=payload, timeout=12)
+        return {
+            "version": "cargo_v17_doc_analyzer_v10_quality_filter",
+            "url": url,
+            "payload": payload,
+            "status_code": r.status_code,
+            "content_type": r.headers.get("content-type", ""),
+            "size": len(r.text),
+            "text_start": r.text[:1500],
+        }
+    except Exception as e:
+        return {"version": "cargo_v17_doc_analyzer_v10_quality_filter", "url": url, "error": str(e)}
 
 
 @app.get("/scan")
@@ -1890,7 +2181,7 @@ def scan():
     all_tenders = []
     seen_urls = set()
 
-    message = "📊 AI Tender Agent Cargo V18 Strict Final Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V17 Balanced Search Scan завершён\n\n"
 
     sources = [
         ("Tenderweek", parse_tenderweek),
@@ -1952,7 +2243,7 @@ def scan():
 
     return {
         "status": "success",
-        "version": "cargo_v18_strict_final",
+        "version": "cargo_v17_doc_analyzer_v10_quality_filter",
         "sources": source_counts,
         "found_total": found_total,
         "new_total": new_total,
