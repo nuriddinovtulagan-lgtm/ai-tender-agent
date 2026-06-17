@@ -10,7 +10,7 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V24 Company Knowledge Base")
+app = FastAPI(title="AI Tender Agent Cargo V27 Tender Intelligence")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -610,6 +610,255 @@ def compare_with_company_kb(required_documents):
     }
 
 
+
+# ============================================================
+# Cargo V25 — Tender Intelligence
+# Cargo V26 — Draft Assistant
+# Cargo V27 — Market Analytics
+# ============================================================
+
+REGION_DISTANCE_KM = {
+    "ташкент": 0, "toshkent": 0,
+    "самарканд": 310, "samarqand": 310,
+    "наманган": 300, "namangan": 300,
+    "ургенч": 970, "urganch": 970,
+    "бухара": 580, "buxoro": 580,
+    "андижан": 350, "andijon": 350,
+    "ферган": 320, "farg": 320,
+    "карши": 520, "qarshi": 520,
+    "навоий": 470, "navoiy": 470,
+    "джизак": 200, "jizzax": 200,
+    "термез": 710, "termez": 710,
+    "нукус": 1100, "nukus": 1100,
+}
+
+def extract_money_number(value):
+    try:
+        return float(value or 0)
+    except Exception:
+        try:
+            return float(str(value).replace(" ", "").replace(",", "."))
+        except Exception:
+            return 0.0
+
+
+def detect_route_distance_km(route_text, full_text):
+    t = normalize_text((route_text or "") + " " + (full_text or ""))
+    distances = []
+    for city, km in REGION_DISTANCE_KM.items():
+        if city in t and km:
+            distances.append(km)
+    if not distances:
+        return None
+    return max(distances)
+
+
+def detect_vehicle_need(text):
+    t = normalize_text(text)
+    vehicles = []
+    if any(x in t for x in ["фура", "fura", "22 тонн", "22 ton", "20 тонн", "tent", "тент", "mega", "мега", "ref", "реф"]):
+        vehicles.append("Фура 20-22 тонн")
+    if any(x in t for x in ["рефриж", "реф", "ref", "температур"]):
+        vehicles.append("Рефрижератор")
+    if any(x in t for x in ["тент", "tent"]):
+        vehicles.append("Тент")
+    if any(x in t for x in ["борт", "bortli"]):
+        vehicles.append("Бортовой транспорт")
+    if any(x in t for x in ["самосвал", "samosval"]):
+        vehicles.append("Самосвал")
+    if any(x in t for x in ["низкорам", "трал", "негабарит", "тяжеловес"]):
+        vehicles.append("Спецтранспорт / трал")
+
+    qty_matches = re.findall(r"(\d{1,3})\s*(?:ед|единиц|машин|авто|фур|ta|дона)", t)
+    qty = int(qty_matches[0]) if qty_matches else 1
+    return {"vehicle_types": list(dict.fromkeys(vehicles)) or ["Тип транспорта уточнить"], "estimated_vehicle_count": qty}
+
+
+def estimate_transport_economics(trade, title, full_text, route_text, transport_text):
+    amount = extract_money_number(trade.get("start_cost"))
+    currency = trade.get("currency_codeabc") or trade.get("currency_name") or "UZS"
+
+    budget_products = extract_budget_products(trade)
+    delivery_days = ""
+    if budget_products:
+        delivery_days = budget_products[0].get("Delivery_Term", "") or ""
+
+    distance_km = detect_route_distance_km(route_text, full_text)
+    vehicle_need = detect_vehicle_need(full_text + " " + transport_text)
+    t = normalize_text(full_text)
+    logistics_type = ", ".join(classify_logistics_type(full_text))
+
+    if distance_km is None:
+        distance_km = 350 if "Внутренняя перевозка" in logistics_type else 800
+
+    base_cost_per_km = 10500
+    if any(x in t for x in ["рефриж", "реф", "ref"]):
+        base_cost_per_km = 13000
+    if any(x in t for x in ["негабарит", "тяжеловес", "трал"]):
+        base_cost_per_km = 22000
+    if any(x in t for x in ["xalqaro", "международ"]):
+        base_cost_per_km = 16000
+
+    vehicle_count = vehicle_need["estimated_vehicle_count"]
+    estimated_cost = distance_km * base_cost_per_km * 1.25 * 1.18 * vehicle_count
+
+    if amount > 0:
+        margin = amount - estimated_cost
+        margin_percent = round(margin / amount * 100, 1)
+    else:
+        margin = 0
+        margin_percent = 0
+
+    if amount <= 0:
+        profitability = "Нет суммы для оценки"
+    elif margin_percent >= 25:
+        profitability = "Высокая потенциальная маржа"
+    elif margin_percent >= 10:
+        profitability = "Средняя потенциальная маржа"
+    elif margin_percent >= 0:
+        profitability = "Низкая маржа, нужно торговаться"
+    else:
+        profitability = "Риск убытка, нужна ручная калькуляция"
+
+    return {
+        "currency": currency,
+        "amount": amount,
+        "distance_km": distance_km,
+        "vehicle_count": vehicle_count,
+        "vehicle_types": vehicle_need["vehicle_types"],
+        "estimated_cost": round(estimated_cost, 0),
+        "estimated_margin": round(margin, 0),
+        "estimated_margin_percent": margin_percent,
+        "profitability": profitability,
+        "market_note": f"Оценка предварительная: дистанция ~{distance_km} км, машин: {vehicle_count}, тип: {', '.join(vehicle_need['vehicle_types'])}.",
+        "delivery_days": delivery_days,
+    }
+
+
+def make_commercial_offer_draft(trade, title, analytics):
+    customer = trade.get("customer_name") or "Заказчик"
+    amount = trade.get("start_cost") or ""
+    currency = trade.get("currency_codeabc") or trade.get("currency_name") or "UZS"
+    route = analytics.get("route_text", "маршрут согласно ТЗ")
+    transport = analytics.get("transport_text", "транспорт согласно ТЗ")
+    logistics_type = analytics.get("logistics_type_text", "перевозка грузов")
+    return clean_text(f"""
+Коммерческое предложение
+
+Компания Trans Ocean Logistics выражает готовность оказать услуги по тендеру: {title}.
+
+Заказчик: {customer}
+Тип услуги: {logistics_type}
+Маршрут: {route}
+Транспорт: {transport}
+Ориентировочная сумма тендера: {amount} {currency}
+
+Мы готовы обеспечить транспорт, организацию перевозки, контроль сроков, координацию водителей и сопровождение выполнения услуги согласно техническому заданию.
+
+Окончательная цена и условия выполнения будут подтверждены после детального изучения технического задания, маршрута, графика погрузки/выгрузки и требований заказчика.
+
+С уважением,
+Trans Ocean Logistics
+""")
+
+
+def make_cover_letter_draft(trade, title, analytics):
+    customer = trade.get("customer_name") or "Уважаемые партнёры"
+    route = analytics.get("route_text", "согласно ТЗ")
+    transport = analytics.get("transport_text", "согласно ТЗ")
+    return clean_text(f"""
+Уважаемые представители {customer}!
+
+Компания Trans Ocean Logistics сообщает о заинтересованности в участии в тендере: {title}.
+
+Мы готовы рассмотреть оказание транспортно-логистических услуг по маршруту: {route}.
+Предварительно требуемый транспорт: {transport}.
+
+Просим принять наши документы к рассмотрению. После изучения полного технического задания мы готовы предоставить окончательное коммерческое предложение и подтвердить условия выполнения перевозки.
+
+С уважением,
+Trans Ocean Logistics
+""")
+
+
+def build_tender_intelligence(trade, title, full_text, base_analysis):
+    economics = estimate_transport_economics(
+        trade,
+        title,
+        full_text,
+        base_analysis.get("route_text", ""),
+        base_analysis.get("transport_text", ""),
+    )
+    return {
+        "economics": economics,
+        "commercial_offer_draft": make_commercial_offer_draft(trade, title, base_analysis),
+        "cover_letter_draft": make_cover_letter_draft(trade, title, base_analysis),
+        "decision_support": {
+            "recommended_next_step": "Рассчитать точную ставку и проверить ТЗ",
+            "price_comment": economics["profitability"],
+            "market_note": economics["market_note"],
+        },
+    }
+
+
+def market_analytics_from_sheet(limit=500):
+    try:
+        sheet = get_sheet()
+        rows = sheet.get_all_values()
+        if len(rows) <= 1:
+            return {"status": "warning", "message": "No data in sheet", "total_rows": 0}
+
+        headers = rows[0]
+        idx = {h.strip(): i for i, h in enumerate(headers)}
+
+        def get(row, col):
+            i = idx.get(col)
+            if i is None or i >= len(row):
+                return ""
+            return row[i]
+
+        data_rows = rows[1:][-limit:]
+        source_counts, customer_counts, route_counts, transport_counts, priority_counts = {}, {}, {}, {}, {}
+        amounts = []
+
+        for row in data_rows:
+            source = get(row, "Источник") or "Не указано"
+            customer = get(row, "Заказчик") or "Не указано"
+            route = get(row, "Маршрут") or "Не указано"
+            transport = get(row, "Тип транспорта") or "Не указано"
+            priority = get(row, "Приоритет") or get(row, "Приоритет ") or "Не указано"
+            amount = extract_money_number(get(row, "Сумма"))
+
+            source_counts[source] = source_counts.get(source, 0) + 1
+            customer_counts[customer] = customer_counts.get(customer, 0) + 1
+            route_counts[route] = route_counts.get(route, 0) + 1
+            transport_counts[transport] = transport_counts.get(transport, 0) + 1
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
+            if amount > 0:
+                amounts.append(amount)
+
+        def top_items(d, n=10):
+            return sorted([{"name": k, "count": v} for k, v in d.items()], key=lambda x: x["count"], reverse=True)[:n]
+
+        return {
+            "status": "ok",
+            "version": "market_analytics_v27",
+            "total_rows": len(data_rows),
+            "sources": top_items(source_counts),
+            "top_customers": top_items(customer_counts),
+            "top_routes": top_items(route_counts),
+            "top_transport": top_items(transport_counts),
+            "priority_distribution": top_items(priority_counts),
+            "amount_stats": {
+                "count_with_amount": len(amounts),
+                "average_amount": round(sum(amounts) / len(amounts), 0) if amounts else 0,
+                "max_amount": round(max(amounts), 0) if amounts else 0,
+            },
+        }
+    except Exception as e:
+        return {"status": "error", "version": "market_analytics_v27", "error": str(e)}
+
+
 def smart_api_analysis_from_trade(trade, title=""):
     products = extract_budget_products(trade)
     product_name = description = category_name = delivery_term = ""
@@ -696,12 +945,19 @@ def smart_api_analysis_from_trade(trade, title=""):
     readiness = compare_with_company_kb(docs["required_documents"])
     route_transport = extract_route_and_transport(title, raw_text)
     types = classify_logistics_type(raw_text)
+    base_analysis_for_intelligence = {
+        "route_text": route_transport["route_text"],
+        "transport_text": route_transport["transport_text"],
+        "logistics_type_text": ", ".join(logistics_types),
+    }
+    tender_intelligence = build_tender_intelligence(trade, title, full_text_raw, base_analysis_for_intelligence)
+
     return {
         "score": score, "priority": priority, "win_chance": win_chance, "risk": risk, "logistics": logistics,
         "logistics_types": types, "logistics_type_text": ", ".join(types), "decision": decision,
         "reasons": reasons, "risks": risks, "reason_text": "; ".join(reasons[:7]) if reasons else "нет сильных положительных факторов",
         "risk_text": "; ".join(risks[:6]) if risks else "критических рисков по API не найдено",
-        "document_note": "V24: агент формирует чек-лист и сравнивает его с базой документов Trans Ocean Logistics.",
+        "document_note": "V27: агент анализирует тендер, считает ориентировочную экономику, готовит черновики и ведёт рыночную аналитику.",
         "requirements_short": short_requirements_from_trade(trade), "api_text_used": clean_text(" | ".join([product_name, description, category_name, " ".join(q_texts[:5])]))[:1200],
         "required_documents": docs["required_documents"], "document_warnings": docs["warnings"], "responsible_tasks": docs["responsible_tasks"],
         "documents_summary": docs["summary"], "documents_count": docs["documents_count"], "company_readiness": readiness,
@@ -783,6 +1039,8 @@ def analyze_uzex_for_sheet(site, title, url):
             if products:
                 delivery_term = products[0].get("Delivery_Term", "") or ""
         readiness = smart.get("company_readiness", {})
+        tender_intelligence = smart.get("tender_intelligence", {})
+        economics = tender_intelligence.get("economics", {})
         docs_text = "; ".join([d.get("document", "") for d in smart.get("required_documents", [])[:25]])
         missing_text = "; ".join([d.get("document", "") for d in readiness.get("missing_documents", [])[:15]])
         check_text = "; ".join([d.get("document", "") for d in readiness.get("to_check_documents", [])[:15]])
@@ -799,6 +1057,11 @@ def analyze_uzex_for_sheet(site, title, url):
             "Документы нужны": docs_text, "Готовность компании": readiness.get("summary", ""), "Не хватает документов": missing_text,
             "Проверить/подготовить": check_text, "Предупреждения по документам": "; ".join(smart.get("document_warnings", [])[:10]),
             "Ответственные задачи": responsible, "Рекомендация AI": smart.get("decision", ""),
+            "Оценка рынка": economics.get("profitability", ""),
+            "Ориентир себестоимости": economics.get("estimated_cost", ""),
+            "Потенциальная маржа": f"{economics.get('estimated_margin', '')} / {economics.get('estimated_margin_percent', '')}%",
+            "Черновик КП": tender_intelligence.get("commercial_offer_draft", "")[:1000],
+            "Черновик письма": tender_intelligence.get("cover_letter_draft", "")[:1000],
         })
         return empty
     except Exception as e:
@@ -829,7 +1092,7 @@ def save_to_sheet(site, title, url):
         sheet = get_sheet()
         headers = sheet.row_values(1)
         analytics = analyze_uzex_for_sheet(site, title, url)
-        base_values = {"Дата": datetime.now().strftime("%d.%m.%Y %H:%M"), "Отправил": "AI Agent", "Ссылка": url, "Источник": site, "Статус": "Новый", "Приоритет": analytics.get("Приоритет", "Средний"), "AI анализ": "Cargo V24: Soft Logistics Filter + Company Knowledge Base", "Комментарий": title}
+        base_values = {"Дата": datetime.now().strftime("%d.%m.%Y %H:%M"), "Отправил": "AI Agent", "Ссылка": url, "Источник": site, "Статус": "Новый", "Приоритет": analytics.get("Приоритет", "Средний"), "AI анализ": "Cargo V27: Tender Intelligence + Draft Assistant + Market Analytics", "Комментарий": title}
         sheet.append_row(make_row_by_headers(headers, base_values, analytics))
         return True
     except Exception as e:
@@ -900,7 +1163,7 @@ def format_tender_message(tender):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V24 Company Knowledge Base is running"}
+    return {"status": "AI Tender Agent Cargo V27 Tender Intelligence is running"}
 
 
 @app.head("/")
@@ -946,9 +1209,9 @@ def test_filter():
 @app.get("/setup_sheet_columns")
 def setup_sheet_columns():
     try:
-        return {"status": "ok", "version": "sheet_setup_v24", "analytics": ensure_sheet_columns(), "manager": ensure_tender_manager_columns()}
+        return {"status": "ok", "version": "sheet_setup_v27", "analytics": ensure_sheet_columns(), "manager": ensure_tender_manager_columns()}
     except Exception as e:
-        return {"status": "error", "version": "sheet_setup_v24", "error": str(e)}
+        return {"status": "error", "version": "sheet_setup_v27", "error": str(e)}
 
 
 @app.get("/tender_manager_status")
@@ -956,14 +1219,14 @@ def tender_manager_status():
     try:
         headers = get_sheet().row_values(1)
         missing = [c for c in EXTRA_SHEET_COLUMNS + TENDER_MANAGER_COLUMNS if c not in headers]
-        return {"status": "ok" if not missing else "warning", "version": "tender_manager_v24", "headers_total": len(headers), "missing_columns": missing}
+        return {"status": "ok" if not missing else "warning", "version": "tender_manager_v27", "headers_total": len(headers), "missing_columns": missing}
     except Exception as e:
-        return {"status": "error", "version": "tender_manager_v24", "error": str(e)}
+        return {"status": "error", "version": "tender_manager_v27", "error": str(e)}
 
 
 @app.get("/company_kb")
 def company_kb():
-    return {"status": "ok", "version": "company_kb_v24", "company": "Trans Ocean Logistics", "documents_total": len(COMPANY_KNOWLEDGE_BASE), "documents": COMPANY_KNOWLEDGE_BASE}
+    return {"status": "ok", "version": "company_kb_v27", "company": "Trans Ocean Logistics", "documents_total": len(COMPANY_KNOWLEDGE_BASE), "documents": COMPANY_KNOWLEDGE_BASE}
 
 
 @app.get("/document_checklist")
@@ -977,9 +1240,9 @@ def document_checklist(lot_id: str):
             parts.extend([clean_text(products[0].get("Description", "")), clean_text(products[0].get("Category_Name", ""))])
         parts.extend([clean_text(trade.get("technical_description", "")), clean_text(trade.get("customer_name", ""))])
         checklist = detect_required_documents_from_text(title, " ".join(parts), trade)
-        return {"status": "ok", "version": "document_checklist_v24", "lot_id": lot_id, "title": title, **checklist}
+        return {"status": "ok", "version": "document_checklist_v27", "lot_id": lot_id, "title": title, **checklist}
     except Exception as e:
-        return {"status": "error", "version": "document_checklist_v24", "lot_id": lot_id, "error": str(e)}
+        return {"status": "error", "version": "document_checklist_v27", "lot_id": lot_id, "error": str(e)}
 
 
 @app.get("/company_readiness")
@@ -988,7 +1251,7 @@ def company_readiness(lot_id: str):
     if checklist.get("status") != "ok":
         return checklist
     readiness = compare_with_company_kb(checklist.get("required_documents", []))
-    return {"status": "ok", "version": "company_readiness_v24", "lot_id": lot_id, "title": checklist.get("title"), "document_checklist": checklist, "company_readiness": readiness}
+    return {"status": "ok", "version": "company_readiness_v27", "lot_id": lot_id, "title": checklist.get("title"), "document_checklist": checklist, "company_readiness": readiness}
 
 
 @app.get("/analyze_uzex_lot")
@@ -1001,7 +1264,7 @@ def analyze_uzex_lot(lot_id: str):
             title = clean_text((products[0].get("Product_Name", "") or "") + " | " + (products[0].get("Description", "") or ""))
         smart = smart_api_analysis_from_trade(trade, title)
         return {
-            "status": "ok", "version": "document_analyzer_v24", "lot_id": lot_id,
+            "status": "ok", "version": "document_analyzer_v27", "lot_id": lot_id,
             "lot": {
                 "id": trade.get("id"), "display_no": trade.get("display_no"), "customer_name": trade.get("customer_name"),
                 "start_date": trade.get("start_date"), "end_date": trade.get("end_date"), "start_cost": trade.get("start_cost"),
@@ -1019,7 +1282,7 @@ def analyze_uzex_lot(lot_id: str):
             },
         }
     except Exception as e:
-        return {"status": "error", "version": "document_analyzer_v24", "lot_id": lot_id, "error": str(e)}
+        return {"status": "error", "version": "document_analyzer_v27", "lot_id": lot_id, "error": str(e)}
 
 
 @app.get("/debug_sources")
@@ -1064,6 +1327,80 @@ def debug_raw_candidates():
     return {"version": VERSION, "total_candidates_sample": len(all_items), "accepted_sample": len([x for x in all_items if x.get("accepted") is True]), "rejected_sample": len([x for x in all_items if x.get("accepted") is False]), "items": all_items[:75]}
 
 
+
+
+@app.get("/tender_intelligence")
+def tender_intelligence(lot_id: str):
+    try:
+        trade = get_uzex_trade(lot_id)
+        budget_products = extract_budget_products(trade)
+        title = ""
+        description = ""
+        category_name = ""
+
+        if budget_products:
+            first = budget_products[0]
+            title = clean_text(first.get("Product_Name", ""))
+            description = clean_text(first.get("Description", ""))
+            category_name = clean_text(first.get("Category_Name", ""))
+
+        smart = smart_api_analysis_from_trade(trade, " | ".join([title, description]))
+
+        return {
+            "status": "ok",
+            "version": "tender_intelligence_v27",
+            "lot_id": lot_id,
+            "title": title,
+            "description": description,
+            "category_name": category_name,
+            "ai_score": smart.get("score"),
+            "priority": smart.get("priority"),
+            "logistics": smart.get("logistics"),
+            "logistics_type": smart.get("logistics_type_text"),
+            "route": smart.get("route_text"),
+            "transport": smart.get("transport_text"),
+            "decision": smart.get("decision"),
+            "tender_intelligence": smart.get("tender_intelligence"),
+        }
+    except Exception as e:
+        return {"status": "error", "version": "tender_intelligence_v27", "lot_id": lot_id, "error": str(e)}
+
+
+@app.get("/drafts")
+def drafts(lot_id: str):
+    try:
+        trade = get_uzex_trade(lot_id)
+        budget_products = extract_budget_products(trade)
+        title = ""
+        description = ""
+
+        if budget_products:
+            first = budget_products[0]
+            title = clean_text(first.get("Product_Name", ""))
+            description = clean_text(first.get("Description", ""))
+
+        smart = smart_api_analysis_from_trade(trade, " | ".join([title, description]))
+        ti = smart.get("tender_intelligence", {})
+
+        return {
+            "status": "ok",
+            "version": "draft_assistant_v26_v27",
+            "lot_id": lot_id,
+            "title": title,
+            "commercial_offer_draft": ti.get("commercial_offer_draft", ""),
+            "cover_letter_draft": ti.get("cover_letter_draft", ""),
+            "documents": smart.get("required_documents", []),
+            "responsible_tasks": smart.get("responsible_tasks", []),
+        }
+    except Exception as e:
+        return {"status": "error", "version": "draft_assistant_v26_v27", "lot_id": lot_id, "error": str(e)}
+
+
+@app.get("/market_analytics")
+def market_analytics(limit: int = 500):
+    return market_analytics_from_sheet(limit=limit)
+
+
 @app.get("/backfill_existing_tenders")
 def backfill_existing_tenders(limit: int = 50):
     try:
@@ -1071,10 +1408,10 @@ def backfill_existing_tenders(limit: int = 50):
         sheet = get_sheet()
         values = sheet.get_all_values()
         if not values:
-            return {"status": "warning", "version": "backfill_v24", "message": "Sheet is empty"}
+            return {"status": "warning", "version": "backfill_v27", "message": "Sheet is empty"}
         headers, headers_map = values[0], get_header_index_map(values[0])
         if "Ссылка" not in headers_map:
-            return {"status": "error", "version": "backfill_v24", "error": "Required column not found: Ссылка", "headers": headers}
+            return {"status": "error", "version": "backfill_v27", "error": "Required column not found: Ссылка", "headers": headers}
         link_col = headers_map["Ссылка"]
         processed = updated = skipped = 0
         errors = []
@@ -1092,9 +1429,9 @@ def backfill_existing_tenders(limit: int = 50):
                 updated += 1
             except Exception as e:
                 errors.append({"row": row_idx, "link": link, "error": str(e)[:250]})
-        return {"status": "ok", "version": "backfill_v24", "processed": processed, "updated": updated, "skipped": skipped, "errors_count": len(errors), "errors": errors[:10]}
+        return {"status": "ok", "version": "backfill_v27", "processed": processed, "updated": updated, "skipped": skipped, "errors_count": len(errors), "errors": errors[:10]}
     except Exception as e:
-        return {"status": "error", "version": "backfill_v24", "error": str(e)}
+        return {"status": "error", "version": "backfill_v27", "error": str(e)}
 
 
 @app.get("/quality_backfill_existing_tenders")
@@ -1104,11 +1441,11 @@ def quality_backfill_existing_tenders(limit: int = 100):
 
 @app.get("/scan")
 def scan():
-    print("SCAN STARTED V24")
+    print("SCAN STARTED V27")
     found_total = new_total = duplicate_total = 0
     all_tenders, seen_urls = [], set()
     source_counts = {}
-    message = "📊 AI Tender Agent Cargo V24 Company Knowledge Base Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V27 Tender Intelligence Scan завершён\n\n"
     for source, parser in [("Tenderweek", parse_tenderweek), ("UZEX", parse_uzex), ("XT-Xarid", parse_xt_xarid)]:
         try:
             result = parser()
@@ -1133,7 +1470,7 @@ def scan():
             send_telegram(format_tender_message(tender))
         else:
             duplicate_total += 1
-    message += f"Всего найдено: {found_total}\nНовых сохранено: {new_total}\nДубликатов пропущено: {duplicate_total}\n\nV24: мягкий фильтр перевозок + база документов Trans Ocean Logistics."
+    message += f"Всего найдено: {found_total}\nНовых сохранено: {new_total}\nДубликатов пропущено: {duplicate_total}\n\nV27: Tender Intelligence + подготовка черновиков + аналитика рынка."
     send_telegram(message)
     return {"status": "success", "version": VERSION, "sources": source_counts, "found_total": found_total, "new_total": new_total, "duplicates": duplicate_total}
 
