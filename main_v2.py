@@ -10,13 +10,13 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V25 Stable Tender Intelligence")
+app = FastAPI(title="AI Tender Agent Cargo V26 Smart Filter")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-VERSION = "cargo_v25_stable_tender_intelligence"
+VERSION = "cargo_v26_smart_filter"
 
 # ============================================================
 # Cargo V23/V24 logic
@@ -62,6 +62,59 @@ HARD_BAD_WORDS = [
     "программ", "система принятия решений", "it", "software", "crm", "erp", "сервер", "телеком",
     "интернет", "сайт", "портал",
 ]
+
+# Cargo V26 Smart Filter:
+# These words indicate repair, maintenance, spare parts, tires, fuel, oils,
+# vehicle purchase or service works. They are NOT cargo transportation tenders.
+REPAIR_MAINTENANCE_STOP_WORDS = [
+    "texnik xizmat", "texnik xizmat ko'rsatish", "texnik xizmat ko‘rsatish",
+    "texnik xizmat korsatish", "texnik xizmat ko’rsatish",
+    "техник хизмат", "техник хизмат кўрсатиш", "техник хизмат курсатиш",
+    "техническое обслуживание", "техобслуживание", "технического обслуживания",
+    "техническое сервисное обслуживание", "сервисное обслуживание",
+    "обслуживание автомобилей", "обслуживание автотранспорта",
+    "обслуживание грузовых автомобилей", "обслуживание транспорта",
+    "ремонт", "ремонт автомобилей", "ремонт автотранспорта", "ремонт транспорта",
+    "ремонт грузовых автомобилей", "ремонт спецтехники", "ремонт машин",
+    "автосервис", "сервис автомобилей", "сервис транспорта",
+    "диагностика", "диагностика автомобилей", "диагностика транспорта",
+    "шиномонтаж", "мойка автомобилей", "мойка транспорта", "кузовной ремонт",
+    "замена масла", "технический осмотр", "техосмотр",
+]
+
+SPARE_PARTS_STOP_WORDS = [
+    "запчасти", "запасные части", "автозапчасти", "ehtiyot qismlar",
+    "эҳтиёт қисмлар", "extiyot qismlar", "ehtiyot qism",
+    "шины", "автошины", "покрышки", "резина", "шиналар", "shina", "shinalar",
+    "аккумулятор", "аккумуляторы", "akkumulyator",
+    "масло", "моторное масло", "смазочные материалы", "смазка", "гсм",
+    "yoqilg'i", "yoqilgi", "топливо", "дизельное топливо", "бензин",
+    "фильтр масляный", "фильтр воздушный", "колодки", "тормозные колодки",
+    "двигатель", "мотор", "коробка передач", "ходовая часть",
+]
+
+VEHICLE_PURCHASE_STOP_WORDS = [
+    "закупка автомобиля", "закупка автомобилей", "поставка автомобиля",
+    "поставка автомобилей", "покупка автомобиля", "покупка автомобилей",
+    "приобретение автомобиля", "приобретение автомобилей",
+    "грузовой автомобиль", "грузовые автомобили", "легковой автомобиль",
+    "автобус", "микроавтобус", "самосвал харид", "avtomobil xarid",
+    "avtotransport vositasi xarid", "transport vositasi xarid",
+    "сотиб олиш", "харид қилиш", "харид килиш",
+]
+
+# These terms preserve real transportation/rental lots even if some neutral vehicle words are present.
+TRANSPORT_SERVICE_ALLOW_WORDS = [
+    "перевозка грузов", "перевозка груза", "перевозке грузов", "перевозки грузов",
+    "доставка грузов", "доставка груза", "доставка товара",
+    "транспортно-экспедиционные услуги", "экспедиторские услуги",
+    "логистические услуги", "международная перевозка", "международные перевозки",
+    "мультимодальная перевозка", "контейнерная перевозка",
+    "yuk tashish", "yuklarni tashish", "yuk tashish xizmati",
+    "xalqaro yuk tashish", "logistika xizmatlari", "ekspeditorlik xizmatlari",
+    "transport xizmati", "transport xizmatlari",
+]
+
 
 LOGISTICS_TYPES = {
     "Международная перевозка": ["xalqaro", "международ", "international", "cmr", "customs", "bojxona", "тамож"],
@@ -133,8 +186,14 @@ def get_headers(json_mode=False):
 
 def has_transport_intent(text):
     t = normalize_text(text)
+
+    # V26: repair/maintenance/spare parts are not transportation tenders.
+    if has_repair_or_maintenance_context(t):
+        return False
+
     if any(phrase in t for phrase in SERVICE_PHRASES):
         return True
+
     cargo = any(w in t for w in ["yuk", "груз", "cargo", "freight"])
     action = any(w in t for w in ["tashish", "перевоз", "transport", "достав", "xizmat", "услуг"])
     return cargo and action
@@ -142,6 +201,35 @@ def has_transport_intent(text):
 
 def looks_like_bad_url(url):
     return any(part in (url or "").lower() for part in BAD_URL_PARTS)
+
+
+def has_real_transport_service_phrase(text):
+    t = normalize_text(text)
+    return any(w in t for w in TRANSPORT_SERVICE_ALLOW_WORDS)
+
+
+def has_repair_or_maintenance_context(text):
+    t = normalize_text(text)
+    stop_groups = REPAIR_MAINTENANCE_STOP_WORDS + SPARE_PARTS_STOP_WORDS + VEHICLE_PURCHASE_STOP_WORDS
+    return any(w in t for w in stop_groups)
+
+
+def smart_filter_rejection_reason(text):
+    t = normalize_text(text)
+
+    for w in REPAIR_MAINTENANCE_STOP_WORDS:
+        if w in t:
+            return "rejected_repair_maintenance:" + w
+
+    for w in SPARE_PARTS_STOP_WORDS:
+        if w in t:
+            return "rejected_spare_parts_fuel_tires:" + w
+
+    for w in VEHICLE_PURCHASE_STOP_WORDS:
+        if w in t:
+            return "rejected_vehicle_purchase:" + w
+
+    return ""
 
 
 def filter_reason(title, url):
@@ -155,6 +243,11 @@ def filter_reason(title, url):
     for bad in BAD_TITLE_WORDS:
         if bad in t:
             return "bad_title_word:" + bad
+
+    smart_reject = smart_filter_rejection_reason(t)
+    if smart_reject:
+        return smart_reject
+
     if has_transport_intent(t):
         for phrase in SERVICE_PHRASES:
             if phrase in t:
@@ -876,7 +969,63 @@ def smart_api_analysis_from_trade(trade, title=""):
                     q_texts.append(str(q.get(key)))
     raw_text = " ".join([title or "", str(trade.get("customer_name") or ""), product_name, description, category_name, str(trade.get("technical_description") or ""), " ".join(q_texts)])
     text = normalize_text(raw_text)
+    smart_reject = smart_filter_rejection_reason(text)
     transport_intent = has_transport_intent(text)
+
+    if smart_reject:
+        docs = detect_required_documents_from_text(title, raw_text, trade)
+        readiness = compare_with_company_kb(docs["required_documents"])
+        route_transport = extract_route_and_transport(title, raw_text)
+        types = ["Непрофильный лот: ремонт/обслуживание/запчасти"]
+        tender_intelligence = {
+            "economics": {
+                "currency": trade.get("currency_codeabc") or trade.get("currency_name") or "UZS",
+                "amount": 0,
+                "distance_km": 0,
+                "vehicle_count": 0,
+                "vehicle_types": [],
+                "estimated_cost": 0,
+                "estimated_margin": 0,
+                "estimated_margin_percent": 0,
+                "profitability": "Не считать: непрофильный лот",
+                "market_note": "V26 Smart Filter отклонил лот: ремонт/обслуживание/запчасти/покупка транспорта.",
+                "delivery_days": "",
+            },
+            "commercial_offer_draft": "",
+            "cover_letter_draft": "",
+            "decision_support": {
+                "recommended_next_step": "Не участвовать",
+                "price_comment": "Непрофильный лот",
+                "market_note": smart_reject,
+            },
+        }
+        return {
+            "score": 0,
+            "priority": "Непрофильный",
+            "win_chance": "Низкий",
+            "risk": "Высокий",
+            "logistics": "Нет",
+            "logistics_types": types,
+            "logistics_type_text": ", ".join(types),
+            "decision": "Не участвовать: это ремонт/техническое обслуживание/запчасти/покупка транспорта, а не перевозка груза.",
+            "reasons": [],
+            "risks": [smart_reject],
+            "reason_text": "Лот отклонён V26 Smart Filter",
+            "risk_text": smart_reject,
+            "document_note": "V26 Smart Filter: непрофильный лот для Trans Ocean Logistics.",
+            "requirements_short": short_requirements_from_trade(trade),
+            "api_text_used": clean_text(" | ".join([product_name, description, category_name, " ".join(q_texts[:5])]))[:1200],
+            "required_documents": docs["required_documents"],
+            "document_warnings": docs["warnings"],
+            "responsible_tasks": docs["responsible_tasks"],
+            "documents_summary": docs["summary"],
+            "documents_count": docs["documents_count"],
+            "company_readiness": readiness,
+            "tender_intelligence": tender_intelligence,
+            "route_text": route_transport["route_text"],
+            "transport_text": route_transport["transport_text"],
+        }
+
     amount = 0.0
     try:
         amount = float(trade.get("start_cost") or 0)
@@ -957,7 +1106,7 @@ def smart_api_analysis_from_trade(trade, title=""):
         "logistics_types": types, "logistics_type_text": ", ".join(types), "decision": decision,
         "reasons": reasons, "risks": risks, "reason_text": "; ".join(reasons[:7]) if reasons else "нет сильных положительных факторов",
         "risk_text": "; ".join(risks[:6]) if risks else "критических рисков по API не найдено",
-        "document_note": "V27: агент анализирует тендер, считает ориентировочную экономику, готовит черновики и ведёт рыночную аналитику.",
+        "document_note": "V26: агент отсекает ремонт/обслуживание/запчасти и анализирует только реальные перевозки.",
         "requirements_short": short_requirements_from_trade(trade), "api_text_used": clean_text(" | ".join([product_name, description, category_name, " ".join(q_texts[:5])]))[:1200],
         "required_documents": docs["required_documents"], "document_warnings": docs["warnings"], "responsible_tasks": docs["responsible_tasks"],
         "documents_summary": docs["summary"], "documents_count": docs["documents_count"], "company_readiness": readiness,
@@ -1093,7 +1242,7 @@ def save_to_sheet(site, title, url):
         sheet = get_sheet()
         headers = sheet.row_values(1)
         analytics = analyze_uzex_for_sheet(site, title, url)
-        base_values = {"Дата": datetime.now().strftime("%d.%m.%Y %H:%M"), "Отправил": "AI Agent", "Ссылка": url, "Источник": site, "Статус": "Новый", "Приоритет": analytics.get("Приоритет", "Средний"), "AI анализ": "Cargo V27: Tender Intelligence + Draft Assistant + Market Analytics", "Комментарий": title}
+        base_values = {"Дата": datetime.now().strftime("%d.%m.%Y %H:%M"), "Отправил": "AI Agent", "Ссылка": url, "Источник": site, "Статус": "Новый", "Приоритет": analytics.get("Приоритет", "Средний"), "AI анализ": "Cargo V26: Smart Filter + Tender Intelligence", "Комментарий": title}
         sheet.append_row(make_row_by_headers(headers, base_values, analytics))
         return True
     except Exception as e:
@@ -1164,7 +1313,7 @@ def format_tender_message(tender):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V25 Stable Tender Intelligence is running"}
+    return {"status": "AI Tender Agent Cargo V26 Smart Filter is running"}
 
 
 @app.head("/")
@@ -1203,6 +1352,10 @@ def test_filter():
         "Аренда транспортных средств для перевозки грузов": "https://etender.uzex.uz/lot/999",
         "Лабораторное оборудование": "https://www.tenderweek.com/tender-35921",
         "Автоматизация кредитного конвейера": "https://xt-xarid.uz/tender/111",
+        "Texnik xizmat ko'rsatish yuk mashinalariga": "https://etender.uzex.uz/lot/497043",
+        "Техническое обслуживание грузовых автомобилей": "https://etender.uzex.uz/lot/497043",
+        "Ремонт грузовых автомобилей": "https://etender.uzex.uz/lot/497044",
+        "Закупка запчастей для грузовых автомобилей": "https://etender.uzex.uz/lot/497045",
     }
     return {k: {"accepted": is_real_cargo_tender(k, v), "reason": filter_reason(k, v)} for k, v in samples.items()}
 
