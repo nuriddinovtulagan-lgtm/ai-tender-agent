@@ -10,13 +10,13 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V27 Tender Intelligence")
+app = FastAPI(title="AI Tender Agent Cargo V25 Stable Tender Intelligence")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-VERSION = "cargo_v24_company_knowledge_base"
+VERSION = "cargo_v25_stable_tender_intelligence"
 
 # ============================================================
 # Cargo V23/V24 logic
@@ -948,9 +948,9 @@ def smart_api_analysis_from_trade(trade, title=""):
     base_analysis_for_intelligence = {
         "route_text": route_transport["route_text"],
         "transport_text": route_transport["transport_text"],
-        "logistics_type_text": ", ".join(logistics_types),
+        "logistics_type_text": ", ".join(types),
     }
-    tender_intelligence = build_tender_intelligence(trade, title, full_text_raw, base_analysis_for_intelligence)
+    tender_intelligence = build_tender_intelligence(trade, title, raw_text, base_analysis_for_intelligence)
 
     return {
         "score": score, "priority": priority, "win_chance": win_chance, "risk": risk, "logistics": logistics,
@@ -961,6 +961,7 @@ def smart_api_analysis_from_trade(trade, title=""):
         "requirements_short": short_requirements_from_trade(trade), "api_text_used": clean_text(" | ".join([product_name, description, category_name, " ".join(q_texts[:5])]))[:1200],
         "required_documents": docs["required_documents"], "document_warnings": docs["warnings"], "responsible_tasks": docs["responsible_tasks"],
         "documents_summary": docs["summary"], "documents_count": docs["documents_count"], "company_readiness": readiness,
+        "tender_intelligence": tender_intelligence,
         "route_text": route_transport["route_text"], "transport_text": route_transport["transport_text"],
     }
 
@@ -1163,7 +1164,7 @@ def format_tender_message(tender):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V27 Tender Intelligence is running"}
+    return {"status": "AI Tender Agent Cargo V25 Stable Tender Intelligence is running"}
 
 
 @app.head("/")
