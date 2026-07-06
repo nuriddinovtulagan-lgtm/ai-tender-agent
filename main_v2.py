@@ -2,6 +2,8 @@ import os
 import json
 import re
 import requests
+import threading
+import traceback
 from datetime import datetime
 from urllib.parse import urljoin
 
@@ -10,13 +12,33 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V28 Performance")
+app = FastAPI(title="AI Tender Agent Cargo V28.1 Background")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-VERSION = "cargo_v28_performance"
+VERSION = "cargo_v28_1_background"
+
+# ============================================================
+# Cargo V28.1 Background Scan Control
+# Protects /scan from cron timeouts and parallel starts.
+# ============================================================
+
+SCAN_LOCK = threading.Lock()
+SCAN_STATE = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_trigger": None,
+    "last_result": None,
+    "last_error": None,
+}
+
+
+def now_text():
+    return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
 
 # ============================================================
 # Cargo V23/V24 logic
@@ -1265,7 +1287,7 @@ def required_sheet_headers():
 
 def prepare_sheet_for_scan_fast():
     """
-    Cargo V28 Performance:
+    Cargo V28.1 Background:
     - открывает Google Sheets один раз;
     - читает всю таблицу одним запросом;
     - обновляет заголовки одним запросом только если нужно;
@@ -1385,7 +1407,7 @@ def format_tender_message(tender):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V28 Performance is running"}
+    return {"status": "AI Tender Agent Cargo V28.1 Background is running"}
 
 
 @app.head("/")
@@ -1665,9 +1687,8 @@ def quality_backfill_existing_tenders(limit: int = 100):
     return backfill_existing_tenders(limit=limit)
 
 
-@app.get("/scan")
-def scan():
-    print("SCAN STARTED V28 PERFORMANCE")
+def run_scan_job():
+    print("SCAN STARTED V28.1 BACKGROUND")
     found_total = 0
     new_total = 0
     duplicate_total = 0
@@ -1676,7 +1697,7 @@ def scan():
     scan_seen_urls = set()
     source_counts = {}
 
-    message = "📊 AI Tender Agent Cargo V28 Performance Scan завершён\n\n"
+    message = "📊 AI Tender Agent Cargo V28.1 Background Scan завершён\n\n"
 
     # 1) Сначала собираем лоты из источников. Google Sheets здесь не трогаем.
     for source, parser in [("Tenderweek", parse_tenderweek), ("UZEX", parse_uzex), ("XT-Xarid", parse_xt_xarid)]:
@@ -1743,7 +1764,7 @@ def scan():
                 "Источник": site,
                 "Статус": "Новый",
                 "Приоритет": analytics.get("Приоритет", "Средний"),
-                "AI анализ": "Cargo V28 Performance: Smart Filter + Tender Intelligence",
+                "AI анализ": "Cargo V28.1 Background: Smart Filter + Tender Intelligence",
                 "Комментарий": title,
             }
             rows_to_append.append(make_row_by_headers(headers, base_values, analytics))
@@ -1799,6 +1820,93 @@ def scan():
         "duplicates": duplicate_total,
         "errors": errors[:10],
     }
+
+
+def _run_scan_with_lock(trigger="http"):
+    """Run scan safely: only one scan can work at a time."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return {
+            "status": "already_running",
+            "version": VERSION,
+            "started_at": SCAN_STATE.get("started_at"),
+            "message": "Scan is already running. Second request skipped.",
+        }
+
+    SCAN_STATE.update({
+        "running": True,
+        "started_at": now_text(),
+        "finished_at": None,
+        "last_trigger": trigger,
+        "last_error": None,
+    })
+
+    try:
+        result = run_scan_job()
+        SCAN_STATE.update({
+            "running": False,
+            "finished_at": now_text(),
+            "last_result": result,
+            "last_error": None,
+        })
+        return result
+    except Exception as e:
+        err = str(e)[:800]
+        print("SCAN BACKGROUND ERROR:", err)
+        traceback.print_exc()
+        SCAN_STATE.update({
+            "running": False,
+            "finished_at": now_text(),
+            "last_error": err,
+            "last_result": {"status": "error", "version": VERSION, "error": err},
+        })
+        try:
+            send_telegram("⚠️ AI Tender Agent Cargo V28.1: scan error\n" + err[:1200])
+        except Exception:
+            pass
+        return {"status": "error", "version": VERSION, "error": err}
+    finally:
+        try:
+            SCAN_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+def _background_scan(trigger="cron"):
+    _run_scan_with_lock(trigger=trigger)
+
+
+@app.get("/scan")
+def scan():
+    """Fast endpoint for cron-job.org. Returns immediately and runs heavy scan in background."""
+    if SCAN_LOCK.locked():
+        return {
+            "status": "already_running",
+            "version": VERSION,
+            "running": True,
+            "started_at": SCAN_STATE.get("started_at"),
+            "message": "Previous scan is still running. Cron request accepted but skipped.",
+        }
+
+    worker = threading.Thread(target=_background_scan, kwargs={"trigger": "cron_http"}, daemon=True)
+    worker.start()
+    return {
+        "status": "accepted",
+        "version": VERSION,
+        "running": True,
+        "message": "Scan started in background. Check Telegram, Google Sheets, or /scan_status.",
+        "started_at": now_text(),
+    }
+
+
+@app.get("/scan_sync")
+def scan_sync():
+    """Manual full scan. Use only for testing; cron should use /scan."""
+    return _run_scan_with_lock(trigger="manual_sync")
+
+
+@app.get("/scan_status")
+def scan_status():
+    return {"status": "ok", "version": VERSION, **SCAN_STATE}
 
 
 @app.head("/scan")
