@@ -10,13 +10,13 @@ from fastapi import FastAPI
 import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent Cargo V26 Smart Filter")
+app = FastAPI(title="AI Tender Agent Cargo V28 Performance")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 
-VERSION = "cargo_v26_smart_filter"
+VERSION = "cargo_v28_performance"
 
 # ============================================================
 # Cargo V23/V24 logic
@@ -1249,6 +1249,78 @@ def save_to_sheet(site, title, url):
         print("GOOGLE SHEETS ERROR:", e)
         return False
 
+def required_sheet_headers():
+    """V28: полный список колонок. Нужен для одной подготовки таблицы за scan."""
+    base_headers = ["Дата", "Отправил", "Ссылка", "Источник", "Статус", "Приоритет", "AI анализ", "Комментарий"]
+    intelligence_headers = [
+        "Логистика", "Риск", "Шанс победы", "Оценка рынка",
+        "Ориентир себестоимости", "Потенциальная маржа", "Черновик КП", "Черновик письма",
+    ]
+    result = []
+    for col in base_headers + EXTRA_SHEET_COLUMNS + intelligence_headers + TENDER_MANAGER_COLUMNS:
+        if col not in result:
+            result.append(col)
+    return result
+
+
+def prepare_sheet_for_scan_fast():
+    """
+    Cargo V28 Performance:
+    - открывает Google Sheets один раз;
+    - читает всю таблицу одним запросом;
+    - обновляет заголовки одним запросом только если нужно;
+    - готовит set существующих ссылок без col_values() для каждого тендера.
+    """
+    sheet = get_sheet()
+    values = sheet.get_all_values()
+    required = required_sheet_headers()
+
+    if not values or not values[0]:
+        headers = required[:]
+        end_a1 = gspread.utils.rowcol_to_a1(1, len(headers))
+        end_col = ''.join([c for c in end_a1 if c.isalpha()])
+        sheet.update(f"A1:{end_col}1", [headers])
+        values = [headers]
+    else:
+        headers = values[0]
+        changed = False
+        for col in required:
+            if col not in headers:
+                headers.append(col)
+                changed = True
+        if changed:
+            end_a1 = gspread.utils.rowcol_to_a1(1, len(headers))
+            end_col = ''.join([c for c in end_a1 if c.isalpha()])
+            sheet.update(f"A1:{end_col}1", [headers])
+
+    headers_map = get_header_index_map(headers)
+    existing_urls = set()
+
+    # Основная колонка в нашей таблице — "Ссылка". Дополнительно проверяем 3 и 4 колонки,
+    # потому что в старых версиях ссылка могла попасть в соседний столбец.
+    link_indexes = []
+    if "Ссылка" in headers_map:
+        link_indexes.append(headers_map["Ссылка"] - 1)
+    link_indexes.extend([2, 3])
+    link_indexes = sorted(set([i for i in link_indexes if i >= 0]))
+
+    for row in values[1:]:
+        for idx in link_indexes:
+            if idx < len(row):
+                value = clean_text(row[idx])
+                if value.startswith("http"):
+                    existing_urls.add(value)
+
+    return sheet, headers, existing_urls
+
+
+def append_new_tenders_fast(sheet, headers, rows):
+    """V28: сохраняет все новые тендеры одним batch-запросом."""
+    if not rows:
+        return 0
+    sheet.append_rows(rows, value_input_option="USER_ENTERED")
+    return len(rows)
+
 
 def format_document_checklist_for_telegram(smart):
     text = ""
@@ -1313,7 +1385,7 @@ def format_tender_message(tender):
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent Cargo V26 Smart Filter is running"}
+    return {"status": "AI Tender Agent Cargo V28 Performance is running"}
 
 
 @app.head("/")
@@ -1595,11 +1667,18 @@ def quality_backfill_existing_tenders(limit: int = 100):
 
 @app.get("/scan")
 def scan():
-    print("SCAN STARTED V27")
-    found_total = new_total = duplicate_total = 0
-    all_tenders, seen_urls = [], set()
+    print("SCAN STARTED V28 PERFORMANCE")
+    found_total = 0
+    new_total = 0
+    duplicate_total = 0
+    errors = []
+    all_tenders = []
+    scan_seen_urls = set()
     source_counts = {}
-    message = "📊 AI Tender Agent Cargo V27 Tender Intelligence Scan завершён\n\n"
+
+    message = "📊 AI Tender Agent Cargo V28 Performance Scan завершён\n\n"
+
+    # 1) Сначала собираем лоты из источников. Google Sheets здесь не трогаем.
     for source, parser in [("Tenderweek", parse_tenderweek), ("UZEX", parse_uzex), ("XT-Xarid", parse_xt_xarid)]:
         try:
             result = parser()
@@ -1608,25 +1687,118 @@ def scan():
             message += f"{source}: найдено транспортных лотов {len(result)}\n"
         except Exception as e:
             source_counts[source] = 0
+            err = f"{source} error: {str(e)[:250]}"
+            errors.append(err)
             message += f"{source}: ERROR\n"
-            print(source, "ERROR:", e)
-    message += "\n"
+            print(err)
+
+    # 2) Один раз читаем Google Sheets и получаем все существующие ссылки.
+    try:
+        sheet, headers, existing_urls = prepare_sheet_for_scan_fast()
+    except Exception as e:
+        err = "Google Sheets prepare error: " + str(e)[:350]
+        print(err)
+        errors.append(err)
+        send_telegram("⚠️ AI Tender Agent Cargo V28: ошибка Google Sheets\n" + err)
+        return {
+            "status": "error",
+            "version": VERSION,
+            "sources": source_counts,
+            "found_total": 0,
+            "new_total": 0,
+            "duplicates": 0,
+            "errors": errors,
+        }
+
+    rows_to_append = []
+    new_tenders_for_telegram = []
+
+    # 3) Готовим новые строки в памяти. Никаких чтений Google Sheets внутри цикла.
     for tender in all_tenders:
-        url, title = tender.get("url"), tender.get("title")
-        if not url or url in seen_urls:
+        url = clean_text(tender.get("url"))
+        title = clean_text(tender.get("title"))
+        site = tender.get("site", "")
+
+        if not url or not title:
             continue
-        seen_urls.add(url)
+        if url in scan_seen_urls:
+            continue
+        scan_seen_urls.add(url)
+
         if not is_real_cargo_tender(title, url):
             continue
+
         found_total += 1
-        if save_to_sheet(tender["site"], title, url):
-            new_total += 1
-            send_telegram(format_tender_message(tender))
-        else:
+
+        if url in existing_urls:
             duplicate_total += 1
-    message += f"Всего найдено: {found_total}\nНовых сохранено: {new_total}\nДубликатов пропущено: {duplicate_total}\n\nV27: Tender Intelligence + подготовка черновиков + аналитика рынка."
+            continue
+
+        try:
+            analytics = analyze_uzex_for_sheet(site, title, url)
+            base_values = {
+                "Дата": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                "Отправил": "AI Agent",
+                "Ссылка": url,
+                "Источник": site,
+                "Статус": "Новый",
+                "Приоритет": analytics.get("Приоритет", "Средний"),
+                "AI анализ": "Cargo V28 Performance: Smart Filter + Tender Intelligence",
+                "Комментарий": title,
+            }
+            rows_to_append.append(make_row_by_headers(headers, base_values, analytics))
+            new_tenders_for_telegram.append(tender)
+            existing_urls.add(url)
+        except Exception as e:
+            err = f"Analyze/save prepare error for {url}: {str(e)[:250]}"
+            print(err)
+            errors.append(err)
+
+    # 4) Одним запросом сохраняем все новые строки.
+    try:
+        new_total = append_new_tenders_fast(sheet, headers, rows_to_append)
+    except Exception as e:
+        err = "Google Sheets append_rows error: " + str(e)[:350]
+        print(err)
+        errors.append(err)
+        send_telegram("⚠️ AI Tender Agent Cargo V28: ошибка сохранения в Google Sheets\n" + err)
+        return {
+            "status": "error",
+            "version": VERSION,
+            "sources": source_counts,
+            "found_total": found_total,
+            "new_total": 0,
+            "duplicates": duplicate_total,
+            "errors": errors,
+        }
+
+    # 5) Telegram отправляем после успешного сохранения.
+    for tender in new_tenders_for_telegram:
+        try:
+            send_telegram(format_tender_message(tender))
+        except Exception as e:
+            err = "Telegram message error: " + str(e)[:250]
+            print(err)
+            errors.append(err)
+
+    message += "\n"
+    message += f"Всего найдено: {found_total}\n"
+    message += f"Новых сохранено: {new_total}\n"
+    message += f"Дубликатов пропущено: {duplicate_total}\n"
+    if errors:
+        message += f"Ошибок: {len(errors)}\n"
+    message += "\nV28: Performance fix — Google Sheets читается 1 раз, новые тендеры сохраняются пачкой."
     send_telegram(message)
-    return {"status": "success", "version": VERSION, "sources": source_counts, "found_total": found_total, "new_total": new_total, "duplicates": duplicate_total}
+
+    return {
+        "status": "success" if not errors else "warning",
+        "version": VERSION,
+        "sources": source_counts,
+        "found_total": found_total,
+        "new_total": new_total,
+        "duplicates": duplicate_total,
+        "errors": errors[:10],
+    }
 
 
 @app.head("/scan")
