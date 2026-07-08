@@ -1,17 +1,42 @@
 import os
+import re
 import json
-import requests
+import threading
+import traceback
 from datetime import datetime
+
+import requests
+import gspread
 from bs4 import BeautifulSoup
 from fastapi import FastAPI
-import gspread
 from google.oauth2.service_account import Credentials
 
-app = FastAPI(title="AI Tender Agent")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+APP_VERSION = "cargo_v28_3_stable_background"
+
+app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
+
+# Поддерживает оба варианта названий переменных, чтобы Render не сломался
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
+GOOGLE_CREDS_JSON = (
+    os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    or os.getenv("GOOGLE_CREDS_JSON")
+)
+
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Тендеры")
+
+SCAN_STATE = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "last_trigger": None,
+    "last_result": None,
+    "last_error": None,
+}
+SCAN_LOCK = threading.Lock()
+
 
 KEYWORDS = [
     "услуга по перевозке грузов", "услуги по перевозке грузов",
@@ -50,18 +75,79 @@ SEARCH_WORDS = [
     "yuk tashish", "transport xizmati", "logistika", "yetkazib berish",
 ]
 
+REJECT_WORDS = [
+    "ремонт", "техническое обслуживание", "техобслуживание", "запчаст",
+    "поставка автомобиля", "покупка автомобиля", "шина", "масло моторное",
+    "страхование", "мебель", "канцеляр", "бетон", "строительные материалы",
+]
 
-def is_logistics_tender(title):
-    title = (title or "").lower()
-    return any(word.lower() in title for word in KEYWORDS)
+
+def now_str():
+    return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = str(text).lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def is_logistics_tender(text: str) -> bool:
+    t = normalize_text(text)
+    for bad in REJECT_WORDS:
+        if bad in t:
+            return False
+    return any(word.lower() in t for word in KEYWORDS)
+
+
+def accept_reason(text: str) -> str:
+    t = normalize_text(text)
+    for bad in REJECT_WORDS:
+        if bad in t:
+            return f"rejected:{bad}"
+    for good in KEYWORDS:
+        if good.lower() in t:
+            return f"accepted:{good}"
+    return "no_transport_phrase"
+
+
+def tender_key(item: dict) -> str:
+    title = normalize_text(item.get("title", ""))
+    url = normalize_text(item.get("url", ""))
+    return f"{title}|{url}"
+
+
+def send_telegram(text: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram variables missing")
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT_ID,
+                "text": text[:3900],
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        print("TELEGRAM:", response.status_code, response.text[:200])
+        return response.status_code == 200
+    except Exception as e:
+        print("TELEGRAM ERROR:", e)
+        return False
 
 
 def get_sheet():
-    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not raw_json:
-        raise Exception("GOOGLE_SERVICE_ACCOUNT_JSON is empty")
+    if not GOOGLE_CREDS_JSON:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON / GOOGLE_CREDS_JSON is empty")
+    if not GOOGLE_SHEET_ID:
+        raise RuntimeError("GOOGLE_SHEET_ID is empty")
 
-    info = json.loads(raw_json)
+    info = json.loads(GOOGLE_CREDS_JSON)
     creds = Credentials.from_service_account_info(
         info,
         scopes=[
@@ -70,35 +156,80 @@ def get_sheet():
         ],
     )
     client = gspread.authorize(creds)
-    return client.open_by_key(GOOGLE_SHEET_ID).worksheet("Тендеры")
-
-
-def send_telegram(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram variables missing")
-        return False
+    book = client.open_by_key(GOOGLE_SHEET_ID)
 
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text[:3900]},
-            timeout=20,
-        )
-        return response.status_code == 200
+        return book.worksheet(WORKSHEET_NAME)
+    except Exception:
+        return book.sheet1
+
+
+def get_existing_keys(sheet):
+    try:
+        rows = sheet.get_all_values()
     except Exception as e:
-        print("TELEGRAM ERROR:", e)
-        return False
+        print("GET SHEET VALUES ERROR:", e)
+        return set()
+
+    keys = set()
+    if not rows:
+        return keys
+
+    header = [normalize_text(h) for h in rows[0]]
+    title_idx = None
+    url_idx = None
+
+    for i, h in enumerate(header):
+        if h in ["название", "title", "тендер", "наименование"]:
+            title_idx = i
+        if h in ["ссылка", "url", "link"]:
+            url_idx = i
+
+    # Старый формат: Дата, Источник, Название, Ссылка, Статус
+    if title_idx is None and len(header) >= 3:
+        title_idx = 2
+    if url_idx is None and len(header) >= 4:
+        url_idx = 3
+
+    for row in rows[1:]:
+        title = row[title_idx] if title_idx is not None and len(row) > title_idx else ""
+        url = row[url_idx] if url_idx is not None and len(row) > url_idx else ""
+        if title or url:
+            keys.add(f"{normalize_text(title)}|{normalize_text(url)}")
+
+    return keys
 
 
-def collect_links(base_url, pages_to_scan, site_name, min_title_len=6, require_tender_in_url=False):
+def save_new_tenders(sheet, items):
+    rows = []
+    for item in items:
+        rows.append([
+            datetime.now().strftime("%d.%m.%Y %H:%M"),
+            item.get("site", ""),
+            item.get("title", ""),
+            item.get("url", ""),
+            "Новый",
+            item.get("reason", ""),
+        ])
+
+    if rows:
+        sheet.append_rows(rows, value_input_option="USER_ENTERED")
+    return len(rows)
+
+
+def collect_links(base_url, pages_to_scan, site_name, min_title_len=6, require_tender_in_url=False, max_pages=30):
     headers = {"User-Agent": "Mozilla/5.0 (compatible; AI-Tender-Agent/1.0)"}
     tenders = []
     seen_urls = set()
 
-    for url in pages_to_scan:
+    for url in pages_to_scan[:max_pages]:
         try:
-            r = requests.get(url, headers=headers, timeout=30)
-            r.raise_for_status()
+            print(f"{site_name} GET:", url)
+            r = requests.get(url, headers=headers, timeout=20)
+            if r.status_code != 200:
+                print(f"{site_name} STATUS:", r.status_code)
+                continue
+
             soup = BeautifulSoup(r.text, "html.parser")
 
             for link in soup.find_all("a"):
@@ -122,7 +253,12 @@ def collect_links(base_url, pages_to_scan, site_name, min_title_len=6, require_t
                     continue
 
                 seen_urls.add(full_url)
-                tenders.append({"site": site_name, "title": title, "url": full_url})
+                tenders.append({
+                    "site": site_name,
+                    "title": title,
+                    "url": full_url,
+                    "reason": accept_reason(combined_text),
+                })
 
         except Exception as e:
             print(f"{site_name.upper()} ERROR:", e)
@@ -134,31 +270,136 @@ def parse_tenderweek():
     base_url = "https://www.tenderweek.com/"
     pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS:
+    # Ограничиваем источник, чтобы не зависал
+    for word in SEARCH_WORDS[:8]:
         pages_to_scan.extend([
             f"{base_url}?search={word}",
             f"{base_url}?q={word}",
-            f"{base_url}?keyword={word}",
         ])
 
-    return collect_links(base_url, pages_to_scan, "Tenderweek", min_title_len=10, require_tender_in_url=True)
+    return collect_links(
+        base_url,
+        pages_to_scan,
+        "Tenderweek",
+        min_title_len=10,
+        require_tender_in_url=True,
+        max_pages=20,
+    )
 
 
 def parse_xt_xarid():
     base_url = "https://xt-xarid.uz/"
     pages_to_scan = [base_url]
 
-    for word in SEARCH_WORDS:
+    for word in SEARCH_WORDS[:8]:
         pages_to_scan.extend([
             f"{base_url}?search={word}",
             f"{base_url}?q={word}",
-            f"{base_url}?keyword={word}",
         ])
 
-    return collect_links(base_url, pages_to_scan, "XT-Xarid", min_title_len=6)
+    return collect_links(
+        base_url,
+        pages_to_scan,
+        "XT-Xarid",
+        min_title_len=6,
+        max_pages=15,
+    )
 
 
-def parse_uzex():
+def parse_uzex_api():
+    items = []
+    api_urls = [
+        "https://etender.uzex.uz/api/common/Trade/GetTrades",
+        "https://etender.uzex.uz/api/common/Trade/GetTradeList",
+    ]
+
+    keywords = [
+        "yuk tashish",
+        "transport",
+        "logistika",
+        "перевозка грузов",
+        "транспортные услуги",
+        "экспедиторские услуги",
+    ]
+
+    for keyword in keywords:
+        for api_url in api_urls:
+            try:
+                print("UZEX API:", api_url, keyword)
+                r = requests.get(
+                    api_url,
+                    params={"search": keyword, "page": 1, "size": 20},
+                    timeout=25,
+                )
+                if r.status_code != 200:
+                    print("UZEX API STATUS:", r.status_code)
+                    continue
+
+                data = r.json()
+                possible_lists = []
+
+                if isinstance(data, list):
+                    possible_lists = data
+                elif isinstance(data, dict):
+                    for key in ["data", "items", "result", "trades", "content"]:
+                        value = data.get(key)
+                        if isinstance(value, list):
+                            possible_lists = value
+                            break
+                        if isinstance(value, dict):
+                            for subkey in ["data", "items", "result", "content"]:
+                                if isinstance(value.get(subkey), list):
+                                    possible_lists = value.get(subkey)
+                                    break
+
+                for lot in possible_lists:
+                    if not isinstance(lot, dict):
+                        continue
+
+                    title = (
+                        lot.get("name")
+                        or lot.get("title")
+                        or lot.get("lotName")
+                        or lot.get("productName")
+                        or lot.get("description")
+                        or ""
+                    )
+                    lot_id = (
+                        lot.get("id")
+                        or lot.get("lotId")
+                        or lot.get("tradeId")
+                        or lot.get("number")
+                        or lot.get("displayNo")
+                        or ""
+                    )
+
+                    if not title:
+                        continue
+
+                    combined = f"{title} {lot_id}"
+                    if not is_logistics_tender(combined):
+                        continue
+
+                    lot_url = f"https://etender.uzex.uz/lot/{lot_id}" if lot_id else "https://etender.uzex.uz"
+
+                    items.append({
+                        "site": "UZEX",
+                        "title": title,
+                        "url": lot_url,
+                        "reason": accept_reason(combined),
+                    })
+
+            except Exception as e:
+                print("UZEX API ERROR:", api_url, keyword, e)
+
+    unique = {}
+    for item in items:
+        unique[tender_key(item)] = item
+
+    return list(unique.values())
+
+
+def parse_uzex_html():
     base_urls = [
         "https://etender.uzex.uz/lots/1/0",
         "https://etender.uzex.uz/",
@@ -168,50 +409,183 @@ def parse_uzex():
 
     for base_url in base_urls:
         pages_to_scan.append(base_url)
-        for word in SEARCH_WORDS:
+        for word in SEARCH_WORDS[:8]:
             pages_to_scan.extend([
                 f"{base_url}?search={word}",
                 f"{base_url}?q={word}",
-                f"{base_url}?keyword={word}",
             ])
 
-    return collect_links("https://etender.uzex.uz/", pages_to_scan, "UZEX", min_title_len=6)
+    return collect_links(
+        "https://etender.uzex.uz/",
+        pages_to_scan,
+        "UZEX",
+        min_title_len=6,
+        max_pages=25,
+    )
 
 
-def tender_exists(url):
+def parse_uzex():
+    items = []
+    try:
+        items.extend(parse_uzex_api())
+    except Exception as e:
+        print("UZEX API MAIN ERROR:", e)
+
+    try:
+        items.extend(parse_uzex_html())
+    except Exception as e:
+        print("UZEX HTML MAIN ERROR:", e)
+
+    unique = {}
+    for item in items:
+        unique[tender_key(item)] = item
+
+    return list(unique.values())
+
+
+def run_scan(trigger="manual"):
+    result = {
+        "status": "success",
+        "version": APP_VERSION,
+        "sources": {"Tenderweek": 0, "UZEX": 0, "XT-Xarid": 0},
+        "found_total": 0,
+        "new_total": 0,
+        "duplicates": 0,
+        "errors": [],
+    }
+
+    all_items = []
+
+    sources = [
+        ("Tenderweek", parse_tenderweek),
+        ("UZEX", parse_uzex),
+        ("XT-Xarid", parse_xt_xarid),
+    ]
+
+    print("SCAN STARTED", APP_VERSION, trigger)
+
+    for source_name, parser in sources:
+        try:
+            items = parser()
+            result["sources"][source_name] = len(items)
+            all_items.extend(items)
+            print(f"{source_name} DONE:", len(items))
+        except Exception as e:
+            error_text = f"{source_name}: {str(e)}"
+            result["errors"].append(error_text)
+            print(error_text)
+            print(traceback.format_exc())
+
+    unique = {}
+    for item in all_items:
+        if is_logistics_tender(f"{item.get('title', '')} {item.get('url', '')}"):
+            unique[tender_key(item)] = item
+
+    all_items = list(unique.values())
+    result["found_total"] = len(all_items)
+
     try:
         sheet = get_sheet()
-        urls = sheet.col_values(4)
-        return url in urls
+        existing_keys = get_existing_keys(sheet)
+
+        new_items = []
+        duplicates = 0
+
+        for item in all_items:
+            if tender_key(item) in existing_keys:
+                duplicates += 1
+            else:
+                new_items.append(item)
+
+        result["new_total"] = save_new_tenders(sheet, new_items)
+        result["duplicates"] = duplicates
+
+        for item in new_items[:10]:
+            send_telegram(
+                f"🆕 Новый логистический тендер\n\n"
+                f"📌 {item.get('site')}\n\n"
+                f"{item.get('title')}\n\n"
+                f"{item.get('url')}"
+            )
+
     except Exception as e:
-        print("CHECK ERROR:", e)
-        return False
-
-
-def save_to_sheet(site, title, url):
-    try:
-        if tender_exists(url):
-            return False
-
-        sheet = get_sheet()
-        row = [
-            datetime.now().strftime("%d.%m.%Y %H:%M"),
-            site,
-            title,
-            url,
-            "Новый",
-        ]
-        sheet.append_row(row)
-        return True
-
-    except Exception as e:
+        result["status"] = "warning"
+        result["errors"].append(f"Google Sheets: {str(e)}")
         print("GOOGLE SHEETS ERROR:", e)
-        return False
+        print(traceback.format_exc())
+
+    message = (
+        f"📊 AI Tender Agent {APP_VERSION}\n"
+        f"Scan завершён\n\n"
+        f"Tenderweek: {result['sources']['Tenderweek']}\n"
+        f"UZEX: {result['sources']['UZEX']}\n"
+        f"XT-Xarid: {result['sources']['XT-Xarid']}\n\n"
+        f"Всего найдено: {result['found_total']}\n"
+        f"Новых сохранено: {result['new_total']}\n"
+        f"Дубликатов пропущено: {result['duplicates']}\n"
+        f"Ошибок: {len(result['errors'])}"
+    )
+
+    if result["errors"]:
+        message += "\n\n" + "\n".join(result["errors"][:5])
+
+    send_telegram(message)
+
+    print("SCAN FINISHED", result)
+    return result
+
+
+def background_scan_worker(trigger):
+    try:
+        result = run_scan(trigger)
+        with SCAN_LOCK:
+            SCAN_STATE["last_result"] = result
+            SCAN_STATE["last_error"] = None
+    except Exception as e:
+        err = traceback.format_exc()
+        print("BACKGROUND WORKER ERROR:", err)
+        with SCAN_LOCK:
+            SCAN_STATE["last_error"] = str(e)
+        send_telegram(f"❌ AI Tender Agent error\n\nVersion: {APP_VERSION}\nError: {str(e)}")
+    finally:
+        with SCAN_LOCK:
+            SCAN_STATE["running"] = False
+            SCAN_STATE["finished_at"] = now_str()
+        print("BACKGROUND WORKER FINALLY: running=False")
+
+
+def start_background_scan(trigger="manual_http"):
+    with SCAN_LOCK:
+        if SCAN_STATE["running"]:
+            return {
+                "status": "already_running",
+                "version": APP_VERSION,
+                "running": True,
+                "started_at": SCAN_STATE["started_at"],
+                "message": "Scan already running",
+            }
+
+        SCAN_STATE["running"] = True
+        SCAN_STATE["started_at"] = now_str()
+        SCAN_STATE["finished_at"] = None
+        SCAN_STATE["last_trigger"] = trigger
+        SCAN_STATE["last_error"] = None
+
+    thread = threading.Thread(target=background_scan_worker, args=(trigger,), daemon=True)
+    thread.start()
+
+    return {
+        "status": "accepted",
+        "version": APP_VERSION,
+        "running": True,
+        "message": "Scan started in background. Check Telegram, Google Sheets, or /scan_status.",
+        "started_at": SCAN_STATE["started_at"],
+    }
 
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent is running"}
+    return {"status": "AI Tender Agent is running", "version": APP_VERSION}
 
 
 @app.head("/")
@@ -219,13 +593,19 @@ def head_home():
     return {}
 
 
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+
+
 @app.get("/health")
 def health():
     result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
 
     try:
-        tg_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-        tg_response = requests.get(tg_url, timeout=10)
+        if not BOT_TOKEN or not CHAT_ID:
+            raise RuntimeError("BOT_TOKEN/CHAT_ID missing")
+        tg_response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
         result["telegram"] = tg_response.status_code == 200
     except Exception as e:
         result["errors"].append("Telegram error: " + str(e))
@@ -243,6 +623,30 @@ def health():
     return result
 
 
+@app.get("/scan")
+def scan():
+    return start_background_scan("cron_http")
+
+
+@app.get("/scan_start")
+def scan_start():
+    return start_background_scan("manual_http")
+
+
+@app.get("/scan_status")
+def scan_status():
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "running": SCAN_STATE["running"],
+        "started_at": SCAN_STATE["started_at"],
+        "finished_at": SCAN_STATE["finished_at"],
+        "last_trigger": SCAN_STATE["last_trigger"],
+        "last_result": SCAN_STATE["last_result"],
+        "last_error": SCAN_STATE["last_error"],
+    }
+
+
 @app.get("/test_filter")
 def test_filter():
     tests = [
@@ -258,72 +662,20 @@ def test_filter():
     return {t: is_logistics_tender(t) for t in tests}
 
 
-@app.get("/scan")
-def scan():
-    found_total = 0
-    new_total = 0
-    duplicate_total = 0
-    all_tenders = []
-    seen_urls = set()
-
-    message = "📊 AI Auto Scan завершён\n\n"
-
-    sources = [
-        ("Tenderweek", parse_tenderweek),
-        ("XT-Xarid", parse_xt_xarid),
-        ("UZEX", parse_uzex),
-    ]
-
-    for source_name, parser in sources:
+@app.get("/debug_items")
+def debug_items():
+    items = []
+    for parser in [parse_tenderweek, parse_uzex, parse_xt_xarid]:
         try:
-            result = parser()
-            all_tenders.extend(result)
-            message += f"{source_name} найдено: {len(result)}\n"
+            items.extend(parser())
         except Exception as e:
-            message += f"{source_name} ERROR\n"
-            print(f"{source_name} ERROR:", e)
+            items.append({"site": "ERROR", "title": str(e), "url": ""})
 
-    message += "\n"
+    unique = {}
+    for item in items:
+        unique[tender_key(item)] = item
 
-    for tender in all_tenders:
-        url = tender.get("url")
-        title = tender.get("title")
-
-        if not url or url in seen_urls:
-            continue
-        seen_urls.add(url)
-
-        if not is_logistics_tender(f"{title} {url}"):
-            continue
-
-        found_total += 1
-        saved = save_to_sheet(tender["site"], title, url)
-
-        if saved:
-            new_total += 1
-            text = (
-                f"🆕 Новый логистический тендер\n\n"
-                f"📌 {tender['site']}\n\n"
-                f"{title}\n\n"
-                f"{url}"
-            )
-            send_telegram(text)
-        else:
-            duplicate_total += 1
-
-    message += (
-        f"Всего найдено по логистике: {found_total}\n"
-        f"Новых сохранено: {new_total}\n"
-        f"Дубликатов пропущено: {duplicate_total}"
-    )
-    send_telegram(message)
-
-    return {
-        "status": "success",
-        "found_total": found_total,
-        "new_total": new_total,
-        "duplicates": duplicate_total,
-    }
+    return {"version": APP_VERSION, "count": len(unique), "items": list(unique.values())}
 
 
 if __name__ == "__main__":
