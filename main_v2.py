@@ -22,7 +22,7 @@ from google.oauth2.service_account import Credentials
 # uvicorn main_v2:app --host 0.0.0.0 --port $PORT
 # ============================================================
 
-APP_VERSION = "cargo_v30_real_api_engine"
+APP_VERSION = "cargo_v30_1_strict_category_filter"
 app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
 
 # ---------------- Environment variables ----------------
@@ -197,6 +197,98 @@ REJECT_PHRASES = [
     "страхование автомобиля",
     "страхование транспортного средства",
 ]
+
+
+# Strict phrases that independently prove a freight/logistics service.
+# Generic words such as "delivery / yetkazib berish" are intentionally excluded.
+STRONG_LOGISTICS_PHRASES = [
+    "услуга по перевозке грузов",
+    "услуги по перевозке грузов",
+    "перевозка грузов",
+    "перевозке грузов",
+    "перевозку грузов",
+    "грузоперевоз",
+    "грузовые перевозки",
+    "международные перевозки",
+    "автомобильные перевозки",
+    "железнодорожные перевозки",
+    "контейнерные перевозки",
+    "транспортно-экспедиционные услуги",
+    "экспедиторские услуги",
+    "фрахт",
+    "yuk tashish",
+    "yuklarni tashish",
+    "yuk tashish xizmati",
+    "yuk tashish xizmatlari",
+    "юк ташиш",
+    "юкларни ташиш",
+    "cargo transportation",
+    "freight transportation",
+    "freight forwarding",
+]
+
+# Rental/special-machinery lots are relevant only when transport equipment is explicit.
+RENTAL_TRANSPORT_PHRASES = [
+    "аренда грузового транспорта",
+    "аренда автотранспорта",
+    "аренда спецтехники",
+    "услуги спецтехники",
+    "услуги специальной техники",
+    "тягач",
+    "трал",
+    "самосвал",
+    "фура",
+    "полуприцеп",
+    "контейнеровоз",
+    "рефрижератор",
+    "экскаватор",
+    "автокран",
+    "бульдозер",
+    "погрузчик",
+    "махсус техника",
+    "махсус машина",
+    "maxsus texnika",
+    "maxsus transport",
+    "ijaraga texnika",
+    "ижарага техника",
+]
+
+# These phrases often describe supply/installation, not a transport service.
+WEAK_SUPPLY_PHRASES = [
+    "поставка",
+    "поставку",
+    "поставки",
+    "закупка",
+    "приобретение",
+    "снабжение",
+    "изготовление и доставка",
+    "изготовление, доставка",
+    "yetkazib berish",
+    "етказиб бериш",
+    "доставка питания",
+    "доставка продуктов",
+    "доставка оборудования",
+    "доставка товара",
+    "доставка товаров",
+]
+
+# Categories that should never be admitted only because their description contains
+# a generic delivery word.
+NON_TRANSPORT_CATEGORY_IDS = {
+    106825, 107919, 108163, 108595, 108631, 108768, 108871, 109090,
+    109122, 111223, 111452, 111494, 112246, 112963, 113218, 113434,
+    113765, 113821, 114027, 115349, 117359, 117611, 118144, 118845,
+    119460, 120182, 120735, 122010, 122283, 122645, 122780, 123457,
+    123593, 123678, 123700, 123719, 123911, 123949, 124049, 124278,
+    124491, 124577, 124970, 125732, 125770, 125805, 125883, 126040,
+    126145, 126181, 126287, 126334, 126378, 126466, 126565, 126647,
+    126700, 126746, 126784, 126916, 126986, 127029, 127110, 127218,
+    127260, 127309, 127332, 127367, 127412, 127546, 127636, 127710,
+    127741, 127774, 127803, 127832, 127859, 127901, 127953, 128131,
+    128183, 128189, 128200,
+}
+
+RENTAL_CATEGORY_ID = 127120
 
 
 # ============================================================
@@ -545,16 +637,49 @@ def fetch_all_trade_list():
 
 
 def title_is_candidate(row: dict) -> bool:
+    """
+    Fast pre-filter for TradeList.
+
+    TradeList usually returns category_name=null, so we keep:
+    1) explicit freight/logistics titles;
+    2) explicit transport-service titles;
+    3) rental/special-machinery titles.
+
+    Generic "delivery / yetkazib berish" is not enough.
+    """
     text = " ".join([
         str(row.get("name") or ""),
         str(row.get("category_name") or ""),
-        str(row.get("seller_name") or ""),
     ])
+    normalized = normalize_text(text)
 
-    if reject_reason(text):
+    if reject_reason(normalized):
         return False
 
-    return contains_keyword(text, TITLE_KEYWORDS)
+    if contains_keyword(normalized, STRONG_LOGISTICS_PHRASES):
+        return True
+
+    transport_service_phrases = [
+        "транспортные услуги",
+        "транспортная услуга",
+        "transport xizmati",
+        "transport xizmatlari",
+        "транспорт хизмати",
+        "транспорт хизматлари",
+        "логистические услуги",
+        "logistika xizmatlari",
+        "складские услуги",
+        "warehouse services",
+        "таможенное оформление",
+        "погрузочно-разгрузочные работы",
+    ]
+    if contains_keyword(normalized, transport_service_phrases):
+        return True
+
+    if contains_keyword(normalized, RENTAL_TRANSPORT_PHRASES):
+        return True
+
+    return False
 
 
 def fetch_trade_detail(lot_id):
@@ -754,16 +879,55 @@ def analyze_trade(list_row: dict, detail: dict):
     if rejected:
         return None, f"rejected:{rejected}"
 
-    accepted_by_category = bool(
-        category_ids.intersection(TRANSPORT_CATEGORY_IDS)
+    normalized_full_text = normalize_text(full_text)
+
+    matched_transport_categories = category_ids.intersection(
+        TRANSPORT_CATEGORY_IDS
     )
-    accepted_by_text = contains_keyword(
-        full_text,
-        DETAIL_KEYWORDS,
+    accepted_by_transport_category = bool(matched_transport_categories)
+
+    accepted_by_strong_text = contains_keyword(
+        normalized_full_text,
+        STRONG_LOGISTICS_PHRASES,
     )
 
-    if not accepted_by_category and not accepted_by_text:
-        return None, "not_logistics"
+    accepted_rental_transport = (
+        RENTAL_CATEGORY_ID in category_ids
+        and contains_keyword(
+            normalized_full_text,
+            RENTAL_TRANSPORT_PHRASES,
+        )
+    )
+
+    # Strict rule:
+    # - official transport categories are accepted;
+    # - rental category is accepted only for explicit transport/special equipment;
+    # - other categories require an explicit freight phrase.
+    # Generic supply/delivery wording is never sufficient.
+    if accepted_by_transport_category:
+        pass
+    elif accepted_rental_transport:
+        pass
+    elif accepted_by_strong_text:
+        pass
+    else:
+        return None, "not_strict_logistics"
+
+    # Extra guard against ordinary supply/food/installation lots.
+    if (
+        category_ids.intersection(NON_TRANSPORT_CATEGORY_IDS)
+        and not accepted_by_strong_text
+        and not accepted_rental_transport
+    ):
+        return None, "non_transport_category"
+
+    if (
+        contains_keyword(normalized_full_text, WEAK_SUPPLY_PHRASES)
+        and not accepted_by_transport_category
+        and not accepted_by_strong_text
+        and not accepted_rental_transport
+    ):
+        return None, "generic_supply_or_delivery"
 
     lot_id = detail.get("id") or list_row.get("id")
     display_no = (
@@ -789,16 +953,17 @@ def analyze_trade(list_row: dict, detail: dict):
 
     reason_parts = []
 
-    if accepted_by_category:
-        matched = sorted(
-            category_ids.intersection(TRANSPORT_CATEGORY_IDS)
-        )
+    if accepted_by_transport_category:
+        matched = sorted(matched_transport_categories)
         reason_parts.append(
-            "category:" + ",".join(map(str, matched))
+            "transport_category:" + ",".join(map(str, matched))
         )
 
-    if accepted_by_text:
-        reason_parts.append("logistics_text")
+    if accepted_rental_transport:
+        reason_parts.append("rental_transport")
+
+    if accepted_by_strong_text:
+        reason_parts.append("strong_logistics_text")
 
     item = {
         "site": "UZEX",
@@ -1267,6 +1432,7 @@ def home():
         "status": "AI Tender Agent is running",
         "version": APP_VERSION,
         "engine": "UZEX Real API",
+        "filter": "Strict Category Filter",
     }
 
 
@@ -1477,25 +1643,32 @@ def debug_categories():
 def test_filter():
     tests = [
         "Услуга по перевозке грузов",
-        "Оказание транспортных услуг",
-        "Транспортно-экспедиционные услуги",
         "Yuk tashish xizmatlari",
+        "Транспортно-экспедиционные услуги",
         "Cargo transportation services",
-        "Аренда спецтехники с водителем",
+        "Аренда тягача 40 тонн",
+        "Экскаватор maxsus texnika xizmatlari",
+        "Поставка сетевых коммутаторов с доставкой",
+        "Иссиқ овқат етказиб бериш хизмати",
+        "Изготовление, доставка и монтаж перил",
         "Ремонт грузового автомобиля",
-        "Поставка автомобильных шин",
-        "Закупка бетона",
+        "Техническое обслуживание автотранспорта",
     ]
 
     output = {}
 
-    for text in tests:
-        output[text] = {
-            "title_candidate": contains_keyword(
-                text,
-                TITLE_KEYWORDS,
-            ) and not bool(reject_reason(text)),
-            "reject_reason": reject_reason(text),
+    for sample in tests:
+        output[sample] = {
+            "title_candidate": title_is_candidate({"name": sample}),
+            "strong_logistics": contains_keyword(
+                sample,
+                STRONG_LOGISTICS_PHRASES,
+            ),
+            "rental_transport": contains_keyword(
+                sample,
+                RENTAL_TRANSPORT_PHRASES,
+            ),
+            "reject_reason": reject_reason(sample),
         }
 
     return output
