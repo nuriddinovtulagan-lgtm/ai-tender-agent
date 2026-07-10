@@ -23,7 +23,7 @@ from google.oauth2.service_account import Credentials
 # uvicorn main_v2:app --host 0.0.0.0 --port $PORT
 # ============================================================
 
-APP_VERSION = "cargo_v30_2_enterprise"
+APP_VERSION = "cargo_v30_2_1_enterprise_sheet_fix"
 app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
 
 # ---------------- Environment variables ----------------
@@ -516,6 +516,15 @@ def ensure_enterprise_headers(sheet):
     if missing:
         start_col = len(current) + 1
         end_col = start_col + len(missing) - 1
+
+        # Google Sheets may have fewer physical columns than required.
+        # Expand the worksheet before writing new enterprise headers.
+        if sheet.col_count < end_col:
+            sheet.resize(
+                rows=max(sheet.row_count, 1000),
+                cols=end_col,
+            )
+
         sheet.update(
             f"{gspread.utils.rowcol_to_a1(1, start_col)}:"
             f"{gspread.utils.rowcol_to_a1(1, end_col)}",
@@ -528,6 +537,11 @@ def ensure_enterprise_headers(sheet):
 
 
 def get_existing_keys(sheet):
+    """
+    Reads both the old 6-column sheet and the new enterprise layout.
+    It scans known columns and every cell for UZEX IDs, display numbers,
+    and /lot/<id> URLs.
+    """
     rows = sheet.get_all_values()
     if not rows:
         return set()
@@ -551,7 +565,6 @@ def get_existing_keys(sheet):
         ["Ссылка", "url", "link"],
     )
 
-    # Backward compatibility with old 6-column layout.
     if title_idx is None and len(header) >= 3:
         title_idx = 2
     if url_idx is None and len(header) >= 4:
@@ -581,39 +594,51 @@ def get_existing_keys(sheet):
             else ""
         )
 
-        if lot_id:
-            keys.add(f"uzex:{normalize_text(lot_id)}")
+        if lot_id.isdigit():
+            keys.add(f"uzex:{lot_id}")
 
         if display_no:
             keys.add(
                 f"uzex_display:{normalize_text(display_no)}"
             )
 
-        url_match = re.search(r"/lot/(\d+)", url)
-        if url_match:
-            keys.add(f"uzex:{url_match.group(1)}")
-
         if title or url:
             keys.add(
                 f"{normalize_text(title)}|{normalize_text(url)}"
             )
 
-        # Read legacy details text where V30 stored "UZEX ID: ...; №: ..."
+        # Strong fallback: scan every cell, including legacy comments.
         for cell in row:
+            cell_text = str(cell or "")
+
             for match in re.findall(
-                r"(?:UZEX\s*ID|ID)\s*:\s*(\d+)",
-                str(cell),
+                r"(?:https?://etender\.uzex\.uz)?/lot/(\d+)",
+                cell_text,
                 flags=re.IGNORECASE,
             ):
                 keys.add(f"uzex:{match}")
 
             for match in re.findall(
-                r"(?:№|display_no)\s*:\s*([0-9]+)",
-                str(cell),
+                r"(?:UZEX\s*ID|Lot\s*ID|ID)\s*:\s*(\d+)",
+                cell_text,
+                flags=re.IGNORECASE,
+            ):
+                keys.add(f"uzex:{match}")
+
+            for match in re.findall(
+                r"(?:№|display_no|Номер\s*тендера)\s*:\s*([0-9]{8,})",
+                cell_text,
                 flags=re.IGNORECASE,
             ):
                 keys.add(
                     f"uzex_display:{normalize_text(match)}"
+                )
+
+            # UZEX display numbers are long numeric identifiers.
+            stripped = re.sub(r"\D", "", cell_text)
+            if 12 <= len(stripped) <= 20:
+                keys.add(
+                    f"uzex_display:{normalize_text(stripped)}"
                 )
 
     return keys
@@ -1956,6 +1981,42 @@ def debug_categories():
             else None
         ),
     }
+
+
+@app.get("/repair_sheet")
+def repair_sheet():
+    try:
+        sheet = get_sheet()
+        before = {
+            "rows": sheet.row_count,
+            "cols": sheet.col_count,
+            "header_columns": len(sheet.row_values(1)),
+        }
+
+        header = ensure_enterprise_headers(sheet)
+
+        after = {
+            "rows": sheet.row_count,
+            "cols": sheet.col_count,
+            "header_columns": len(header),
+        }
+
+        existing_keys = get_existing_keys(sheet)
+
+        return {
+            "status": "ok",
+            "version": APP_VERSION,
+            "before": before,
+            "after": after,
+            "existing_keys_found": len(existing_keys),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "error",
+            "version": APP_VERSION,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 @app.get("/enterprise_preview")
