@@ -5,21 +5,25 @@ import time
 import threading
 import traceback
 from datetime import datetime
-from urllib.parse import quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlencode
 
 import requests
 import gspread
 from bs4 import BeautifulSoup
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from google.oauth2.service_account import Credentials
 
 
-APP_VERSION = "cargo_v28_4_uzex_restore"
-
-app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
-
-# Render Start Command должен быть:
+# ============================================================
+# AI TENDER AGENT — CARGO V29 UZEX ENGINE
+# Main file: main_v2.py
+# Render Start Command:
 # uvicorn main_v2:app --host 0.0.0.0 --port $PORT
+# ============================================================
+
+APP_VERSION = "cargo_v29_uzex_engine"
+app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
@@ -30,10 +34,19 @@ GOOGLE_CREDS_JSON = (
 )
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Тендеры")
 
-REQUEST_TIMEOUT = 20
-MAX_SOURCE_SECONDS = 70
-MAX_TOTAL_SECONDS = 180
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+MAX_TOTAL_SECONDS = int(os.getenv("MAX_TOTAL_SECONDS", "240"))
+UZEX_LIST_PAGES = int(os.getenv("UZEX_LIST_PAGES", "8"))
+UZEX_MAX_LOTS = int(os.getenv("UZEX_MAX_LOTS", "160"))
+UZEX_DETAIL_WORKERS = int(os.getenv("UZEX_DETAIL_WORKERS", "8"))
 
+UZEX_BASE = "https://etender.uzex.uz"
+UZEX_LIST_URLS = [
+    f"{UZEX_BASE}/lots/1/0",
+    f"{UZEX_BASE}/lots/2/0",
+]
+
+SCAN_LOCK = threading.Lock()
 SCAN_STATE = {
     "running": False,
     "started_at": None,
@@ -42,53 +55,137 @@ SCAN_STATE = {
     "last_result": None,
     "last_error": None,
 }
-SCAN_LOCK = threading.Lock()
+
+DIAG_LOCK = threading.Lock()
+DIAGNOSTICS = {
+    "updated_at": None,
+    "uzex": {},
+    "tenderweek": {},
+    "xt_xarid": {},
+}
 
 
 KEYWORDS = [
-    "услуга по перевозке грузов", "услуги по перевозке грузов",
-    "оказание услуг по перевозке грузов", "перевозка грузов",
-    "перевозка товара", "перевозка товаров", "доставка грузов",
-    "доставка товара", "доставка товаров", "грузоперевоз",
-    "грузовые перевозки", "грузовой транспорт", "груз",
-    "логистика", "логистические услуги", "логист",
-    "транспорт", "транспортные услуги", "оказание транспортных услуг",
-    "автотранспорт", "автотранспортные услуги", "автомобильные перевозки",
-    "международные перевозки", "внутренние перевозки", "междугородние перевозки",
-    "железнодорожные перевозки", "жд перевозки", "ж/д перевозки",
-    "контейнерные перевозки", "контейнер", "мультимодальные перевозки",
-    "интермодальные перевозки", "экспедирование", "экспедиторские услуги",
-    "транспортно-экспедиционные услуги", "транспортная экспедиция",
-    "экспедитор", "доставка", "склад", "складские услуги",
-    "хранение груза", "погрузка", "разгрузка",
-    "погрузочно-разгрузочные работы", "погрузо-разгрузочные работы",
-    "спецтехника", "аренда спецтехники", "фура", "тягач",
-    "полуприцеп", "рефрижератор", "изотермический", "бортовой автомобиль",
-    "самосвал", "контейнеровоз", "таможенное оформление",
-    "таможенный брокер", "таможенные услуги", "транзит",
-    "freight", "freight forwarding", "cargo", "cargo transportation",
-    "transportation", "transport services", "logistics", "logistics services",
-    "delivery", "shipping", "forwarding", "warehouse", "customs clearance",
-    "yuk tashish", "yuklarni tashish", "transport xizmati",
-    "transport xizmatlari", "logistika", "yetkazib berish", "ombor",
-    "юк ташиш", "юкларни ташиш", "транспорт хизмати",
-    "транспорт хизматлари", "логистика", "етказиб бериш", "омбор",
+    "услуга по перевозке грузов",
+    "услуги по перевозке грузов",
+    "оказание услуг по перевозке грузов",
+    "перевозка грузов",
+    "перевозка товара",
+    "перевозка товаров",
+    "доставка грузов",
+    "доставка товара",
+    "доставка товаров",
+    "грузоперевоз",
+    "грузовые перевозки",
+    "грузовой транспорт",
+    "транспортные услуги",
+    "оказание транспортных услуг",
+    "автотранспортные услуги",
+    "автомобильные перевозки",
+    "международные перевозки",
+    "внутренние перевозки",
+    "междугородние перевозки",
+    "железнодорожные перевозки",
+    "жд перевозки",
+    "ж/д перевозки",
+    "контейнерные перевозки",
+    "мультимодальные перевозки",
+    "интермодальные перевозки",
+    "экспедирование",
+    "экспедиторские услуги",
+    "транспортно-экспедиционные услуги",
+    "транспортная экспедиция",
+    "экспедитор",
+    "складские услуги",
+    "хранение груза",
+    "погрузка",
+    "разгрузка",
+    "погрузочно-разгрузочные работы",
+    "погрузо-разгрузочные работы",
+    "аренда спецтехники",
+    "фура",
+    "тягач",
+    "полуприцеп",
+    "рефрижератор",
+    "контейнеровоз",
+    "таможенное оформление",
+    "таможенный брокер",
+    "таможенные услуги",
+    "freight",
+    "freight forwarding",
+    "cargo transportation",
+    "transport services",
+    "logistics services",
+    "shipping",
+    "forwarding",
+    "warehouse services",
+    "customs clearance",
+    "yuk tashish",
+    "yuklarni tashish",
+    "yuk tashish xizmati",
+    "yuk tashish xizmatlari",
+    "transport xizmati",
+    "transport xizmatlari",
+    "logistika xizmatlari",
+    "yetkazib berish xizmati",
+    "юк ташиш",
+    "юкларни ташиш",
+    "транспорт хизмати",
+    "транспорт хизматлари",
+    "логистика хизматлари",
+    "етказиб бериш хизмати",
 ]
 
-SEARCH_WORDS = [
-    "перевозка", "перевозка грузов", "транспорт", "транспортные услуги",
-    "доставка", "логистика", "экспедирование", "склад", "спецтехника",
-    "контейнер", "таможенное оформление", "freight", "cargo", "logistics",
-    "yuk tashish", "transport xizmati", "logistika", "yetkazib berish",
-    "юк ташиш", "транспорт хизмати", "логистика",
-]
+# Слова, которые сами по себе слишком общие и не должны принимать тендер.
+WEAK_WORDS = {
+    "транспорт",
+    "логистика",
+    "доставка",
+    "cargo",
+    "logistics",
+    "delivery",
+    "transportation",
+    "ombor",
+    "омбор",
+}
 
 REJECT_WORDS = [
-    "ремонт", "техническое обслуживание", "техобслуживание",
-    "запчаст", "запасные части", "поставка автомобиля", "покупка автомобиля",
-    "шина", "масло моторное", "страхование", "мебель", "канцеляр",
-    "бетон", "строительные материалы", "компьютер", "принтер",
-    "картридж", "кондиционер", "медицинское оборудование",
+    "ремонт автомобиля",
+    "ремонт транспорт",
+    "техническое обслуживание автомобиля",
+    "техническое обслуживание транспорт",
+    "техобслуживание автомобиля",
+    "запасные части",
+    "запчаст",
+    "поставка автомобиля",
+    "покупка автомобиля",
+    "приобретение автомобиля",
+    "автомобильная шина",
+    "автошина",
+    "масло моторное",
+    "страхование транспорта",
+    "мебель",
+    "канцеляр",
+    "бетон",
+    "строительные материалы",
+    "компьютер",
+    "принтер",
+    "картридж",
+    "кондиционер",
+    "медицинское оборудование",
+]
+
+STRONG_PATTERNS = [
+    r"\bперевоз\w*\s+(?:груз\w*|товар\w*|продукц\w*)",
+    r"\bтранспортн\w+\s+услуг\w*",
+    r"\bэкспедитор\w*\s+услуг\w*",
+    r"\bтранспортно[-\s]?экспедицион\w+",
+    r"\bгрузоперевоз\w*",
+    r"\byuk\w*\s+tash\w*",
+    r"\btransport\w*\s+xizmat\w*",
+    r"\bfreight\s+(?:forwarding|transportation)",
+    r"\bcargo\s+transportation",
+    r"\blogistics\s+services",
 ]
 
 
@@ -96,60 +193,100 @@ def now_str():
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def normalize_text(text: str) -> str:
-    if not text:
+def normalize_text(value) -> str:
+    if value is None:
         return ""
-    text = str(text).lower().strip()
-    text = re.sub(r"\s+", " ", text)
+    text = str(value).replace("\xa0", " ").lower()
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def is_logistics_tender(text: str) -> bool:
+def compact_text(value, limit=1000) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit]
+
+
+def contains_reject(text: str) -> str:
+    t = normalize_text(text)
+    for word in REJECT_WORDS:
+        if word in t:
+            return word
+    return ""
+
+
+def logistics_match(text: str):
     t = normalize_text(text)
     if not t:
-        return False
+        return False, "empty"
 
-    for bad in REJECT_WORDS:
-        if bad in t:
-            return False
+    rejected = contains_reject(t)
+    if rejected:
+        return False, f"rejected:{rejected}"
 
-    return any(word.lower() in t for word in KEYWORDS)
+    for pattern in STRONG_PATTERNS:
+        if re.search(pattern, t, flags=re.IGNORECASE):
+            return True, f"accepted_pattern:{pattern}"
+
+    for keyword in KEYWORDS:
+        k = normalize_text(keyword)
+        if k in WEAK_WORDS:
+            continue
+        if k in t:
+            return True, f"accepted_keyword:{keyword}"
+
+    return False, "no_logistics_phrase"
 
 
-def accept_reason(text: str) -> str:
-    t = normalize_text(text)
-
-    for bad in REJECT_WORDS:
-        if bad in t:
-            return f"rejected:{bad}"
-
-    for good in KEYWORDS:
-        if good.lower() in t:
-            return f"accepted:{good}"
-
-    return "no_transport_phrase"
+def is_logistics_tender(text: str) -> bool:
+    return logistics_match(text)[0]
 
 
 def tender_key(item: dict) -> str:
-    title = normalize_text(item.get("title", ""))
-    url = normalize_text(item.get("url", ""))
+    # UZEX lot URL is the most stable key.
+    url = normalize_text(item.get("url"))
+    lot_match = re.search(r"/lot/(\d+)", url)
+    if lot_match:
+        return f"uzex_lot:{lot_match.group(1)}"
+
+    title = normalize_text(item.get("title"))
     return f"{title}|{url}"
 
 
-def safe_get(url, *, params=None, headers=None, timeout=REQUEST_TIMEOUT):
-    default_headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AI-Tender-Agent/28.4",
-        "Accept": "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    if headers:
-        default_headers.update(headers)
+def update_diag(source: str, data: dict):
+    with DIAG_LOCK:
+        DIAGNOSTICS["updated_at"] = now_str()
+        DIAGNOSTICS[source] = data
 
-    return requests.get(url, params=params, headers=default_headers, timeout=timeout)
+
+def make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/149.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,uz;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
+    return session
+
+
+def safe_get(session: requests.Session, url: str, *, params=None, timeout=None):
+    response = session.get(
+        url,
+        params=params,
+        timeout=timeout or REQUEST_TIMEOUT,
+        allow_redirects=True,
+    )
+    return response
 
 
 def send_telegram(text: str) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram variables missing")
+        print("TELEGRAM: BOT_TOKEN or CHAT_ID missing")
         return False
 
     try:
@@ -164,8 +301,8 @@ def send_telegram(text: str) -> bool:
         )
         print("TELEGRAM:", response.status_code, response.text[:200])
         return response.status_code == 200
-    except Exception as e:
-        print("TELEGRAM ERROR:", e)
+    except Exception as exc:
+        print("TELEGRAM ERROR:", repr(exc))
         return False
 
 
@@ -194,32 +331,30 @@ def get_sheet():
 
 def get_existing_keys(sheet):
     rows = sheet.get_all_values()
-    keys = set()
-
     if not rows:
-        return keys
+        return set()
 
-    header = [normalize_text(h) for h in rows[0]]
+    header = [normalize_text(cell) for cell in rows[0]]
     title_idx = None
     url_idx = None
 
-    for i, h in enumerate(header):
-        if h in ["название", "title", "тендер", "наименование"]:
-            title_idx = i
-        if h in ["ссылка", "url", "link"]:
-            url_idx = i
+    for index, heading in enumerate(header):
+        if heading in {"название", "title", "тендер", "наименование"}:
+            title_idx = index
+        if heading in {"ссылка", "url", "link"}:
+            url_idx = index
 
-    # Старый формат: Дата, Источник, Название, Ссылка, Статус
     if title_idx is None:
         title_idx = 2
     if url_idx is None:
         url_idx = 3
 
+    keys = set()
     for row in rows[1:]:
         title = row[title_idx] if len(row) > title_idx else ""
         url = row[url_idx] if len(row) > url_idx else ""
         if title or url:
-            keys.add(f"{normalize_text(title)}|{normalize_text(url)}")
+            keys.add(tender_key({"title": title, "url": url}))
 
     return keys
 
@@ -241,380 +376,400 @@ def save_new_tenders(sheet, items):
     return len(rows)
 
 
-def add_unique(items: dict, item: dict):
-    if not item.get("title") or not item.get("url"):
-        return
+# ============================================================
+# UZEX ENGINE
+# ============================================================
 
-    combined = f"{item.get('title', '')} {item.get('url', '')} {item.get('reason', '')}"
-    if not is_logistics_tender(combined):
-        return
+def extract_lot_ids_from_html(html: str):
+    ids = set()
 
-    items[tender_key(item)] = item
+    # Обычные ссылки /lot/123456
+    for lot_id in re.findall(r"(?:https?://etender\.uzex\.uz)?/lot/(\d+)", html, re.I):
+        ids.add(lot_id)
+
+    # Экранированные ссылки в JSON / JS: \/lot\/123456
+    for lot_id in re.findall(r"\\?/lot\\?/(\d+)", html, re.I):
+        ids.add(lot_id)
+
+    # Возможные JSON-поля.
+    for lot_id in re.findall(
+        r'["\'](?:lotId|lot_id|tradeId|trade_id|id)["\']\s*:\s*["\']?(\d{4,})',
+        html,
+        re.I,
+    ):
+        ids.add(lot_id)
+
+    return ids
 
 
-# ---------------- Tenderweek ----------------
+def build_uzex_list_candidates():
+    urls = []
 
-def parse_tenderweek():
-    started = time.time()
-    unique = {}
-    base_url = "https://www.tenderweek.com/"
+    # Несколько вариантов пагинации. Неподдерживаемые варианты просто
+    # вернут ту же страницу и будут дедуплицированы по lot ID.
+    for base in UZEX_LIST_URLS:
+        urls.append(base)
+        for page in range(1, UZEX_LIST_PAGES + 1):
+            variants = [
+                {"page": page},
+                {"Page": page},
+                {"pageNumber": page},
+                {"pageIndex": page - 1},
+                {"currentPage": page},
+            ]
+            for params in variants:
+                urls.append(f"{base}?{urlencode(params)}")
 
-    pages = [base_url]
-    for page in range(2, 6):
-        pages.append(f"{base_url}?page={page}")
+    # Убираем повторы, сохраняя порядок.
+    return list(dict.fromkeys(urls))
 
-    for word in SEARCH_WORDS[:8]:
-        q = quote_plus(word)
-        pages.append(f"{base_url}?search={q}")
-        pages.append(f"{base_url}?q={q}")
 
-    for url in pages[:22]:
-        if time.time() - started > MAX_SOURCE_SECONDS:
-            print("Tenderweek stopped by source timeout")
+def discover_uzex_lot_ids():
+    session = make_session()
+    list_urls = build_uzex_list_candidates()
+    discovered = set()
+    request_log = []
+    errors = []
+
+    for url in list_urls:
+        if len(discovered) >= UZEX_MAX_LOTS:
             break
 
         try:
-            print("Tenderweek GET:", url)
-            r = safe_get(url, timeout=20)
-            print("Tenderweek status:", r.status_code, "size:", len(r.text))
+            response = safe_get(session, url, timeout=REQUEST_TIMEOUT)
+            ids = extract_lot_ids_from_html(response.text) if response.status_code == 200 else set()
+            before = len(discovered)
+            discovered.update(ids)
 
-            if r.status_code != 200:
-                continue
+            request_log.append({
+                "url": url,
+                "status": response.status_code,
+                "size": len(response.content),
+                "ids_on_page": len(ids),
+                "new_ids": len(discovered) - before,
+                "content_type": response.headers.get("content-type", ""),
+            })
 
-            soup = BeautifulSoup(r.text, "html.parser")
-            for link in soup.find_all("a"):
-                title = " ".join(link.get_text(" ", strip=True).split())
-                href = link.get("href")
+            print(
+                "UZEX LIST:",
+                response.status_code,
+                len(response.content),
+                "ids:", len(ids),
+                "new:", len(discovered) - before,
+                url,
+            )
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+            print("UZEX LIST ERROR:", url, repr(exc))
 
-                if not title or not href or len(title) < 8:
-                    continue
-
-                full_url = requests.compat.urljoin(base_url, href)
-                combined = f"{title} {full_url}"
-
-                if "tender" not in full_url.lower() and not is_logistics_tender(combined):
-                    continue
-
-                if not is_logistics_tender(combined):
-                    continue
-
-                add_unique(unique, {
-                    "site": "Tenderweek",
-                    "title": title,
-                    "url": full_url,
-                    "reason": accept_reason(combined),
-                })
-
-        except Exception as e:
-            print("Tenderweek error:", e)
-
-    return list(unique.values())
+    return list(discovered)[:UZEX_MAX_LOTS], request_log, errors
 
 
-# ---------------- XT-Xarid ----------------
-
-def parse_xt_xarid():
-    started = time.time()
-    unique = {}
-    base_url = "https://xt-xarid.uz/"
-
-    pages = [base_url]
-    for word in SEARCH_WORDS[:6]:
-        q = quote_plus(word)
-        pages.append(f"{base_url}?search={q}")
-        pages.append(f"{base_url}?q={q}")
-
-    for url in pages[:14]:
-        if time.time() - started > MAX_SOURCE_SECONDS:
-            print("XT-Xarid stopped by source timeout")
-            break
-
-        try:
-            print("XT-Xarid GET:", url)
-            r = safe_get(url, timeout=15)
-            print("XT-Xarid status:", r.status_code, "size:", len(r.text))
-
-            if r.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            for link in soup.find_all("a"):
-                title = " ".join(link.get_text(" ", strip=True).split())
-                href = link.get("href")
-
-                if not title or not href or len(title) < 6:
-                    continue
-
-                full_url = requests.compat.urljoin(base_url, href)
-                combined = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined):
-                    continue
-
-                add_unique(unique, {
-                    "site": "XT-Xarid",
-                    "title": title,
-                    "url": full_url,
-                    "reason": accept_reason(combined),
-                })
-
-        except Exception as e:
-            print("XT-Xarid error:", e)
-
-    return list(unique.values())
-
-
-# ---------------- UZEX RESTORE ----------------
-
-def extract_list_from_json(data):
-    if isinstance(data, list):
-        return data
-
-    if not isinstance(data, dict):
-        return []
+def select_lot_container_text(soup: BeautifulSoup, lot_id: str) -> str:
+    # Ищем ссылку на lot и берём ближайший содержательный контейнер.
+    link = soup.find("a", href=re.compile(rf"/lot/{re.escape(lot_id)}(?:\D|$)"))
+    if not link:
+        return ""
 
     candidates = []
-
-    def walk(obj, depth=0):
-        if depth > 5:
-            return
-
-        if isinstance(obj, list):
-            if obj and all(isinstance(x, dict) for x in obj[:5]):
-                candidates.append(obj)
-            return
-
-        if isinstance(obj, dict):
-            for value in obj.values():
-                walk(value, depth + 1)
-
-    walk(data)
+    node = link
+    for _ in range(6):
+        node = node.parent
+        if not node:
+            break
+        text = compact_text(node.get_text(" ", strip=True), 4000)
+        if 30 <= len(text) <= 4000:
+            candidates.append(text)
 
     if not candidates:
-        return []
+        return compact_text(link.get_text(" ", strip=True), 1000)
 
-    candidates.sort(key=len, reverse=True)
+    # Ближайший контейнер, в котором уже есть достаточно информации.
+    candidates.sort(key=len)
     return candidates[0]
 
 
-def get_lot_title(lot: dict) -> str:
-    fields = [
-        "name", "title", "lotName", "productName", "description",
-        "product_name", "goodsName", "subject", "ruName", "uzName",
-        "Name", "Title", "ProductName", "goods_name", "lot_name",
+def extract_title_from_detail(soup: BeautifulSoup, full_text: str, lot_id: str) -> str:
+    candidates = []
+
+    for tag_name in ["h1", "h2", "h3", "h4"]:
+        for tag in soup.find_all(tag_name):
+            text = compact_text(tag.get_text(" ", strip=True), 500)
+            if len(text) >= 6:
+                candidates.append(text)
+
+    for attrs in [
+        {"property": "og:title"},
+        {"name": "twitter:title"},
+    ]:
+        tag = soup.find("meta", attrs=attrs)
+        if tag and tag.get("content"):
+            candidates.append(compact_text(tag.get("content"), 500))
+
+    if soup.title:
+        candidates.append(compact_text(soup.title.get_text(" ", strip=True), 500))
+
+    # Убираем общие заголовки.
+    ignored = [
+        "etender.uzex.uz",
+        "o‘zbekiston respublika tovar-xom ashyo birjasi",
+        "лот ҳақида маълумот",
+        "lot haqida ma",
+        "технические требования",
+        "texnik talablar",
+        "калькулятор",
+        "kalkulyator",
     ]
 
-    for f in fields:
-        value = lot.get(f)
-        if value:
-            return str(value)
+    for candidate in candidates:
+        low = normalize_text(candidate)
+        if any(part in low for part in ignored):
+            continue
+        if lot_id and candidate.strip() == lot_id:
+            continue
+        return candidate[:500]
 
-    for value in lot.values():
-        if isinstance(value, dict):
-            nested = get_lot_title(value)
-            if nested:
-                return nested
-
-    return ""
-
-
-def get_lot_id(lot: dict) -> str:
-    fields = [
-        "id", "lotId", "tradeId", "number", "displayNo",
-        "lot_id", "LotId", "ID", "Id", "trade_id", "lotNumber",
+    # Ищем текст рядом с номером/номи.
+    patterns = [
+        r"(?:Номи|Nomi|Наименование|Название)\s*[:\-]\s*(.{10,500})",
+        r"(?:Предмет закупки|Xarid predmeti)\s*[:\-]\s*(.{10,500})",
     ]
+    for pattern in patterns:
+        match = re.search(pattern, full_text, re.I)
+        if match:
+            return compact_text(match.group(1), 500)
 
-    for f in fields:
-        value = lot.get(f)
-        if value:
-            return str(value)
-
-    for value in lot.values():
-        if isinstance(value, dict):
-            nested = get_lot_id(value)
-            if nested:
-                return nested
-
-    return ""
+    # Последний безопасный вариант.
+    return f"UZEX логистический тендер № {lot_id}"
 
 
-def parse_uzex_api():
-    started = time.time()
-    unique = {}
+def fetch_uzex_lot(lot_id: str):
+    session = make_session()
+    url = f"{UZEX_BASE}/lot/{lot_id}"
 
-    api_urls = [
-        "https://etender.uzex.uz/api/common/Trade/GetTrades",
-        "https://etender.uzex.uz/api/common/Trade/GetTradeList",
-        "https://etender.uzex.uz/api/common/Trade/GetList",
-        "https://etender.uzex.uz/api/common/Lot/GetLots",
-    ]
+    try:
+        response = safe_get(session, url, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            return None, {
+                "lot_id": lot_id,
+                "status": response.status_code,
+                "size": len(response.content),
+                "error": "non_200",
+            }
 
-    keywords = [
-        "transport",
-        "yuk tashish",
-        "logistika",
-        "transport xizmati",
-        "перевозка",
-        "перевозка грузов",
-        "транспорт",
-        "транспортные услуги",
-        "экспедиторские услуги",
-    ]
+        soup = BeautifulSoup(response.text, "html.parser")
+        full_text = compact_text(soup.get_text(" ", strip=True), 25000)
 
-    param_variants = []
-    for keyword in keywords:
-        param_variants.extend([
-            {"search": keyword, "page": 1, "size": 50},
-            {"keyword": keyword, "page": 1, "size": 50},
-            {"Search": keyword, "Page": 1, "Size": 50},
-            {"filter": keyword, "page": 1, "limit": 50},
-        ])
+        # Иногда полезный текст находится в JSON/JS и не виден в soup.get_text().
+        searchable = f"{full_text} {response.text[:120000]}"
+        accepted, reason = logistics_match(searchable)
 
-    for api_url in api_urls:
-        for params in param_variants:
-            if time.time() - started > MAX_SOURCE_SECONDS:
-                print("UZEX API stopped by source timeout")
-                return list(unique.values())
+        if not accepted:
+            return None, {
+                "lot_id": lot_id,
+                "status": response.status_code,
+                "size": len(response.content),
+                "accepted": False,
+                "reason": reason,
+            }
 
-            try:
-                print("UZEX API GET:", api_url, params)
-                r = safe_get(api_url, params=params, timeout=25)
-                print("UZEX API status:", r.status_code, "size:", len(r.text))
+        title = extract_title_from_detail(soup, full_text, lot_id)
+        item = {
+            "site": "UZEX",
+            "title": title,
+            "url": url,
+            "reason": reason,
+        }
+        return item, {
+            "lot_id": lot_id,
+            "status": response.status_code,
+            "size": len(response.content),
+            "accepted": True,
+            "reason": reason,
+        }
 
-                if r.status_code != 200:
-                    continue
-
-                try:
-                    data = r.json()
-                except Exception:
-                    print("UZEX API not json")
-                    continue
-
-                lots = extract_list_from_json(data)
-                print("UZEX API lots raw:", len(lots))
-
-                for lot in lots:
-                    if not isinstance(lot, dict):
-                        continue
-
-                    title = get_lot_title(lot)
-                    lot_id = get_lot_id(lot)
-
-                    lot_preview = json.dumps(lot, ensure_ascii=False)[:1200]
-                    combined = f"{title} {lot_preview}"
-
-                    if not title:
-                        continue
-
-                    if not is_logistics_tender(combined):
-                        continue
-
-                    lot_url = "https://etender.uzex.uz"
-                    if lot_id:
-                        lot_url = f"https://etender.uzex.uz/lot/{lot_id}"
-
-                    add_unique(unique, {
-                        "site": "UZEX",
-                        "title": title,
-                        "url": lot_url,
-                        "reason": accept_reason(combined),
-                    })
-
-            except Exception as e:
-                print("UZEX API error:", api_url, params, e)
-
-    return list(unique.values())
-
-
-def parse_uzex_html():
-    started = time.time()
-    unique = {}
-
-    base_urls = [
-        "https://etender.uzex.uz/lots/1/0",
-        "https://etender.uzex.uz/",
-        "https://xarid.uzex.uz/",
-    ]
-
-    pages = []
-    for base in base_urls:
-        pages.append(base)
-        for word in SEARCH_WORDS[:8]:
-            q = quote_plus(word)
-            pages.append(f"{base}?search={q}")
-            pages.append(f"{base}?q={q}")
-            pages.append(f"{base}?keyword={q}")
-
-    for url in pages[:35]:
-        if time.time() - started > MAX_SOURCE_SECONDS:
-            print("UZEX HTML stopped by source timeout")
-            break
-
-        try:
-            print("UZEX HTML GET:", url)
-            r = safe_get(url, timeout=20)
-            print("UZEX HTML status:", r.status_code, "size:", len(r.text))
-
-            if r.status_code != 200:
-                continue
-
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            for link in soup.find_all("a"):
-                title = " ".join(link.get_text(" ", strip=True).split())
-                href = link.get("href")
-
-                if not title or not href or len(title) < 6:
-                    continue
-
-                full_url = requests.compat.urljoin("https://etender.uzex.uz/", href)
-                combined = f"{title} {full_url}"
-
-                if not is_logistics_tender(combined):
-                    continue
-
-                add_unique(unique, {
-                    "site": "UZEX",
-                    "title": title,
-                    "url": full_url,
-                    "reason": accept_reason(combined),
-                })
-
-        except Exception as e:
-            print("UZEX HTML error:", e)
-
-    return list(unique.values())
+    except Exception as exc:
+        return None, {
+            "lot_id": lot_id,
+            "status": None,
+            "size": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def parse_uzex():
+    started = time.time()
+    lot_ids, list_log, discovery_errors = discover_uzex_lot_ids()
+
     unique = {}
+    detail_log = []
+    accepted_count = 0
+    rejected_count = 0
+    failed_count = 0
 
-    try:
-        api_items = parse_uzex_api()
-        print("UZEX API accepted:", len(api_items))
-        for item in api_items:
-            unique[tender_key(item)] = item
-    except Exception as e:
-        print("UZEX API main error:", e)
-        print(traceback.format_exc())
+    if lot_ids:
+        with ThreadPoolExecutor(max_workers=UZEX_DETAIL_WORKERS) as executor:
+            future_map = {
+                executor.submit(fetch_uzex_lot, lot_id): lot_id
+                for lot_id in lot_ids
+            }
 
-    try:
-        html_items = parse_uzex_html()
-        print("UZEX HTML accepted:", len(html_items))
-        for item in html_items:
-            unique[tender_key(item)] = item
-    except Exception as e:
-        print("UZEX HTML main error:", e)
-        print(traceback.format_exc())
+            for future in as_completed(future_map):
+                if time.time() - started > MAX_TOTAL_SECONDS - 20:
+                    break
+
+                try:
+                    item, detail = future.result()
+                    detail_log.append(detail)
+
+                    if item:
+                        unique[tender_key(item)] = item
+                        accepted_count += 1
+                    elif detail.get("error"):
+                        failed_count += 1
+                    else:
+                        rejected_count += 1
+                except Exception as exc:
+                    failed_count += 1
+                    detail_log.append({
+                        "lot_id": future_map[future],
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
+
+    status = "ok"
+    warning = None
+
+    if not lot_ids:
+        status = "error"
+        warning = "UZEX list pages returned no lot IDs"
+    elif accepted_count == 0:
+        status = "warning"
+        warning = "UZEX lots were discovered, but no logistics lots passed the filter"
+
+    diag = {
+        "status": status,
+        "warning": warning,
+        "started_at": datetime.fromtimestamp(started).strftime("%d.%m.%Y %H:%M:%S"),
+        "finished_at": now_str(),
+        "duration_seconds": round(time.time() - started, 2),
+        "list_requests": len(list_log),
+        "list_http_200": sum(1 for row in list_log if row["status"] == 200),
+        "lot_ids_discovered": len(lot_ids),
+        "detail_checked": len(detail_log),
+        "accepted": accepted_count,
+        "rejected": rejected_count,
+        "failed": failed_count,
+        "discovery_errors": discovery_errors[:20],
+        "list_log": list_log[:80],
+        "detail_log": detail_log[:120],
+    }
+    update_diag("uzex", diag)
+
+    print("UZEX ENGINE RESULT:", json.dumps({
+        "lot_ids": len(lot_ids),
+        "accepted": accepted_count,
+        "rejected": rejected_count,
+        "failed": failed_count,
+    }, ensure_ascii=False))
 
     return list(unique.values())
 
 
-# ---------------- SCAN CORE ----------------
+# ============================================================
+# TENDERWEEK / XT-XARID — conservative fallback
+# ============================================================
+
+def parse_generic_html_source(source_name: str, urls):
+    session = make_session()
+    unique = {}
+    logs = []
+    errors = []
+
+    for url in urls:
+        try:
+            response = safe_get(session, url)
+            logs.append({
+                "url": url,
+                "status": response.status_code,
+                "size": len(response.content),
+            })
+            if response.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            for link in soup.find_all("a", href=True):
+                href = requests.compat.urljoin(url, link.get("href"))
+                anchor_text = compact_text(link.get_text(" ", strip=True), 1000)
+
+                # Проверяем не только текст ссылки, но и ближайший контейнер.
+                container_text = anchor_text
+                node = link
+                for _ in range(4):
+                    node = node.parent
+                    if not node:
+                        break
+                    candidate = compact_text(node.get_text(" ", strip=True), 3000)
+                    if len(candidate) > len(container_text):
+                        container_text = candidate
+                    if len(container_text) >= 100:
+                        break
+
+                accepted, reason = logistics_match(f"{anchor_text} {container_text} {href}")
+                if not accepted:
+                    continue
+
+                title = anchor_text if len(anchor_text) >= 8 else container_text[:500]
+                if not title:
+                    continue
+
+                item = {
+                    "site": source_name,
+                    "title": title[:500],
+                    "url": href,
+                    "reason": reason,
+                }
+                unique[tender_key(item)] = item
+
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+
+    key = "tenderweek" if source_name == "Tenderweek" else "xt_xarid"
+    update_diag(key, {
+        "status": "ok" if any(row["status"] == 200 for row in logs) else "error",
+        "requests": len(logs),
+        "accepted": len(unique),
+        "errors": errors[:20],
+        "logs": logs[:30],
+    })
+    return list(unique.values())
+
+
+def parse_tenderweek():
+    urls = [
+        "https://www.tenderweek.com/",
+        "https://www.tenderweek.com/?search=перевозка",
+        "https://www.tenderweek.com/?search=логистика",
+        "https://www.tenderweek.com/?search=транспортные+услуги",
+    ]
+    return parse_generic_html_source("Tenderweek", urls)
+
+
+def parse_xt_xarid():
+    urls = [
+        "https://xt-xarid.uz/",
+        "https://xt-xarid.uz/?search=перевозка",
+        "https://xt-xarid.uz/?search=логистика",
+        "https://xt-xarid.uz/?search=transport",
+    ]
+    return parse_generic_html_source("XT-Xarid", urls)
+
+
+# ============================================================
+# SCAN CORE
+# ============================================================
 
 def run_scan(trigger="manual"):
     scan_started = time.time()
-
     result = {
         "status": "success",
         "version": APP_VERSION,
@@ -623,42 +778,66 @@ def run_scan(trigger="manual"):
         "new_total": 0,
         "duplicates": 0,
         "errors": [],
+        "warnings": [],
+        "duration_seconds": 0,
     }
 
     all_items = []
-
-    print("SCAN STARTED", APP_VERSION, trigger)
-
     sources = [
-        ("Tenderweek", parse_tenderweek),
         ("UZEX", parse_uzex),
+        ("Tenderweek", parse_tenderweek),
         ("XT-Xarid", parse_xt_xarid),
     ]
+
+    print("SCAN STARTED:", APP_VERSION, trigger)
 
     for source_name, parser in sources:
         if time.time() - scan_started > MAX_TOTAL_SECONDS:
             result["errors"].append("Total scan timeout reached")
+            result["status"] = "warning"
             break
 
         try:
             items = parser()
             result["sources"][source_name] = len(items)
             all_items.extend(items)
-            print(f"{source_name} DONE:", len(items))
-        except Exception as e:
-            error_text = f"{source_name}: {str(e)}"
+            print(source_name, "DONE:", len(items))
+        except Exception as exc:
+            error_text = f"{source_name}: {type(exc).__name__}: {exc}"
             result["errors"].append(error_text)
+            result["status"] = "warning"
             print(error_text)
             print(traceback.format_exc())
 
     unique = {}
     for item in all_items:
-        combined = f"{item.get('title', '')} {item.get('url', '')} {item.get('reason', '')}"
-        if is_logistics_tender(combined):
+        accepted, _ = logistics_match(
+            f"{item.get('title', '')} {item.get('url', '')} {item.get('reason', '')}"
+        )
+        if accepted:
             unique[tender_key(item)] = item
 
     all_items = list(unique.values())
     result["found_total"] = len(all_items)
+
+    with DIAG_LOCK:
+        uzex_diag = dict(DIAGNOSTICS.get("uzex") or {})
+
+    if uzex_diag.get("status") == "error":
+        result["status"] = "warning"
+        result["warnings"].append(
+            uzex_diag.get("warning") or "UZEX source is unavailable"
+        )
+    elif uzex_diag.get("status") == "warning":
+        result["warnings"].append(
+            uzex_diag.get("warning") or "UZEX returned no accepted logistics lots"
+        )
+
+    if sum(result["sources"].values()) == 0:
+        result["status"] = "warning"
+        result["warnings"].append(
+            "All sources returned zero. Check /debug_sources and /debug_uzex."
+        )
 
     try:
         sheet = get_sheet()
@@ -676,39 +855,44 @@ def run_scan(trigger="manual"):
         result["new_total"] = save_new_tenders(sheet, new_items)
         result["duplicates"] = duplicates
 
-        for item in new_items[:10]:
+        for item in new_items[:15]:
             send_telegram(
-                f"🆕 Новый логистический тендер\n\n"
-                f"📌 {item.get('site')}\n\n"
-                f"{item.get('title')}\n\n"
-                f"{item.get('url')}"
+                "🆕 Новый логистический тендер\n\n"
+                f"📌 {item.get('site', '')}\n\n"
+                f"{item.get('title', '')}\n\n"
+                f"{item.get('url', '')}"
             )
 
-    except Exception as e:
+    except Exception as exc:
         result["status"] = "warning"
-        result["errors"].append(f"Google Sheets: {str(e)}")
-        print("GOOGLE SHEETS ERROR:", e)
-        print(traceback.format_exc())
+        result["errors"].append(
+            f"Google Sheets: {type(exc).__name__}: {exc}"
+        )
+        print("GOOGLE SHEETS ERROR:", traceback.format_exc())
+
+    result["duration_seconds"] = round(time.time() - scan_started, 2)
 
     message = (
         f"📊 AI Tender Agent\n"
         f"{APP_VERSION}\n"
-        f"Scan завершён\n\n"
+        f"Сканирование завершено\n\n"
         f"Tenderweek: {result['sources']['Tenderweek']}\n"
         f"UZEX: {result['sources']['UZEX']}\n"
         f"XT-Xarid: {result['sources']['XT-Xarid']}\n\n"
         f"Всего найдено: {result['found_total']}\n"
         f"Новых сохранено: {result['new_total']}\n"
-        f"Дубликатов пропущено: {result['duplicates']}\n"
-        f"Ошибок: {len(result['errors'])}"
+        f"Дубликатов: {result['duplicates']}\n"
+        f"Время: {result['duration_seconds']} сек.\n"
+        f"Статус: {result['status']}"
     )
 
+    if result["warnings"]:
+        message += "\n\n⚠️ Предупреждения:\n" + "\n".join(result["warnings"][:4])
     if result["errors"]:
-        message += "\n\nОшибки:\n" + "\n".join(result["errors"][:5])
+        message += "\n\n❌ Ошибки:\n" + "\n".join(result["errors"][:4])
 
     send_telegram(message)
-
-    print("SCAN FINISHED", result)
+    print("SCAN FINISHED:", json.dumps(result, ensure_ascii=False))
     return result
 
 
@@ -718,25 +902,21 @@ def background_scan_worker(trigger):
         with SCAN_LOCK:
             SCAN_STATE["last_result"] = result
             SCAN_STATE["last_error"] = None
-
-    except Exception as e:
-        err = traceback.format_exc()
-        print("BACKGROUND WORKER ERROR:", err)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        print("BACKGROUND WORKER ERROR:", traceback.format_exc())
         with SCAN_LOCK:
-            SCAN_STATE["last_error"] = str(e)
-
+            SCAN_STATE["last_error"] = error
         send_telegram(
             f"❌ AI Tender Agent error\n\n"
             f"Version: {APP_VERSION}\n"
             f"Trigger: {trigger}\n"
-            f"Error: {str(e)}"
+            f"Error: {error}"
         )
-
     finally:
         with SCAN_LOCK:
             SCAN_STATE["running"] = False
             SCAN_STATE["finished_at"] = now_str()
-        print("BACKGROUND WORKER FINALLY: running=False")
 
 
 def start_background_scan(trigger="manual_http"):
@@ -768,16 +948,21 @@ def start_background_scan(trigger="manual_http"):
         "status": "accepted",
         "version": APP_VERSION,
         "running": True,
-        "message": "Scan started in background. Check Telegram, Google Sheets, or /scan_status.",
         "started_at": SCAN_STATE["started_at"],
+        "message": "Scan started. Check /scan_status.",
     }
 
 
-# ---------------- ENDPOINTS ----------------
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
 @app.get("/")
 def home():
-    return {"status": "AI Tender Agent is running", "version": APP_VERSION}
+    return {
+        "status": "AI Tender Agent is running",
+        "version": APP_VERSION,
+    }
 
 
 @app.head("/")
@@ -792,22 +977,40 @@ def version():
 
 @app.get("/health")
 def health():
-    result = {"status": "ok", "telegram": False, "google_sheets": False, "errors": []}
+    result = {
+        "status": "ok",
+        "telegram": False,
+        "google_sheets": False,
+        "uzex_home": False,
+        "errors": [],
+    }
 
     try:
         if not BOT_TOKEN or not CHAT_ID:
             raise RuntimeError("BOT_TOKEN/CHAT_ID missing")
-        tg_response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10)
-        result["telegram"] = tg_response.status_code == 200
-    except Exception as e:
-        result["errors"].append("Telegram error: " + str(e))
+        response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getMe",
+            timeout=10,
+        )
+        result["telegram"] = response.status_code == 200
+    except Exception as exc:
+        result["errors"].append(f"Telegram: {type(exc).__name__}: {exc}")
 
     try:
-        sh = get_sheet()
-        sh.row_values(1)
+        sheet = get_sheet()
+        sheet.row_values(1)
         result["google_sheets"] = True
-    except Exception as e:
-        result["errors"].append("Google Sheets error: " + str(e))
+    except Exception as exc:
+        result["errors"].append(f"Google Sheets: {type(exc).__name__}: {exc}")
+
+    try:
+        session = make_session()
+        response = safe_get(session, UZEX_LIST_URLS[0], timeout=15)
+        result["uzex_home"] = response.status_code == 200
+        if response.status_code != 200:
+            result["errors"].append(f"UZEX HTTP {response.status_code}")
+    except Exception as exc:
+        result["errors"].append(f"UZEX: {type(exc).__name__}: {exc}")
 
     if result["errors"]:
         result["status"] = "warning"
@@ -827,15 +1030,74 @@ def scan_start():
 
 @app.get("/scan_status")
 def scan_status():
+    with SCAN_LOCK:
+        return {
+            "status": "ok",
+            "version": APP_VERSION,
+            **SCAN_STATE,
+        }
+
+
+@app.get("/debug_sources")
+def debug_sources():
+    with DIAG_LOCK:
+        return {
+            "version": APP_VERSION,
+            "diagnostics": DIAGNOSTICS,
+        }
+
+
+@app.get("/debug_uzex")
+def debug_uzex(run: bool = Query(default=False)):
+    if run:
+        items = parse_uzex()
+        with DIAG_LOCK:
+            diag = dict(DIAGNOSTICS.get("uzex") or {})
+        return {
+            "version": APP_VERSION,
+            "count": len(items),
+            "items": items[:100],
+            "diagnostics": diag,
+        }
+
+    with DIAG_LOCK:
+        diag = dict(DIAGNOSTICS.get("uzex") or {})
     return {
-        "status": "ok",
         "version": APP_VERSION,
-        "running": SCAN_STATE["running"],
-        "started_at": SCAN_STATE["started_at"],
-        "finished_at": SCAN_STATE["finished_at"],
-        "last_trigger": SCAN_STATE["last_trigger"],
-        "last_result": SCAN_STATE["last_result"],
-        "last_error": SCAN_STATE["last_error"],
+        "message": "Use /debug_uzex?run=true to run UZEX diagnostics.",
+        "diagnostics": diag,
+    }
+
+
+@app.get("/debug_items")
+def debug_items(run: bool = Query(default=False)):
+    if not run:
+        with SCAN_LOCK:
+            last_result = SCAN_STATE.get("last_result")
+        return {
+            "version": APP_VERSION,
+            "message": "Use /debug_items?run=true to run all parsers.",
+            "last_result": last_result,
+        }
+
+    items = []
+    errors = []
+    for name, parser in [
+        ("UZEX", parse_uzex),
+        ("Tenderweek", parse_tenderweek),
+        ("XT-Xarid", parse_xt_xarid),
+    ]:
+        try:
+            items.extend(parser())
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+    unique = {tender_key(item): item for item in items}
+    return {
+        "version": APP_VERSION,
+        "count": len(unique),
+        "items": list(unique.values())[:200],
+        "errors": errors,
     }
 
 
@@ -850,48 +1112,23 @@ def test_filter():
         "Yuk tashish xizmatlari",
         "Cargo transportation services",
         "Таможенное оформление и экспедирование",
+        "Ремонт грузового автомобиля",
+        "Поставка автомобильных шин",
     ]
-    return {t: is_logistics_tender(t) for t in tests}
-
-
-@app.get("/debug_items")
-def debug_items():
-    items = []
-    errors = []
-
-    for name, parser in [
-        ("Tenderweek", parse_tenderweek),
-        ("UZEX", parse_uzex),
-        ("XT-Xarid", parse_xt_xarid),
-    ]:
-        try:
-            parsed = parser()
-            items.extend(parsed)
-        except Exception as e:
-            errors.append(f"{name}: {str(e)}")
-
-    unique = {}
-    for item in items:
-        unique[tender_key(item)] = item
-
     return {
-        "version": APP_VERSION,
-        "count": len(unique),
-        "items": list(unique.values())[:100],
-        "errors": errors,
-    }
-
-
-@app.get("/debug_uzex")
-def debug_uzex():
-    items = parse_uzex()
-    return {
-        "version": APP_VERSION,
-        "count": len(items),
-        "items": items[:100],
+        text: {
+            "accepted": logistics_match(text)[0],
+            "reason": logistics_match(text)[1],
+        }
+        for text in tests
     }
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+    )
