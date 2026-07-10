@@ -5,6 +5,7 @@ import time
 import threading
 import traceback
 from datetime import datetime
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -22,7 +23,7 @@ from google.oauth2.service_account import Credentials
 # uvicorn main_v2:app --host 0.0.0.0 --port $PORT
 # ============================================================
 
-APP_VERSION = "cargo_v30_1_strict_category_filter"
+APP_VERSION = "cargo_v30_2_enterprise"
 app = FastAPI(title="AI Tender Agent", version=APP_VERSION)
 
 # ---------------- Environment variables ----------------
@@ -43,6 +44,45 @@ MAX_TRADE_LIST_ROWS = int(os.getenv("MAX_TRADE_LIST_ROWS", "1000"))
 DETAIL_WORKERS = int(os.getenv("DETAIL_WORKERS", "8"))
 MAX_DETAIL_CANDIDATES = int(os.getenv("MAX_DETAIL_CANDIDATES", "250"))
 MAX_TOTAL_SECONDS = int(os.getenv("MAX_TOTAL_SECONDS", "240"))
+
+ENTERPRISE_SHEET_HEADERS = [
+    "Дата добавления",
+    "Источник",
+    "UZEX ID",
+    "Номер тендера",
+    "Название",
+    "Ссылка",
+    "Статус",
+    "Заказчик",
+    "ИНН заказчика",
+    "Регион",
+    "Район",
+    "Сумма",
+    "Валюта",
+    "Дата начала",
+    "Срок окончания",
+    "Тип оплаты",
+    "Аванс %",
+    "Срок оплаты, дней",
+    "Задаток",
+    "Задаток %",
+    "Категория ID",
+    "Категория",
+    "Тип транспорта",
+    "Маршрут",
+    "Документы",
+    "PDF",
+    "DOC/DOCX",
+    "Квалификационные требования",
+    "Приоритет",
+    "Рекомендация",
+    "Причина принятия",
+    "Комментарий системы",
+]
+
+DOCUMENT_DOWNLOAD_LIMIT_BYTES = int(
+    os.getenv("DOCUMENT_DOWNLOAD_LIMIT_BYTES", "8000000")
+)
 
 # ---------------- UZEX Real API ----------------
 
@@ -442,6 +482,51 @@ def find_column(header, names):
     return None
 
 
+def ensure_enterprise_headers(sheet):
+    """
+    Keeps existing data and upgrades the first row to the enterprise schema.
+    Existing rows are not deleted.
+    """
+    current = sheet.row_values(1)
+
+    if not current:
+        sheet.append_row(
+            ENTERPRISE_SHEET_HEADERS,
+            value_input_option="USER_ENTERED",
+        )
+        return ENTERPRISE_SHEET_HEADERS
+
+    normalized_current = [normalize_text(value) for value in current]
+    normalized_target = [
+        normalize_text(value)
+        for value in ENTERPRISE_SHEET_HEADERS
+    ]
+
+    # Already enterprise-compatible.
+    if all(value in normalized_current for value in normalized_target):
+        return current
+
+    # Do not destroy the old header. Extend it with missing enterprise columns.
+    missing = [
+        header
+        for header in ENTERPRISE_SHEET_HEADERS
+        if normalize_text(header) not in normalized_current
+    ]
+
+    if missing:
+        start_col = len(current) + 1
+        end_col = start_col + len(missing) - 1
+        sheet.update(
+            f"{gspread.utils.rowcol_to_a1(1, start_col)}:"
+            f"{gspread.utils.rowcol_to_a1(1, end_col)}",
+            [missing],
+            value_input_option="USER_ENTERED",
+        )
+        current.extend(missing)
+
+    return current
+
+
 def get_existing_keys(sheet):
     rows = sheet.get_all_values()
     if not rows:
@@ -449,7 +534,10 @@ def get_existing_keys(sheet):
 
     header = rows[0]
 
-    id_idx = find_column(header, ["ID", "Lot ID", "UZEX ID"])
+    id_idx = find_column(
+        header,
+        ["UZEX ID", "ID", "Lot ID", "UZEX lot ID"],
+    )
     display_idx = find_column(
         header,
         ["Номер тендера", "display_no", "Номер", "Номер лота"],
@@ -458,10 +546,12 @@ def get_existing_keys(sheet):
         header,
         ["Название", "title", "Тендер", "Наименование"],
     )
-    url_idx = find_column(header, ["Ссылка", "url", "link"])
+    url_idx = find_column(
+        header,
+        ["Ссылка", "url", "link"],
+    )
 
-    # Compatibility with the old table:
-    # Дата, Источник, Название, Ссылка, Статус, Причина
+    # Backward compatibility with old 6-column layout.
     if title_idx is None and len(header) >= 3:
         title_idx = 2
     if url_idx is None and len(header) >= 4:
@@ -470,68 +560,286 @@ def get_existing_keys(sheet):
     keys = set()
 
     for row in rows[1:]:
-        lot_id = row[id_idx] if id_idx is not None and len(row) > id_idx else ""
+        lot_id = (
+            row[id_idx].strip()
+            if id_idx is not None and len(row) > id_idx
+            else ""
+        )
         display_no = (
-            row[display_idx]
+            row[display_idx].strip()
             if display_idx is not None and len(row) > display_idx
             else ""
         )
         title = (
-            row[title_idx]
+            row[title_idx].strip()
             if title_idx is not None and len(row) > title_idx
             else ""
         )
         url = (
-            row[url_idx]
+            row[url_idx].strip()
             if url_idx is not None and len(row) > url_idx
             else ""
         )
 
         if lot_id:
             keys.add(f"uzex:{normalize_text(lot_id)}")
-        if display_no:
-            keys.add(f"uzex_display:{normalize_text(display_no)}")
 
-        match = re.search(r"/lot/(\d+)", url)
-        if match:
-            keys.add(f"uzex:{match.group(1)}")
+        if display_no:
+            keys.add(
+                f"uzex_display:{normalize_text(display_no)}"
+            )
+
+        url_match = re.search(r"/lot/(\d+)", url)
+        if url_match:
+            keys.add(f"uzex:{url_match.group(1)}")
 
         if title or url:
             keys.add(
                 f"{normalize_text(title)}|{normalize_text(url)}"
             )
 
+        # Read legacy details text where V30 stored "UZEX ID: ...; №: ..."
+        for cell in row:
+            for match in re.findall(
+                r"(?:UZEX\s*ID|ID)\s*:\s*(\d+)",
+                str(cell),
+                flags=re.IGNORECASE,
+            ):
+                keys.add(f"uzex:{match}")
+
+            for match in re.findall(
+                r"(?:№|display_no)\s*:\s*([0-9]+)",
+                str(cell),
+                flags=re.IGNORECASE,
+            ):
+                keys.add(
+                    f"uzex_display:{normalize_text(match)}"
+                )
+
     return keys
 
 
+def detect_transport_type(item: dict) -> str:
+    text = normalize_text(
+        " ".join([
+            item.get("title", ""),
+            item.get("addon_description", ""),
+            item.get("technical_description", ""),
+            " ".join(item.get("routes", [])),
+        ])
+    )
+
+    rules = [
+        (["трал", "tral", "низкорамн"], "Трал / низкорамный транспорт"),
+        (["рефрижератор", "reefer"], "Рефрижератор"),
+        (["контейнер", "container"], "Контейнеровоз"),
+        (["самосвал"], "Самосвал"),
+        (["тягач"], "Тягач"),
+        (["автокран", "кран"], "Автокран"),
+        (["экскаватор", "ekskavator"], "Экскаватор"),
+        (["погрузчик", "автопогрузчик"], "Погрузчик"),
+        (["автогрейдер", "грейдер"], "Автогрейдер"),
+        (["каток"], "Дорожный каток"),
+        (["фура", "tentlik", "тент"], "Тентованная фура"),
+        (["железнодорож", "ж/д", "rail"], "Железнодорожный транспорт"),
+        (["воздушн", "авиа", "air cargo"], "Авиационный транспорт"),
+        (["водн", "морск", "river", "sea freight"], "Водный транспорт"),
+    ]
+
+    matched = []
+    for keywords, label in rules:
+        if any(keyword in text for keyword in keywords):
+            matched.append(label)
+
+    return ", ".join(dict.fromkeys(matched)) or "Не указан"
+
+
+def calculate_priority(item: dict):
+    score = 0
+    reasons = []
+
+    cost = float(item.get("cost") or 0)
+
+    if cost >= 1_000_000_000:
+        score += 30
+        reasons.append("крупный бюджет")
+    elif cost >= 300_000_000:
+        score += 20
+        reasons.append("средний/крупный бюджет")
+    elif cost >= 100_000_000:
+        score += 10
+        reasons.append("значимый бюджет")
+
+    category_ids = set(item.get("category_ids", []))
+    if 125374 in category_ids:
+        score += 25
+        reasons.append("прямая транспортная категория")
+    if category_ids.intersection({125496, 125577, 125609}):
+        score += 20
+        reasons.append("логистическая категория")
+    if 127120 in category_ids:
+        score += 10
+        reasons.append("аренда транспорта/спецтехники")
+
+    if item.get("routes"):
+        score += 15
+        reasons.append("маршрут извлечён")
+
+    if item.get("documents"):
+        score += 10
+        reasons.append("есть тендерные документы")
+
+    if item.get("qualification_requirements"):
+        score += 5
+        reasons.append("требования определены")
+
+    payment = normalize_text(item.get("payment_type"))
+    if "предоплат" in payment or "олдиндан" in payment:
+        score += 10
+        reasons.append("есть предоплата")
+
+    if score >= 70:
+        return "Высокий", "Участвовать", score, reasons
+    if score >= 45:
+        return "Средний", "Изучить документы и рассчитать ставку", score, reasons
+    return "Низкий", "Проверить целесообразность", score, reasons
+
+
+def summarize_routes(routes):
+    if not routes:
+        return ""
+    return " | ".join(
+        compact_text(route, 500)
+        for route in routes[:10]
+    )[:5000]
+
+
+def summarize_requirements(requirements):
+    if not requirements:
+        return ""
+    return " | ".join(
+        compact_text(req, 500)
+        for req in requirements[:15]
+    )[:5000]
+
+
+def document_urls_by_type(documents):
+    pdf_urls = []
+    office_urls = []
+
+    for document in documents:
+        ext = normalize_text(document.get("ext"))
+        url = document.get("url", "")
+
+        if ext == "pdf":
+            pdf_urls.append(url)
+        elif ext in {"doc", "docx"}:
+            office_urls.append(url)
+
+    return (
+        "\n".join(pdf_urls[:10]),
+        "\n".join(office_urls[:10]),
+    )
+
+
+def item_to_enterprise_map(item):
+    priority, recommendation, score, score_reasons = calculate_priority(item)
+    pdf_urls, office_urls = document_urls_by_type(
+        item.get("documents", [])
+    )
+
+    transport_type = detect_transport_type(item)
+
+    system_comment = (
+        f"Автооценка: {score}/100. "
+        f"Факторы: {', '.join(score_reasons)}."
+    )
+
+    return {
+        "Дата добавления": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        "Источник": "UZEX",
+        "UZEX ID": str(item.get("id", "")),
+        "Номер тендера": item.get("display_no", ""),
+        "Название": item.get("title", ""),
+        "Ссылка": item.get("url", ""),
+        "Статус": "Новый",
+        "Заказчик": item.get("customer_name", ""),
+        "ИНН заказчика": item.get("customer_tin", ""),
+        "Регион": item.get("region_name", ""),
+        "Район": item.get("district_name", ""),
+        "Сумма": item.get("cost", ""),
+        "Валюта": item.get("currency_code", "") or item.get("currency", ""),
+        "Дата начала": item.get("start_date", ""),
+        "Срок окончания": item.get("end_date", ""),
+        "Тип оплаты": item.get("payment_type", ""),
+        "Аванс %": item.get("advance_payment_perc", ""),
+        "Срок оплаты, дней": item.get("term_payment_days", ""),
+        "Задаток": item.get("pledge_name", ""),
+        "Задаток %": item.get("pledge_value", ""),
+        "Категория ID": ", ".join(
+            map(str, item.get("category_ids", []))
+        ),
+        "Категория": ", ".join(
+            item.get("category_names", [])
+        ),
+        "Тип транспорта": transport_type,
+        "Маршрут": summarize_routes(item.get("routes", [])),
+        "Документы": ", ".join(item.get("document_names", [])),
+        "PDF": pdf_urls,
+        "DOC/DOCX": office_urls,
+        "Квалификационные требования": summarize_requirements(
+            item.get("qualification_requirements", [])
+        ),
+        "Приоритет": priority,
+        "Рекомендация": recommendation,
+        "Причина принятия": item.get("reason", ""),
+        "Комментарий системы": system_comment,
+    }
+
+
 def save_new_tenders(sheet, items):
-    # Keeps the existing 6-column table format.
+    header = ensure_enterprise_headers(sheet)
+    normalized_header = [normalize_text(value) for value in header]
+
     rows = []
 
     for item in items:
-        details = (
-            f"UZEX ID: {item.get('id', '')}; "
-            f"№: {item.get('display_no', '')}; "
-            f"Заказчик: {item.get('customer_name', '')}; "
-            f"Сумма: {format_money(item.get('cost'))} "
-            f"{item.get('currency_code', '')}; "
-            f"Окончание: {item.get('end_date', '')}; "
-            f"Категории: {', '.join(item.get('category_names', []))}; "
-            f"Оплата: {item.get('payment_type', '')}; "
-            f"Документы: {', '.join(item.get('document_names', []))}"
-        )
+        data = item_to_enterprise_map(item)
+        row = []
 
-        rows.append([
-            datetime.now().strftime("%d.%m.%Y %H:%M"),
-            "UZEX",
-            item.get("title", ""),
-            item.get("url", ""),
-            "Новый",
-            details[:5000],
-        ])
+        for header_name, normalized_name in zip(
+            header,
+            normalized_header,
+        ):
+            value = ""
+
+            for key, mapped_value in data.items():
+                if normalize_text(key) == normalized_name:
+                    value = mapped_value
+                    break
+
+            # Preserve compatibility with old six columns.
+            if not value:
+                legacy_map = {
+                    "дата": data["Дата добавления"],
+                    "источник": data["Источник"],
+                    "название": data["Название"],
+                    "ссылка": data["Ссылка"],
+                    "статус": data["Статус"],
+                    "причина": data["Причина принятия"],
+                    "комментарий": data["Комментарий системы"],
+                }
+                value = legacy_map.get(normalized_name, "")
+
+            row.append(value)
+
+        rows.append(row)
 
     if rows:
-        sheet.append_rows(rows, value_input_option="USER_ENTERED")
+        sheet.append_rows(
+            rows,
+            value_input_option="USER_ENTERED",
+        )
 
     return len(rows)
 
@@ -1279,22 +1587,32 @@ def run_scan(trigger="manual"):
         duplicates = 0
 
         for item in items:
+            lot_id = normalize_text(item.get("id"))
+            display_no = normalize_text(item.get("display_no"))
+            title_url_key = (
+                f"{normalize_text(item.get('title'))}|"
+                f"{normalize_text(item.get('url'))}"
+            )
+
             possible_keys = {
                 tender_key(item),
-                f"uzex_display:{normalize_text(item.get('display_no'))}",
-                (
-                    f"{normalize_text(item.get('title'))}|"
-                    f"{normalize_text(item.get('url'))}"
-                ),
+                title_url_key,
             }
 
-            if any(
-                key in existing_keys
-                for key in possible_keys
-            ):
+            if lot_id:
+                possible_keys.add(f"uzex:{lot_id}")
+            if display_no:
+                possible_keys.add(
+                    f"uzex_display:{display_no}"
+                )
+
+            if any(key in existing_keys for key in possible_keys):
                 duplicates += 1
             else:
                 new_items.append(item)
+
+                # Important: prevents duplicates inside the same batch.
+                existing_keys.update(possible_keys)
 
         result["new_total"] = save_new_tenders(
             sheet,
@@ -1433,6 +1751,7 @@ def home():
         "version": APP_VERSION,
         "engine": "UZEX Real API",
         "filter": "Strict Category Filter",
+        "edition": "Enterprise",
     }
 
 
@@ -1636,6 +1955,28 @@ def debug_categories():
             if isinstance(data, list)
             else None
         ),
+    }
+
+
+@app.get("/enterprise_preview")
+def enterprise_preview(run: bool = Query(default=False)):
+    if run:
+        items, diagnostics = parse_uzex()
+    else:
+        with DATA_LOCK:
+            items = list(LAST_ITEMS)
+            diagnostics = dict(LAST_DIAGNOSTICS)
+
+    previews = []
+
+    for item in items[:100]:
+        previews.append(item_to_enterprise_map(item))
+
+    return {
+        "version": APP_VERSION,
+        "count": len(previews),
+        "items": previews,
+        "diagnostics": diagnostics,
     }
 
 
