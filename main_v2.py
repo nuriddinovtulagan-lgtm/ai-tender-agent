@@ -24,8 +24,8 @@ GOOGLE_SERVICE_ACCOUNT_JSON
 Optional:
 SCAN_INTERVAL_MINUTES=30
 SCAN_ON_STARTUP=true
-UZEX_TRADE_LIST_URL=https://etender.uzex.uz/api/Trade/GetTradeList
-UZEX_GET_TRADE_URL=https://etender.uzex.uz/api/Trade/GetTrade
+UZEX_TRADE_LIST_URL=https://apietender.uzex.uz/api/common/TradeList
+UZEX_GET_TRADE_URL=https://apietender.uzex.uz/api/common/GetTrade
 UZEX_BASE_URL=https://etender.uzex.uz
 UZEX_PAGE_SIZE=100
 MAX_PAGES=5
@@ -82,15 +82,28 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
+UZEX_API_BASE = os.getenv(
+    "UZEX_API_BASE",
+    "https://apietender.uzex.uz",
+).rstrip("/")
+
 UZEX_TRADE_LIST_URL = os.getenv(
     "UZEX_TRADE_LIST_URL",
-    "https://etender.uzex.uz/api/Trade/GetTradeList",
+    f"{UZEX_API_BASE}/api/common/TradeList",
 ).strip()
+
 UZEX_GET_TRADE_URL = os.getenv(
     "UZEX_GET_TRADE_URL",
-    "https://etender.uzex.uz/api/Trade/GetTrade",
+    f"{UZEX_API_BASE}/api/common/GetTrade",
 ).strip()
-UZEX_BASE_URL = os.getenv("UZEX_BASE_URL", "https://etender.uzex.uz").rstrip("/")
+
+UZEX_BASE_URL = os.getenv(
+    "UZEX_BASE_URL",
+    "https://etender.uzex.uz",
+).rstrip("/")
+
+UZEX_SYSTEM_ID = int(os.getenv("UZEX_SYSTEM_ID", "0"))
+UZEX_TYPE_ID = int(os.getenv("UZEX_TYPE_ID", "1"))
 
 SCAN_INTERVAL_MINUTES = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
 SCAN_ON_STARTUP = os.getenv("SCAN_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
@@ -631,14 +644,14 @@ async def http_json(
 
 
 def trade_list_payload(page: int) -> Dict[str, Any]:
+    start_row = ((page - 1) * UZEX_PAGE_SIZE) + 1
+    end_row = start_row + UZEX_PAGE_SIZE - 1
+
     return {
-        "page": page,
-        "pageNumber": page,
-        "pageSize": UZEX_PAGE_SIZE,
-        "size": UZEX_PAGE_SIZE,
-        "search": "",
-        "status": 0,
-        "sort": "desc",
+        "TypeId": UZEX_TYPE_ID,
+        "From": start_row,
+        "To": end_row,
+        "System_Id": UZEX_SYSTEM_ID,
     }
 
 
@@ -648,31 +661,16 @@ async def fetch_uzex_list(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
 
     for page in range(1, MAX_PAGES + 1):
         payload = trade_list_payload(page)
-        errors: List[str] = []
-        data = None
 
-        for method in ("POST", "GET"):
-            try:
-                if method == "POST":
-                    data = await http_json(
-                        client,
-                        "POST",
-                        UZEX_TRADE_LIST_URL,
-                        json_body=payload,
-                    )
-                else:
-                    data = await http_json(
-                        client,
-                        "GET",
-                        UZEX_TRADE_LIST_URL,
-                        params=payload,
-                    )
-                break
-            except Exception as exc:
-                errors.append(f"{method}: {exc}")
-
-        if data is None:
-            raise RuntimeError("; ".join(errors))
+        try:
+            data = await http_json(
+                client,
+                "POST",
+                UZEX_TRADE_LIST_URL,
+                json_body=payload,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"UZEX TradeList failed: {exc}") from exc
 
         rows = first_list(data)
         logger.info("UZEX page %s: %s rows", page, len(rows))
@@ -684,15 +682,32 @@ async def fetch_uzex_list(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
         for raw in rows:
             if not isinstance(raw, dict):
                 continue
+
             key = str(
-                deep_get(raw, "id", "tradeId", "lotId", "displayNo", default="")
+                deep_get(
+                    raw,
+                    "id",
+                    "tradeId",
+                    "lotId",
+                    "displayNo",
+                    "Id",
+                    "TradeId",
+                    default="",
+                )
             )
+
             if not key:
                 key = hashlib.md5(
-                    json.dumps(raw, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    json.dumps(
+                        raw,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ).encode("utf-8")
                 ).hexdigest()
+
             if key in seen_ids:
                 continue
+
             seen_ids.add(key)
             all_rows.append(raw)
             added += 1
@@ -703,41 +718,53 @@ async def fetch_uzex_list(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     return all_rows
 
 
-async def enrich_trade(client: httpx.AsyncClient, item: Dict[str, Any]) -> Dict[str, Any]:
+async def enrich_trade(
+    client: httpx.AsyncClient,
+    item: Dict[str, Any],
+) -> Dict[str, Any]:
     lot_id = item.get("lot_id")
+
     if not lot_id:
         return item
 
-    attempts = [
-        ("GET", {"id": lot_id}, None),
-        ("GET", {"tradeId": lot_id}, None),
-        ("POST", None, {"id": lot_id}),
-        ("POST", None, {"tradeId": lot_id}),
-    ]
-    for method, params, body in attempts:
-        try:
-            data = await http_json(
-                client,
-                method,
-                UZEX_GET_TRADE_URL,
-                params=params,
-                json_body=body,
-            )
-            if isinstance(data, dict):
-                candidates = [data]
-                for key in ("data", "result", "trade", "lot", "Data", "Result"):
-                    if isinstance(data.get(key), dict):
-                        candidates.insert(0, data[key])
-                merged = dict(item["raw"])
-                merged.update(candidates[0])
-                enriched = parse_trade(merged)
-                for key, value in item.items():
-                    if key not in enriched or enriched[key] in ("", None):
-                        enriched[key] = value
-                return enriched
-        except Exception:
-            continue
-    return item
+    url = f"{UZEX_GET_TRADE_URL}/{lot_id}/{UZEX_SYSTEM_ID}"
+
+    try:
+        data = await http_json(
+            client,
+            "GET",
+            url,
+        )
+
+        if not isinstance(data, dict):
+            return item
+
+        detail = data
+        for key in ("data", "result", "trade", "lot", "Data", "Result"):
+            if isinstance(data.get(key), dict):
+                detail = data[key]
+                break
+
+        merged = dict(item.get("raw") or {})
+        merged.update(detail)
+
+        enriched = parse_trade(merged)
+
+        for key, value in item.items():
+            if enriched.get(key) in ("", None):
+                enriched[key] = value
+
+        enriched["raw"] = merged
+        enriched["hash"] = make_hash(enriched)
+        return enriched
+
+    except Exception as exc:
+        logger.warning(
+            "GetTrade failed for lot %s: %s",
+            lot_id,
+            exc,
+        )
+        return item
 
 
 def read_known_hashes_from_state() -> set[str]:
@@ -1297,9 +1324,9 @@ async def health(deep: bool = Query(False)) -> Dict[str, Any]:
     return {**basic, **detailed}
 
 
-@app.api_route("/scan", methods=["GET", "POST"])
-async def scan(background_tasks: BackgroundTasks) -> Dict[str, Any]:
+async def start_manual_scan() -> Dict[str, Any]:
     started = start_scan_task("manual_http")
+
     if not started:
         return {
             "status": "already_running",
@@ -1316,6 +1343,16 @@ async def scan(background_tasks: BackgroundTasks) -> Dict[str, Any]:
         "started_at": pretty_now(),
         "message": "Scan started. Check /scan_status.",
     }
+
+
+@app.get("/scan", operation_id="scan_get")
+async def scan_get() -> Dict[str, Any]:
+    return await start_manual_scan()
+
+
+@app.post("/scan", operation_id="scan_post")
+async def scan_post() -> Dict[str, Any]:
+    return await start_manual_scan()
 
 
 @app.get("/scan_status")
@@ -1446,7 +1483,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "main:app",
+        "main_v2:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "10000")),
         reload=False,
