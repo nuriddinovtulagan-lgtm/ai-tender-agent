@@ -1,16 +1,22 @@
 services:
   - type: web
-    name: ai-tender-scraper
+    name: ai-tender-agent
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
     envVars:
-      - key: BOT_TOKEN
-        sync: false
-      - key: CHAT_ID
-        sync: false
-      - key: GOOGLE_SHEET_ID
-        sync: false
-      - key: GOOGLE_SERVICE_ACCOUNT_JSON
-        sync: false
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: SCAN_INTERVAL_MINUTES
+        value: "30"
+      - key: SCAN_ON_STARTUP
+        value: "true"
+      - key: REQUEST_TIMEOUT_SECONDS
+        value: "25"
+      - key: SCAN_TIMEOUT_SECONDS
+        value: "240"
+      - key: STUCK_SCAN_MINUTES
+        value: "10"
