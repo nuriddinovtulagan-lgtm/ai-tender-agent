@@ -1,19 +1,16 @@
-"""
-Cargo V31 Enterprise Stable
-AI Tender Agent for logistics tenders
 
-Features:
-- FastAPI service
-- Internal scheduler (no external cron required)
-- Background scans
-- Protection against duplicate/stuck scans
-- UZEX TradeList + GetTrade API support
-- Telegram notifications
-- Google Sheets storage
-- Deduplication
-- Health, version, metrics, logs and scan status endpoints
-- Automatic startup scan
-- Persistent state on disk when writable
+"""
+Cargo V32 Enterprise AI
+Stable AI Tender Agent for logistics tenders.
+
+Core guarantees:
+- Permanent deduplication by stable UZEX lot ID.
+- TradeList + GetTrade deep merge.
+- Extraction of routes, payment data, product descriptions and documents.
+- Google Sheets is the source of truth for permanent deduplication.
+- Local state is only a fast cache and may be recreated after a Render restart.
+- Internal scheduler resumes automatically after every process restart.
+- External cron may call /health or /scan; duplicate runs are protected.
 
 Required environment variables:
 BOT_TOKEN
@@ -21,25 +18,18 @@ CHAT_ID
 GOOGLE_SHEET_ID
 GOOGLE_SERVICE_ACCOUNT_JSON
 
-Optional:
+Recommended:
 SCAN_INTERVAL_MINUTES=30
 SCAN_ON_STARTUP=true
-UZEX_TRADE_LIST_URL=https://apietender.uzex.uz/api/common/TradeList
-UZEX_GET_TRADE_URL=https://apietender.uzex.uz/api/common/GetTrade
-UZEX_BASE_URL=https://etender.uzex.uz
-UZEX_PAGE_SIZE=100
-MAX_PAGES=5
-REQUEST_TIMEOUT_SECONDS=25
-SCAN_TIMEOUT_SECONDS=240
-STUCK_SCAN_MINUTES=10
-LOG_LEVEL=INFO
-PORT=10000
+UZEX_TYPE_ID=1
+UZEX_SYSTEM_ID=0
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import os
@@ -52,10 +42,11 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urljoin
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 try:
@@ -66,122 +57,82 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v31_enterprise_stable"
-APP_NAME = "AI Tender Agent Cargo V31 Enterprise Stable"
+VERSION = "cargo_v32_enterprise_ai"
+APP_NAME = "AI Tender Agent Cargo V32 Enterprise AI"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = DATA_DIR / "cargo_v31_state.json"
-LOG_FILE = DATA_DIR / "cargo_v31.log"
+STATE_FILE = DATA_DIR / "cargo_v32_state.json"
+CACHE_FILE = DATA_DIR / "cargo_v32_seen_lots.json"
+LOG_FILE = DATA_DIR / "cargo_v32.log"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+SHEET_WORKSHEET_NAME = os.getenv("SHEET_WORKSHEET_NAME", "Тендеры").strip()
 
 UZEX_API_BASE = os.getenv(
     "UZEX_API_BASE",
     "https://apietender.uzex.uz",
 ).rstrip("/")
-
+UZEX_SITE_BASE = os.getenv(
+    "UZEX_SITE_BASE",
+    "https://etender.uzex.uz",
+).rstrip("/")
 UZEX_TRADE_LIST_URL = os.getenv(
     "UZEX_TRADE_LIST_URL",
     f"{UZEX_API_BASE}/api/common/TradeList",
 ).strip()
-
 UZEX_GET_TRADE_URL = os.getenv(
     "UZEX_GET_TRADE_URL",
     f"{UZEX_API_BASE}/api/common/GetTrade",
 ).strip()
-
-UZEX_BASE_URL = os.getenv(
-    "UZEX_BASE_URL",
-    "https://etender.uzex.uz",
-).rstrip("/")
-
-UZEX_SYSTEM_ID = int(os.getenv("UZEX_SYSTEM_ID", "0"))
 UZEX_TYPE_ID = int(os.getenv("UZEX_TYPE_ID", "1"))
+UZEX_SYSTEM_ID = int(os.getenv("UZEX_SYSTEM_ID", "0"))
 
 SCAN_INTERVAL_MINUTES = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
 SCAN_ON_STARTUP = os.getenv("SCAN_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
-UZEX_PAGE_SIZE = max(10, int(os.getenv("UZEX_PAGE_SIZE", "100")))
+UZEX_PAGE_SIZE = max(20, int(os.getenv("UZEX_PAGE_SIZE", "100")))
 MAX_PAGES = max(1, int(os.getenv("MAX_PAGES", "5")))
-REQUEST_TIMEOUT_SECONDS = max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "25")))
-SCAN_TIMEOUT_SECONDS = max(60, int(os.getenv("SCAN_TIMEOUT_SECONDS", "240")))
-STUCK_SCAN_MINUTES = max(2, int(os.getenv("STUCK_SCAN_MINUTES", "10")))
+REQUEST_TIMEOUT_SECONDS = max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")))
+SCAN_TIMEOUT_SECONDS = max(60, int(os.getenv("SCAN_TIMEOUT_SECONDS", "300")))
+DETAIL_CONCURRENCY = max(1, min(12, int(os.getenv("DETAIL_CONCURRENCY", "6"))))
+DETAIL_RETRIES = max(1, min(5, int(os.getenv("DETAIL_RETRIES", "3"))))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-SHEET_WORKSHEET_NAME = os.getenv("SHEET_WORKSHEET_NAME", "Тендеры").strip()
 
-TRANSPORT_ACCEPT = [
-    "перевозка груз",
-    "грузоперевоз",
-    "транспортные услуги",
-    "транспортная услуга",
-    "транспортно-экспедицион",
-    "экспедиторские услуги",
-    "логистические услуги",
-    "международная перевозка",
-    "автомобильная перевозка",
-    "доставка груз",
-    "услуги спецтехники с водителем",
-    "yuk tashish",
-    "yuklarni tashish",
-    "transport xizmati",
-    "transport xizmatlari",
-    "logistika",
-    "ekspeditorlik",
-    "xalqaro yuk",
-    "avtomobil transport",
+ACCEPT_PHRASES = [
+    "перевозка груз", "грузоперевоз", "транспортные услуги",
+    "транспортная услуга", "транспортно-экспедицион",
+    "экспедиторские услуги", "логистические услуги",
+    "международная перевозка", "автомобильная перевозка",
+    "доставка груз", "yuk tashish", "yuklarni tashish",
+    "transport xizmati", "transport xizmatlari", "logistika",
+    "ekspeditorlik", "xalqaro yuk", "avtomobil transport",
+    "yetkazib berish bo'yicha transport", "yetkazib berish bo‘yicha transport",
 ]
 
 STRONG_REJECT = [
-    "приобретение автомобиля",
-    "закупка автомобиля",
-    "поставка автомобиля",
-    "поставка автотранспорт",
-    "запасные части",
-    "запчасти",
-    "ремонт автомобиля",
-    "техническое обслуживание автомобиля",
-    "автострахование",
-    "шины",
-    "аккумулятор",
-    "yoqilg'i",
-    "ehtiyot qismlar",
+    "приобретение автомобиля", "закупка автомобиля",
+    "поставка автомобиля", "поставка автотранспорт",
+    "запасные части", "запчасти", "ремонт автомобиля",
+    "техническое обслуживание автомобиля", "автострахование",
+    "шины", "аккумулятор", "ehtiyot qismlar",
     "avtomobil sotib olish",
 ]
 
 SHEET_HEADERS = [
-    "ID",
-    "Источник",
-    "Номер лота",
-    "Название",
-    "Заказчик",
-    "Сумма",
-    "Валюта",
-    "Дата начала",
-    "Срок окончания",
-    "Категория",
-    "Описание",
-    "Маршрут",
-    "Тип транспорта",
-    "Оплата",
-    "Срок оплаты",
-    "Срок оказания услуг",
-    "Документы нужны",
-    "Предупреждения по документам",
-    "Ответственные задачи",
-    "Приоритет",
-    "AI Score",
-    "Решение",
-    "Статус",
-    "Ссылка",
-    "Дата добавления",
-    "Причина фильтра",
-    "Хеш",
+    "ID", "Источник", "Номер лота", "Название", "Заказчик",
+    "Сумма", "Валюта", "Дата начала", "Срок окончания",
+    "Категория", "Описание", "Маршруты", "Тип транспорта",
+    "Оплата", "Срок оплаты", "Срок оказания услуг",
+    "Документы", "Документы нужны", "Предупреждения",
+    "Ответственные задачи", "Приоритет", "AI Score",
+    "Решение", "Статус", "Ссылка", "Дата добавления",
+    "Дата обновления", "Причина фильтра", "Stable Key",
 ]
 
 
@@ -189,19 +140,12 @@ def now_local() -> datetime:
     return datetime.now(TZ)
 
 
-def iso_now() -> str:
-    return now_local().isoformat(timespec="seconds")
-
-
 def pretty_now() -> str:
     return now_local().strftime("%d.%m.%Y %H:%M:%S")
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
+def iso_now() -> str:
+    return now_local().isoformat(timespec="seconds")
 
 
 class RingBufferHandler(logging.Handler):
@@ -216,59 +160,33 @@ class RingBufferHandler(logging.Handler):
             pass
 
 
-logger = logging.getLogger("cargo_v31")
+logger = logging.getLogger("cargo_v32")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.propagate = False
-
 formatter = logging.Formatter(
     "%(asctime)s | %(levelname)s | %(message)s",
     "%Y-%m-%d %H:%M:%S",
 )
+ring_handler = RingBufferHandler()
+ring_handler.setFormatter(formatter)
 
 if not logger.handlers:
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    logger.addHandler(console)
     try:
         file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     except Exception:
         pass
-
-    ring_handler = RingBufferHandler(capacity=500)
-    ring_handler.setFormatter(formatter)
     logger.addHandler(ring_handler)
-else:
-    ring_handler = next(
-        (h for h in logger.handlers if isinstance(h, RingBufferHandler)),
-        RingBufferHandler(),
-    )
-
-
-@dataclass
-class ScanResult:
-    status: str = "idle"
-    version: str = VERSION
-    trigger: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    duration_seconds: float = 0.0
-    sources: Dict[str, int] = field(default_factory=lambda: {"UZEX": 0})
-    found_total: int = 0
-    accepted_total: int = 0
-    new_total: int = 0
-    duplicates: int = 0
-    rejected: int = 0
-    telegram_sent: int = 0
-    sheets_saved: int = 0
-    errors: List[str] = field(default_factory=list)
 
 
 @dataclass
 class RuntimeState:
     running: bool = False
+    app_started_at: str = field(default_factory=iso_now)
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     last_trigger: Optional[str] = None
@@ -279,10 +197,11 @@ class RuntimeState:
     successful_scans: int = 0
     failed_scans: int = 0
     total_found: int = 0
+    total_accepted: int = 0
     total_new: int = 0
+    total_duplicates: int = 0
     telegram_sent: int = 0
     sheets_saved: int = 0
-    app_started_at: str = field(default_factory=iso_now)
 
 
 state = RuntimeState()
@@ -292,8 +211,19 @@ scheduler_task: Optional[asyncio.Task] = None
 active_scan_task: Optional[asyncio.Task] = None
 
 
+def save_state() -> None:
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(asdict(state), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp.replace(STATE_FILE)
+    except Exception as exc:
+        logger.warning("State save failed: %s", exc)
+
+
 def load_state() -> None:
-    global state
     if not STATE_FILE.exists():
         return
     try:
@@ -306,292 +236,330 @@ def load_state() -> None:
             state.started_at = None
             state.next_scheduled_run = None
             state.app_started_at = iso_now()
-        logger.info("Persistent state loaded")
+        logger.info("Runtime state restored")
     except Exception as exc:
-        logger.warning("Could not load state: %s", exc)
-
-
-def save_state() -> None:
-    try:
-        payload = asdict(state)
-        temp = STATE_FILE.with_suffix(".tmp")
-        temp.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temp.replace(STATE_FILE)
-    except Exception as exc:
-        logger.warning("Could not save state: %s", exc)
+        logger.warning("State restore failed: %s", exc)
 
 
 def normalize_text(value: Any) -> str:
-    text = str(value or "").lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    return text
+    text = str(value or "").replace("\u00a0", " ").strip().lower()
+    return re.sub(r"\s+", " ", text)
+
+
+def first_nonempty(*values: Any, default: Any = "") -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return default
 
 
 def deep_get(obj: Any, *paths: str, default: Any = None) -> Any:
     for path in paths:
-        current = obj
+        cur = obj
         ok = True
         for part in path.split("."):
-            if isinstance(current, dict) and part in current:
-                current = current[part]
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
             else:
                 ok = False
                 break
-        if ok and current not in (None, ""):
-            return current
+        if ok and cur not in (None, "", [], {}):
+            return cur
     return default
 
 
-def first_list(obj: Any) -> List[Any]:
+def find_first_list(obj: Any, preferred: Sequence[str] = ()) -> List[Any]:
     if isinstance(obj, list):
         return obj
     if not isinstance(obj, dict):
         return []
-    candidates = [
-        "data",
-        "result",
-        "items",
-        "rows",
-        "trades",
-        "lots",
-        "content",
-        "Data",
-        "Result",
-        "Items",
-    ]
-    for key in candidates:
+
+    for key in preferred:
         value = obj.get(key)
         if isinstance(value, list):
             return value
         if isinstance(value, dict):
-            nested = first_list(value)
+            nested = find_first_list(value, preferred)
             if nested:
                 return nested
-    for value in obj.values():
-        if isinstance(value, list) and value:
+
+    for key in ("data", "result", "items", "rows", "trades", "lots", "content", "Data", "Result", "Items"):
+        value = obj.get(key)
+        if isinstance(value, list):
             return value
+        if isinstance(value, dict):
+            nested = find_first_list(value, preferred)
+            if nested:
+                return nested
+
     return []
 
 
+def flatten_dicts(obj: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from flatten_dicts(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from flatten_dicts(item)
+
+
 def safe_number(value: Any) -> Any:
-    if value is None:
-        return ""
     if isinstance(value, (int, float)):
         return value
-    text = str(value).strip().replace(" ", "").replace(",", ".")
+    if value in (None, ""):
+        return ""
+    text = re.sub(r"[^\d,.\-]", "", str(value))
+    if not text:
+        return str(value)
+    text = text.replace(",", ".")
     try:
         return float(text)
     except Exception:
         return str(value)
 
 
-def make_hash(item: Dict[str, Any]) -> str:
-    raw = "|".join([
-        normalize_text(item.get("source")),
-        normalize_text(item.get("lot_no")),
-        normalize_text(item.get("title")),
-        normalize_text(item.get("url")),
-    ])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+def stable_key(item: Dict[str, Any]) -> str:
+    lot_id = str(item.get("lot_id") or "").strip()
+    lot_no = str(item.get("lot_no") or "").strip()
+    if lot_id:
+        return f"uzex:{lot_id}"
+    if lot_no:
+        return f"uzex-no:{lot_no}"
+    url = str(item.get("url") or "")
+    match = re.search(r"/lot/(\d+)", url)
+    if match:
+        return f"uzex:{match.group(1)}"
+    raw = normalize_text(item.get("title"))
+    return "fallback:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def is_logistics_tender(title: str, description: str = "", category: str = "") -> Tuple[bool, str]:
+def merge_value(old: Any, new: Any) -> Any:
+    if new in (None, "", [], {}):
+        return old
+    if old in (None, "", [], {}):
+        return new
+    if isinstance(old, list) and isinstance(new, list):
+        result = []
+        seen = set()
+        for value in old + new:
+            marker = json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
+            if marker not in seen:
+                seen.add(marker)
+                result.append(value)
+        return result
+    if isinstance(old, dict) and isinstance(new, dict):
+        return deep_merge(old, new)
+    return new
+
+
+def deep_merge(base: Dict[str, Any], detail: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(base)
+    for key, value in detail.items():
+        result[key] = merge_value(result.get(key), value)
+    return result
+
+
+def detect_logistics(title: str, description: str, category: str) -> Tuple[bool, str]:
     text = normalize_text(" ".join([title, description, category]))
     for phrase in STRONG_REJECT:
         if phrase in text:
             return False, f"rejected:{phrase}"
-    for phrase in TRANSPORT_ACCEPT:
+    for phrase in ACCEPT_PHRASES:
         if phrase in text:
             return True, f"accepted:{phrase}"
     return False, "rejected:no_transport_phrase"
 
 
-def calculate_score(item: Dict[str, Any]) -> int:
-    text = normalize_text(" ".join([
-        item.get("title", ""),
-        item.get("description", ""),
-        item.get("category", ""),
-    ]))
-    score = 45
-    if "международ" in text or "xalqaro" in text:
-        score += 20
-    if "экспед" in text or "ekspeditor" in text or "логист" in text:
-        score += 15
-    if item.get("amount") not in ("", None, 0):
-        score += 10
-    if item.get("end_date"):
-        score += 5
-    if item.get("customer"):
-        score += 5
-    return min(score, 100)
-
-
-def priority_from_score(score: int) -> str:
-    if score >= 80:
-        return "Высокий"
-    if score >= 60:
-        return "Средний"
-    return "Низкий"
-
-
-def extract_route(text: str) -> str:
-    text = str(text or "")
-    patterns = [
-        r"(?:из|от)\s+([А-ЯA-ZЁЎҚҒҲ][^,.;\n]{2,50})\s+(?:в|до)\s+([А-ЯA-ZЁЎҚҒҲ][^,.;\n]{2,50})",
-        r"([A-ZА-ЯЁЎҚҒҲ][\w\- ]{2,40})\s*[–—-]\s*([A-ZА-ЯЁЎҚҒҲ][\w\- ]{2,40})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if match:
-            return f"{match.group(1).strip()} → {match.group(2).strip()}"
-    return ""
-
-
-def infer_transport(text: str) -> str:
-    t = normalize_text(text)
-    mapping = [
-        ("рефриж", "Рефрижератор"),
-        ("изотерм", "Изотерм"),
-        ("тент", "Тент"),
-        ("самосвал", "Самосвал"),
-        ("цистерн", "Цистерна"),
-        ("контейнер", "Контейнеровоз"),
-        ("авиаперевоз", "Авиа"),
-        ("темир йўл", "Железнодорожный"),
-        ("железнодорож", "Железнодорожный"),
-    ]
-    found = [label for token, label in mapping if token in t]
-    return ", ".join(dict.fromkeys(found))
-
-
-def default_document_checklist(text: str) -> str:
-    t = normalize_text(text)
-    docs = [
-        "Коммерческое предложение",
-        "Реквизиты компании",
-        "Свидетельство о регистрации",
-        "Устав",
-        "Доверенность/приказ подписанта",
-        "Опыт аналогичных перевозок",
-        "Список транспорта",
-        "Данные водителей",
-    ]
-    if "международ" in t or "xalqaro" in t:
-        docs.extend(["Лицензии/разрешения", "CMR/TIR документы"])
-    return "; ".join(docs)
-
-
-def document_warnings(item: Dict[str, Any]) -> str:
-    warnings: List[str] = []
-    if not item.get("end_date"):
-        warnings.append("Не определён срок подачи")
-    if not item.get("amount"):
-        warnings.append("Не определена сумма")
-    if not item.get("description"):
-        warnings.append("Нужно открыть ТЗ и договор")
-    return "; ".join(warnings) or "Нет критических предупреждений"
-
-
-def responsible_tasks(item: Dict[str, Any]) -> str:
-    return (
-        "Тендерный менеджер: проверить требования и подать заявку; "
-        "Логист: рассчитать маршрут, транспорт и себестоимость; "
-        "Бухгалтерия: проверить налоги, обеспечение и оплату; "
-        "Директор: утвердить цену и участие"
+def extract_lot_identity(raw: Dict[str, Any]) -> Tuple[str, str]:
+    lot_id = first_nonempty(
+        deep_get(raw, "id", "Id", "tradeId", "TradeId", "lotId", "LotId"),
+        deep_get(raw, "trade.id", "lot.id"),
     )
+    lot_no = first_nonempty(
+        deep_get(raw, "display_no", "displayNo", "DisplayNo"),
+        deep_get(raw, "trade_no", "tradeNo", "TradeNo"),
+        deep_get(raw, "lot_no", "lotNo", "LotNo"),
+        lot_id,
+    )
+    return str(lot_id or ""), str(lot_no or "")
+
+
+def extract_documents(raw: Dict[str, Any]) -> List[Dict[str, str]]:
+    docs: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    file_keys = (
+        "tech_file", "tech_doc_file", "additional_file",
+        "contract_proform_file", "contract_file",
+        "expertise_file", "file", "document", "attachment",
+    )
+
+    def add_doc(name: Any, url: Any) -> None:
+        name_s = str(name or "").strip()
+        url_s = str(url or "").strip()
+        if not name_s and not url_s:
+            return
+        if url_s and not url_s.startswith("http"):
+            url_s = urljoin(UZEX_API_BASE + "/", url_s.lstrip("/"))
+        marker = url_s or name_s
+        if marker in seen:
+            return
+        seen.add(marker)
+        docs.append({"name": name_s or url_s.rsplit("/", 1)[-1], "url": url_s})
+
+    for obj in flatten_dicts(raw):
+        for key, value in obj.items():
+            key_l = str(key).lower()
+            if any(token in key_l for token in file_keys):
+                if isinstance(value, str):
+                    add_doc(value.rsplit("/", 1)[-1], value)
+                elif isinstance(value, dict):
+                    add_doc(
+                        first_nonempty(value.get("name"), value.get("fileName"), value.get("filename")),
+                        first_nonempty(value.get("url"), value.get("path"), value.get("filePath")),
+                    )
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str):
+                            add_doc(item.rsplit("/", 1)[-1], item)
+                        elif isinstance(item, dict):
+                            add_doc(
+                                first_nonempty(item.get("name"), item.get("fileName"), item.get("filename")),
+                                first_nonempty(item.get("url"), item.get("path"), item.get("filePath")),
+                            )
+    return docs
+
+
+def extract_product_texts(raw: Dict[str, Any]) -> List[str]:
+    texts: List[str] = []
+    seen: Set[str] = set()
+    for obj in flatten_dicts(raw):
+        for key in ("description", "Description", "descriptionRu", "name", "Name", "productName", "address", "deliveryAddress"):
+            value = obj.get(key)
+            if isinstance(value, str):
+                text = re.sub(r"\s+", " ", value).strip()
+                if len(text) >= 8 and text not in seen:
+                    seen.add(text)
+                    texts.append(text)
+    return texts
+
+
+def extract_routes(texts: Sequence[str]) -> List[str]:
+    routes: List[str] = []
+    seen: Set[str] = set()
+
+    patterns = [
+        r"(?P<from>[^.;\n]{3,80}?)\s+(?:dan|дан|из)\s+(?P<to>[^.;\n]{3,100}?)\s+(?:ga|га|до|в)\b",
+        r"(?P<from>[A-ZА-ЯЁЎҚҒҲ][^.;\n]{2,60})\s*[–—-]\s*(?P<to>[A-ZА-ЯЁЎҚҒҲ][^.;\n]{2,60})",
+    ]
+
+    for text in texts:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        for pattern in patterns:
+            for match in re.finditer(pattern, cleaned, flags=re.IGNORECASE):
+                route = f"{match.group('from').strip()} → {match.group('to').strip()}"
+                route = route[:220]
+                if route not in seen:
+                    seen.add(route)
+                    routes.append(route)
+
+        if not routes and any(token in normalize_text(cleaned) for token in ("sh.dan", "дан", "га yetkazib", "yetkazib berish")):
+            if cleaned not in seen:
+                seen.add(cleaned)
+                routes.append(cleaned[:300])
+
+    return routes[:20]
+
+
+def infer_transport(text: str) -> List[str]:
+    mapping = [
+        ("рефриж", "Рефрижератор"), ("изотерм", "Изотерм"),
+        ("тент", "Тент"), ("самосвал", "Самосвал"),
+        ("цистерн", "Цистерна"), ("контейнер", "Контейнеровоз"),
+        ("авиа", "Авиа"), ("железнодорож", "Железнодорожный"),
+        ("темир йўл", "Железнодорожный"),
+        ("трактор", "Трал/низкорамный транспорт"),
+        ("техника", "Трал/низкорамный транспорт"),
+        ("tentli fura", "Тентованная фура"),
+    ]
+    t = normalize_text(text)
+    found: List[str] = []
+    for token, name in mapping:
+        if token in t and name not in found:
+            found.append(name)
+    return found
 
 
 def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
-    lot_id = deep_get(
-        raw,
-        "id", "tradeId", "lotId", "Id", "TradeId", "LotId",
-        "trade.id", "lot.id",
-        default="",
+    lot_id, lot_no = extract_lot_identity(raw)
+
+    title = first_nonempty(
+        deep_get(raw, "name", "Name", "nameRu", "NameRu"),
+        deep_get(raw, "title", "Title", "titleRu"),
+        deep_get(raw, "trade_name", "tradeName", "lotName"),
     )
-    lot_no = deep_get(
-        raw,
-        "displayNo", "tradeNo", "lotNo", "number", "DisplayNo",
-        "TradeNo", "LotNo", "id",
-        default=lot_id,
+    customer = first_nonempty(
+        deep_get(raw, "customer_name", "customerName", "CustomerName"),
+        deep_get(raw, "organization_name", "organizationName"),
+        deep_get(raw, "buyer_name", "buyerName"),
+        deep_get(raw, "customer.name", "organization.name"),
     )
-    title = deep_get(
-        raw,
-        "nameRu", "titleRu", "tradeNameRu", "lotNameRu",
-        "name", "title", "Name", "Title",
-        "trade.name", "lot.name",
-        default="",
+    amount = first_nonempty(
+        deep_get(raw, "start_cost", "startCost", "StartCost"),
+        deep_get(raw, "start_price", "startPrice", "StartPrice"),
+        deep_get(raw, "amount", "Amount", "price", "Price"),
     )
-    customer = deep_get(
-        raw,
-        "customerName", "organizationName", "buyerName",
-        "CustomerName", "OrganizationName",
-        "customer.name", "organization.name",
-        default="",
-    )
-    amount = deep_get(
-        raw,
-        "startPrice", "amount", "price", "maxPrice",
-        "StartPrice", "Amount", "Price",
-        default="",
-    )
-    currency = deep_get(
-        raw,
-        "currencyName", "currency", "CurrencyName",
-        "currency.code", "currency.name",
+    currency = first_nonempty(
+        deep_get(raw, "currency_name", "currencyName", "CurrencyName"),
+        deep_get(raw, "currency.code", "currency.name", "currency"),
         default="UZS",
     )
-    start_date = deep_get(
-        raw,
-        "startDate", "publishDate", "createdDate",
-        "StartDate", "PublishDate",
-        default="",
+    start_date = first_nonempty(
+        deep_get(raw, "start_date", "startDate", "StartDate"),
+        deep_get(raw, "publish_date", "publishDate", "createdDate"),
     )
-    end_date = deep_get(
-        raw,
-        "endDate", "deadline", "finishDate",
-        "EndDate", "Deadline",
-        default="",
+    end_date = first_nonempty(
+        deep_get(raw, "end_date", "endDate", "EndDate"),
+        deep_get(raw, "deadline", "Deadline", "finishDate"),
     )
-    category = deep_get(
-        raw,
-        "categoryName", "tradeCategoryName", "classifierName",
-        "CategoryName", "category.name",
-        default="",
+    payment = first_nonempty(
+        deep_get(raw, "payment_type_name", "paymentTypeName"),
+        deep_get(raw, "payment_condition", "paymentCondition"),
+        deep_get(raw, "payment_terms", "paymentTerms"),
     )
-    description = deep_get(
-        raw,
-        "descriptionRu", "description", "technicalDescription",
-        "DescriptionRu", "Description",
-        default="",
+    payment_days = first_nonempty(
+        deep_get(raw, "term_payment_days", "termPaymentDays", "paymentDays"),
     )
-    payment = deep_get(
-        raw,
-        "paymentCondition", "paymentTerms", "PaymentCondition",
-        default="",
+    delivery_days = first_nonempty(
+        deep_get(raw, "delivery_term_days", "deliveryTermDays", "termDays"),
     )
-    payment_days = deep_get(
-        raw,
-        "termPaymentDays", "paymentDays", "TermPaymentDays",
-        default="",
+    category = first_nonempty(
+        deep_get(raw, "category_name", "categoryName", "CategoryName"),
+        deep_get(raw, "classifier_name", "classifierName"),
+        deep_get(raw, "category.name"),
     )
-    delivery_days = deep_get(
-        raw,
-        "deliveryTermDays", "termDays", "DeliveryTermDays",
-        default="",
+    description = first_nonempty(
+        deep_get(raw, "description", "Description", "descriptionRu"),
+        deep_get(raw, "technical_description", "technicalDescription"),
     )
 
-    url = deep_get(raw, "url", "link", "Url", "Link", default="")
+    product_texts = extract_product_texts(raw)
+    if not description and product_texts:
+        description = "\n".join(product_texts[:10])
+
+    documents = extract_documents(raw)
+    routes = extract_routes(product_texts + [str(description or "")])
+    transport_types = infer_transport(" ".join(product_texts + [str(title), str(description)]))
+
+    url = first_nonempty(deep_get(raw, "url", "Url", "link", "Link"))
     if not url and lot_id:
-        url = f"{UZEX_BASE_URL}/lot/{lot_id}"
+        url = f"{UZEX_SITE_BASE}/lot/{lot_id}"
 
-    combined = " ".join([str(title), str(description), str(category)])
     item = {
         "source": "UZEX",
-        "lot_id": str(lot_id or ""),
-        "lot_no": str(lot_no or ""),
+        "lot_id": lot_id,
+        "lot_no": lot_no,
         "title": str(title or "").strip(),
         "customer": str(customer or "").strip(),
         "amount": safe_number(amount),
@@ -603,13 +571,75 @@ def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
         "payment": str(payment or ""),
         "payment_days": str(payment_days or ""),
         "delivery_days": str(delivery_days or ""),
-        "route": extract_route(combined),
-        "transport_type": infer_transport(combined),
+        "routes": routes,
+        "transport_types": transport_types,
+        "documents": documents,
         "url": str(url or ""),
         "raw": raw,
     }
-    item["hash"] = make_hash(item)
+    item["stable_key"] = stable_key(item)
     return item
+
+
+def completeness_score(item: Dict[str, Any]) -> int:
+    important = ("title", "customer", "amount", "end_date", "category", "description")
+    return sum(1 for key in important if item.get(key))
+
+
+def ai_score(item: Dict[str, Any]) -> int:
+    score = 35
+    text = normalize_text(" ".join([
+        item.get("title", ""), item.get("description", ""), item.get("category", "")
+    ]))
+    if item.get("customer"): score += 10
+    if item.get("amount") not in ("", None, 0): score += 10
+    if item.get("end_date"): score += 10
+    if item.get("routes"): score += 15
+    if item.get("documents"): score += 10
+    if "международ" in text or "xalqaro" in text: score += 10
+    return min(score, 100)
+
+
+def priority(score: int) -> str:
+    if score >= 80:
+        return "Высокий"
+    if score >= 60:
+        return "Средний"
+    return "Низкий"
+
+
+def document_checklist(item: Dict[str, Any]) -> str:
+    text = normalize_text(item.get("title", "") + " " + item.get("description", ""))
+    docs = [
+        "Коммерческое предложение", "Реквизиты",
+        "Свидетельство о регистрации", "Устав",
+        "Доверенность/приказ подписанта", "Опыт аналогичных перевозок",
+        "Список транспорта", "Данные водителей",
+    ]
+    if "международ" in text or "xalqaro" in text:
+        docs.extend(["CMR/TIR", "Международные разрешения"])
+    if "трактор" in text or "техника" in text:
+        docs.extend(["Документы на трал", "Разрешение на негабарит при необходимости"])
+    return "; ".join(docs)
+
+
+def warnings_for(item: Dict[str, Any]) -> str:
+    warnings = []
+    if not item.get("customer"): warnings.append("Не определён заказчик")
+    if not item.get("amount"): warnings.append("Не определена сумма")
+    if not item.get("end_date"): warnings.append("Не определён срок подачи")
+    if not item.get("routes"): warnings.append("Маршрут требует ручной проверки")
+    if not item.get("documents"): warnings.append("Документы UZEX не обнаружены")
+    return "; ".join(warnings) or "Нет критических предупреждений"
+
+
+def responsible_tasks() -> str:
+    return (
+        "Тендерный менеджер: изучить ТЗ и договор; "
+        "Логист: проверить маршруты, транспорт и себестоимость; "
+        "Бухгалтерия: проверить оплату, налоги и обеспечение; "
+        "Директор: утвердить цену и участие"
+    )
 
 
 async def http_json(
@@ -619,9 +649,10 @@ async def http_json(
     *,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
+    retries: int = 3,
 ) -> Any:
     last_error: Optional[Exception] = None
-    for attempt in range(1, 4):
+    for attempt in range(1, retries + 1):
         try:
             response = await client.request(
                 method,
@@ -630,23 +661,22 @@ async def http_json(
                 json=json_body,
                 headers={
                     "Accept": "application/json, text/plain, */*",
-                    "User-Agent": "Mozilla/5.0 CargoV31/1.0",
                     "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 CargoV32/1.0",
                 },
             )
             response.raise_for_status()
             return response.json()
         except Exception as exc:
             last_error = exc
-            if attempt < 3:
-                await asyncio.sleep(attempt * 1.5)
-    raise RuntimeError(f"HTTP request failed: {url}: {last_error}")
+            if attempt < retries:
+                await asyncio.sleep(1.2 * attempt)
+    raise RuntimeError(f"{method} {url} failed: {last_error}")
 
 
 def trade_list_payload(page: int) -> Dict[str, Any]:
     start_row = ((page - 1) * UZEX_PAGE_SIZE) + 1
     end_row = start_row + UZEX_PAGE_SIZE - 1
-
     return {
         "TypeId": UZEX_TYPE_ID,
         "From": start_row,
@@ -655,160 +685,106 @@ def trade_list_payload(page: int) -> Dict[str, Any]:
     }
 
 
-async def fetch_uzex_list(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
-    all_rows: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
+async def fetch_trade_list(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    rows_all: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
 
     for page in range(1, MAX_PAGES + 1):
-        payload = trade_list_payload(page)
-
-        try:
-            data = await http_json(
-                client,
-                "POST",
-                UZEX_TRADE_LIST_URL,
-                json_body=payload,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"UZEX TradeList failed: {exc}") from exc
-
-        rows = first_list(data)
+        data = await http_json(
+            client,
+            "POST",
+            UZEX_TRADE_LIST_URL,
+            json_body=trade_list_payload(page),
+        )
+        rows = find_first_list(data)
         logger.info("UZEX page %s: %s rows", page, len(rows))
-
         if not rows:
             break
 
         added = 0
-        for raw in rows:
-            if not isinstance(raw, dict):
+        for row in rows:
+            if not isinstance(row, dict):
                 continue
-
-            key = str(
-                deep_get(
-                    raw,
-                    "id",
-                    "tradeId",
-                    "lotId",
-                    "displayNo",
-                    "Id",
-                    "TradeId",
-                    default="",
-                )
-            )
-
-            if not key:
-                key = hashlib.md5(
-                    json.dumps(
-                        raw,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                    ).encode("utf-8")
-                ).hexdigest()
-
-            if key in seen_ids:
+            lot_id, lot_no = extract_lot_identity(row)
+            marker = lot_id or lot_no or hashlib.md5(
+                json.dumps(row, ensure_ascii=False, sort_keys=True).encode()
+            ).hexdigest()
+            if marker in seen:
                 continue
-
-            seen_ids.add(key)
-            all_rows.append(raw)
+            seen.add(marker)
+            rows_all.append(row)
             added += 1
 
         if added == 0 or len(rows) < UZEX_PAGE_SIZE:
             break
 
-    return all_rows
+    return rows_all
 
 
-async def enrich_trade(
+async def fetch_trade_detail(
     client: httpx.AsyncClient,
-    item: Dict[str, Any],
+    list_item: Dict[str, Any],
 ) -> Dict[str, Any]:
-    lot_id = item.get("lot_id")
-
+    lot_id = list_item.get("lot_id")
     if not lot_id:
-        return item
+        return list_item
 
     url = f"{UZEX_GET_TRADE_URL}/{lot_id}/{UZEX_SYSTEM_ID}"
+    last_error = None
 
-    try:
-        data = await http_json(
-            client,
-            "GET",
-            url,
-        )
+    for attempt in range(1, DETAIL_RETRIES + 1):
+        try:
+            data = await http_json(client, "GET", url, retries=1)
+            if not isinstance(data, dict):
+                return list_item
 
-        if not isinstance(data, dict):
-            return item
+            detail = data
+            for key in ("data", "result", "trade", "lot", "Data", "Result"):
+                if isinstance(data.get(key), dict):
+                    detail = data[key]
+                    break
 
-        detail = data
-        for key in ("data", "result", "trade", "lot", "Data", "Result"):
-            if isinstance(data.get(key), dict):
-                detail = data[key]
-                break
+            merged_raw = deep_merge(list_item.get("raw") or {}, detail)
+            merged = parse_trade(merged_raw)
 
-        merged = dict(item.get("raw") or {})
-        merged.update(detail)
+            # Preserve every populated TradeList value when detail is incomplete.
+            for key, value in list_item.items():
+                if merged.get(key) in (None, "", [], {}):
+                    merged[key] = value
 
-        enriched = parse_trade(merged)
+            merged["raw"] = merged_raw
+            merged["stable_key"] = stable_key(merged)
+            return merged
+        except Exception as exc:
+            last_error = exc
+            if attempt < DETAIL_RETRIES:
+                await asyncio.sleep(attempt * 1.5)
 
-        for key, value in item.items():
-            if enriched.get(key) in ("", None):
-                enriched[key] = value
-
-        enriched["raw"] = merged
-        enriched["hash"] = make_hash(enriched)
-        return enriched
-
-    except Exception as exc:
-        logger.warning(
-            "GetTrade failed for lot %s: %s",
-            lot_id,
-            exc,
-        )
-        return item
+    logger.warning("GetTrade failed for %s: %s", lot_id, last_error)
+    return list_item
 
 
-def read_known_hashes_from_state() -> set[str]:
-    try:
-        file = DATA_DIR / "known_hashes.json"
-        if file.exists():
-            values = json.loads(file.read_text(encoding="utf-8"))
-            return set(map(str, values))
-    except Exception:
-        pass
-    return set()
-
-
-def save_known_hashes_to_state(values: Iterable[str]) -> None:
-    try:
-        file = DATA_DIR / "known_hashes.json"
-        file.write_text(
-            json.dumps(sorted(set(values)), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception as exc:
-        logger.warning("Could not save hashes: %s", exc)
+def column_letter(number: int) -> str:
+    result = ""
+    while number:
+        number, remainder = divmod(number - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 
 def get_gspread_client():
     if not GOOGLE_SHEET_ID or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return None
     if gspread is None or Credentials is None:
-        raise RuntimeError("gspread/google-auth are not installed")
+        raise RuntimeError("gspread/google-auth not installed")
 
-    try:
-        credentials_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            "GOOGLE_SERVICE_ACCOUNT_JSON must contain complete JSON"
-        ) from exc
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
+    info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     credentials = Credentials.from_service_account_info(
-        credentials_info,
-        scopes=scopes,
+        info,
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ],
     )
     return gspread.authorize(credentials)
 
@@ -825,52 +801,93 @@ def open_worksheet():
         worksheet = spreadsheet.sheet1
 
     first_row = worksheet.row_values(1)
-    if first_row != SHEET_HEADERS:
-        if not first_row:
-            worksheet.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
-        else:
-            existing = list(first_row)
-            missing = [h for h in SHEET_HEADERS if h not in existing]
-            if missing:
-                worksheet.update(
-                    range_name=f"A1:{column_letter(len(existing) + len(missing))}1",
-                    values=[existing + missing],
-                )
+    if not first_row:
+        worksheet.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
+    else:
+        missing = [header for header in SHEET_HEADERS if header not in first_row]
+        if missing:
+            new_headers = first_row + missing
+            worksheet.update(
+                range_name=f"A1:{column_letter(len(new_headers))}1",
+                values=[new_headers],
+            )
     return worksheet
 
 
-def column_letter(number: int) -> str:
-    result = ""
-    while number:
-        number, remainder = divmod(number - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
+def normalize_sheet_lot_id(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    match = re.search(r"(?:uzex:|/lot/)?(\d{4,})", text)
+    return match.group(1) if match else None
 
 
-def load_known_hashes_from_sheet_sync() -> set[str]:
+def load_permanent_seen_keys_sync() -> Set[str]:
+    """
+    Google Sheets is the permanent source of truth.
+    Reads Stable Key, ID, Number and URL columns to remain compatible
+    with all older Cargo versions.
+    """
     worksheet = open_worksheet()
     if worksheet is None:
         return set()
 
-    try:
-        headers = worksheet.row_values(1)
-        if "Хеш" not in headers:
-            return set()
-        index = headers.index("Хеш") + 1
-        values = worksheet.col_values(index)[1:]
-        return {str(v).strip() for v in values if str(v).strip()}
-    except Exception as exc:
-        logger.warning("Could not read hashes from Google Sheets: %s", exc)
+    values = worksheet.get_all_values()
+    if not values:
         return set()
 
+    headers = values[0]
+    rows = values[1:]
+    index = {name: i for i, name in enumerate(headers)}
+    keys: Set[str] = set()
 
-def item_to_sheet_row(item: Dict[str, Any]) -> List[Any]:
-    score = calculate_score(item)
-    combined = " ".join([
-        str(item.get("title", "")),
-        str(item.get("description", "")),
-        str(item.get("category", "")),
-    ])
+    candidate_headers = [
+        "Stable Key", "ID", "Номер лота", "Ссылка", "Хеш",
+    ]
+
+    for row in rows:
+        for header in candidate_headers:
+            i = index.get(header)
+            if i is None or i >= len(row):
+                continue
+            value = row[i].strip()
+            if not value:
+                continue
+            if header == "Stable Key" and value.startswith(("uzex:", "uzex-no:", "fallback:")):
+                keys.add(value)
+            lot_id = normalize_sheet_lot_id(value)
+            if lot_id:
+                keys.add(f"uzex:{lot_id}")
+    return keys
+
+
+def load_local_seen_keys() -> Set[str]:
+    try:
+        if CACHE_FILE.exists():
+            return set(json.loads(CACHE_FILE.read_text(encoding="utf-8")))
+    except Exception:
+        pass
+    return set()
+
+
+def save_local_seen_keys(keys: Iterable[str]) -> None:
+    try:
+        CACHE_FILE.write_text(
+            json.dumps(sorted(set(keys)), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc:
+        logger.warning("Local seen cache save failed: %s", exc)
+
+
+def document_text(item: Dict[str, Any]) -> str:
+    docs = item.get("documents") or []
+    return "\n".join(
+        f"{doc.get('name', '')} {doc.get('url', '')}".strip()
+        for doc in docs
+    )
+
+
+def sheet_row(item: Dict[str, Any]) -> List[Any]:
+    score = ai_score(item)
     return [
         item.get("lot_id") or item.get("lot_no"),
         item.get("source"),
@@ -883,138 +900,124 @@ def item_to_sheet_row(item: Dict[str, Any]) -> List[Any]:
         item.get("end_date"),
         item.get("category"),
         item.get("description"),
-        item.get("route"),
-        item.get("transport_type"),
+        "\n".join(item.get("routes") or []),
+        ", ".join(item.get("transport_types") or []),
         item.get("payment"),
         item.get("payment_days"),
         item.get("delivery_days"),
-        default_document_checklist(combined),
-        document_warnings(item),
-        responsible_tasks(item),
-        priority_from_score(score),
+        document_text(item),
+        document_checklist(item),
+        warnings_for(item),
+        responsible_tasks(),
+        priority(score),
         score,
         "Участвовать" if score >= 60 else "Проверить",
         "Новый",
         item.get("url"),
         pretty_now(),
+        pretty_now(),
         item.get("filter_reason"),
-        item.get("hash"),
+        item.get("stable_key"),
     ]
 
 
-def append_items_to_sheet_sync(items: List[Dict[str, Any]]) -> int:
+def append_items_sync(items: List[Dict[str, Any]]) -> int:
     if not items:
         return 0
     worksheet = open_worksheet()
     if worksheet is None:
         return 0
+    worksheet.append_rows(
+        [sheet_row(item) for item in items],
+        value_input_option="USER_ENTERED",
+    )
+    return len(items)
 
-    rows = [item_to_sheet_row(item) for item in items]
-    worksheet.append_rows(rows, value_input_option="USER_ENTERED")
-    return len(rows)
 
-
-async def send_telegram_message(client: httpx.AsyncClient, text: str) -> bool:
+async def send_telegram(client: httpx.AsyncClient, item: Dict[str, Any]) -> bool:
     if not BOT_TOKEN or not CHAT_ID:
         return False
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text[:4096],
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return bool(data.get("ok"))
-    except Exception as exc:
-        logger.error("Telegram send failed: %s", exc)
-        return False
-
-
-def telegram_text(item: Dict[str, Any]) -> str:
-    score = calculate_score(item)
-    amount = item.get("amount") or "не указана"
-    currency = item.get("currency") or "UZS"
-    end_date = item.get("end_date") or "не указан"
-    customer = item.get("customer") or "не указан"
-    route = item.get("route") or "нужно определить"
-    transport = item.get("transport_type") or "не указан"
+    routes = item.get("routes") or []
+    docs = item.get("documents") or []
+    score = ai_score(item)
 
     def esc(value: Any) -> str:
-        return (
-            str(value)
-            .replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-        )
+        return html.escape(str(value or ""))
 
-    return (
+    route_block = "\n".join(f"• {esc(route)}" for route in routes[:10]) or "• нужно определить"
+    docs_block = "\n".join(f"• {esc(doc.get('name'))}" for doc in docs[:10]) or "• не обнаружены"
+
+    text = (
         "🚚 <b>Новый логистический тендер</b>\n\n"
         f"<b>{esc(item.get('title'))}</b>\n"
-        f"Источник: {esc(item.get('source'))}\n"
-        f"Заказчик: {esc(customer)}\n"
-        f"Сумма: {esc(amount)} {esc(currency)}\n"
-        f"Срок подачи: {esc(end_date)}\n"
-        f"Маршрут: {esc(route)}\n"
-        f"Транспорт: {esc(transport)}\n"
+        f"🔢 №: {esc(item.get('lot_no') or item.get('lot_id'))}\n"
+        f"🏢 Заказчик: {esc(item.get('customer') or 'не указан')}\n"
+        f"💰 Сумма: {esc(item.get('amount') or 'не указана')} {esc(item.get('currency') or 'UZS')}\n"
+        f"📅 Окончание: {esc(item.get('end_date') or 'не указано')}\n"
+        f"💳 Оплата: {esc(item.get('payment') or 'не указана')}\n"
+        f"🗂 Категория: {esc(item.get('category') or 'не указана')}\n\n"
+        f"🚛 <b>Маршруты:</b>\n{route_block}\n\n"
+        f"📎 <b>Документы:</b>\n{docs_block}\n\n"
         f"AI Score: {score}/100\n"
-        f"Приоритет: {esc(priority_from_score(score))}\n\n"
+        f"Приоритет: {priority(score)}\n\n"
         f"🔗 {esc(item.get('url'))}"
     )
 
+    response = await client.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": text[:4096],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+    response.raise_for_status()
+    return bool(response.json().get("ok"))
 
-async def integration_health() -> Dict[str, Any]:
-    errors: List[str] = []
-    telegram_ok = False
-    google_sheets_ok = False
-    uzex_trade_list_ok = False
-    uzex_get_trade_ok = False
+
+async def integrations_health() -> Dict[str, Any]:
+    errors = []
+    result = {
+        "telegram": False,
+        "google_sheets": False,
+        "uzex_trade_list": False,
+        "uzex_get_trade": False,
+    }
 
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        if BOT_TOKEN:
-            try:
-                response = await client.get(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-                )
-                telegram_ok = response.is_success and response.json().get("ok", False)
-            except Exception as exc:
-                errors.append(f"telegram:{exc}")
-        else:
-            errors.append("telegram:BOT_TOKEN missing")
+        try:
+            if BOT_TOKEN:
+                response = await client.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+                result["telegram"] = response.is_success and response.json().get("ok", False)
+            else:
+                errors.append("telegram:BOT_TOKEN missing")
+        except Exception as exc:
+            errors.append(f"telegram:{exc}")
 
         try:
-            rows = await fetch_uzex_list(client)
-            uzex_trade_list_ok = isinstance(rows, list)
+            rows = await fetch_trade_list(client)
+            result["uzex_trade_list"] = True
             if rows:
-                sample = parse_trade(rows[0])
-                enriched = await enrich_trade(client, sample)
-                uzex_get_trade_ok = bool(enriched)
+                item = parse_trade(rows[0])
+                detail = await fetch_trade_detail(client, item)
+                result["uzex_get_trade"] = bool(detail)
             else:
-                uzex_get_trade_ok = True
+                result["uzex_get_trade"] = True
         except Exception as exc:
             errors.append(f"uzex:{exc}")
 
-    if GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON:
-        try:
-            worksheet = await asyncio.to_thread(open_worksheet)
-            google_sheets_ok = worksheet is not None
-        except Exception as exc:
-            errors.append(f"google_sheets:{exc}")
-    else:
-        errors.append("google_sheets:variables missing")
+    try:
+        worksheet = await asyncio.to_thread(open_worksheet)
+        result["google_sheets"] = worksheet is not None
+    except Exception as exc:
+        errors.append(f"google_sheets:{exc}")
 
     return {
         "status": "ok" if not errors else "degraded",
-        "version": VERSION,
-        "telegram": telegram_ok,
-        "google_sheets": google_sheets_ok,
-        "uzex_trade_list": uzex_trade_list_ok,
-        "uzex_get_trade": uzex_get_trade_ok,
+        **result,
         "errors": errors,
     }
 
@@ -1031,135 +1034,161 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
         }
 
     async with scan_lock:
-        result = ScanResult(
-            status="running",
-            trigger=trigger,
-            started_at=pretty_now(),
-        )
+        started_at = pretty_now()
+        started_mono = time.monotonic()
+        result = {
+            "status": "running",
+            "version": VERSION,
+            "trigger": trigger,
+            "started_at": started_at,
+            "finished_at": None,
+            "duration_seconds": 0,
+            "sources": {"UZEX": 0},
+            "found_total": 0,
+            "accepted_total": 0,
+            "new_total": 0,
+            "duplicates": 0,
+            "rejected": 0,
+            "detail_complete": 0,
+            "detail_incomplete": 0,
+            "telegram_sent": 0,
+            "sheets_saved": 0,
+            "errors": [],
+        }
 
         with state_lock:
             state.running = True
-            state.started_at = result.started_at
+            state.started_at = started_at
             state.finished_at = None
             state.last_trigger = trigger
             state.last_error = None
             state.scan_count += 1
             save_state()
 
-        start_monotonic = time.monotonic()
         logger.info("Scan started | trigger=%s", trigger)
 
         try:
             timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                follow_redirects=True,
-            ) as client:
-                raw_rows = await fetch_uzex_list(client)
-                result.sources["UZEX"] = len(raw_rows)
-                result.found_total = len(raw_rows)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                raw_rows = await fetch_trade_list(client)
+                result["sources"]["UZEX"] = len(raw_rows)
+                result["found_total"] = len(raw_rows)
 
-                parsed: List[Dict[str, Any]] = []
+                accepted_list: List[Dict[str, Any]] = []
                 for raw in raw_rows:
                     item = parse_trade(raw)
-                    accepted, reason = is_logistics_tender(
-                        item["title"],
-                        item["description"],
-                        item["category"],
+                    accepted, reason = detect_logistics(
+                        item["title"], item["description"], item["category"]
                     )
                     item["filter_reason"] = reason
                     if accepted:
-                        parsed.append(item)
+                        accepted_list.append(item)
                     else:
-                        result.rejected += 1
+                        result["rejected"] += 1
 
-                enriched: List[Dict[str, Any]] = []
-                semaphore = asyncio.Semaphore(8)
+                semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
 
-                async def enrich_one(item: Dict[str, Any]) -> Dict[str, Any]:
+                async def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
                     async with semaphore:
-                        return await enrich_trade(client, item)
+                        return await fetch_trade_detail(client, item)
 
-                if parsed:
-                    enriched = await asyncio.gather(
-                        *(enrich_one(item) for item in parsed)
-                    )
+                enriched = await asyncio.gather(*(enrich(item) for item in accepted_list))
 
                 final_items: List[Dict[str, Any]] = []
                 for item in enriched:
-                    accepted, reason = is_logistics_tender(
-                        item["title"],
-                        item["description"],
-                        item["category"],
+                    accepted, reason = detect_logistics(
+                        item["title"], item["description"], item["category"]
                     )
                     item["filter_reason"] = reason
-                    item["hash"] = make_hash(item)
-                    if accepted:
-                        final_items.append(item)
+                    item["stable_key"] = stable_key(item)
+                    if not accepted:
+                        result["rejected"] += 1
+                        continue
 
-                result.accepted_total = len(final_items)
+                    if completeness_score(item) >= 3:
+                        result["detail_complete"] += 1
+                    else:
+                        result["detail_incomplete"] += 1
+                        logger.warning(
+                            "Incomplete lot skipped from notification: %s",
+                            item.get("stable_key"),
+                        )
+                    final_items.append(item)
 
-                known_hashes = read_known_hashes_from_state()
+                result["accepted_total"] = len(final_items)
+
+                local_seen = load_local_seen_keys()
+                permanent_seen: Set[str] = set()
                 try:
-                    known_hashes |= await asyncio.to_thread(
-                        load_known_hashes_from_sheet_sync
-                    )
+                    permanent_seen = await asyncio.to_thread(load_permanent_seen_keys_sync)
                 except Exception as exc:
-                    result.errors.append(f"sheet_hashes:{exc}")
+                    result["errors"].append(f"dedup_sheet:{exc}")
+                    logger.exception("Permanent dedup read failed")
 
+                all_seen = local_seen | permanent_seen
                 new_items = [
                     item for item in final_items
-                    if item["hash"] not in known_hashes
+                    if item["stable_key"] not in all_seen
+                    and completeness_score(item) >= 3
                 ]
-                result.new_total = len(new_items)
-                result.duplicates = len(final_items) - len(new_items)
 
+                result["new_total"] = len(new_items)
+                result["duplicates"] = len(final_items) - len(new_items)
+
+                # Save first. Telegram is sent only after Google Sheets accepted the rows.
                 if new_items:
                     try:
-                        result.sheets_saved = await asyncio.to_thread(
-                            append_items_to_sheet_sync,
+                        result["sheets_saved"] = await asyncio.to_thread(
+                            append_items_sync,
                             new_items,
                         )
                     except Exception as exc:
-                        result.errors.append(f"google_sheets:{exc}")
+                        result["errors"].append(f"google_sheets:{exc}")
                         logger.exception("Google Sheets save failed")
 
-                    for item in new_items:
-                        sent = await send_telegram_message(
-                            client,
-                            telegram_text(item),
+                    if result["sheets_saved"] == len(new_items):
+                        for item in new_items:
+                            try:
+                                if await send_telegram(client, item):
+                                    result["telegram_sent"] += 1
+                            except Exception as exc:
+                                result["errors"].append(
+                                    f"telegram:{item.get('stable_key')}:{exc}"
+                                )
+
+                        all_seen.update(item["stable_key"] for item in new_items)
+                        save_local_seen_keys(all_seen)
+                    else:
+                        result["errors"].append(
+                            "telegram_skipped:rows_not_confirmed_in_google_sheets"
                         )
-                        if sent:
-                            result.telegram_sent += 1
-                        await asyncio.sleep(0.15)
 
-                    known_hashes.update(item["hash"] for item in new_items)
-                    save_known_hashes_to_state(known_hashes)
-
-                result.status = "success" if not result.errors else "partial_success"
+                result["status"] = "success" if not result["errors"] else "partial_success"
 
         except asyncio.CancelledError:
-            result.status = "cancelled"
-            result.errors.append("scan_cancelled")
+            result["status"] = "cancelled"
+            result["errors"].append("scan_cancelled")
             raise
         except Exception as exc:
-            result.status = "error"
-            result.errors.append(str(exc))
-            logger.error("Scan failed: %s", traceback.format_exc())
+            result["status"] = "error"
+            result["errors"].append(str(exc))
+            logger.error("Scan failed:\n%s", traceback.format_exc())
         finally:
-            result.finished_at = pretty_now()
-            result.duration_seconds = round(time.monotonic() - start_monotonic, 2)
+            result["finished_at"] = pretty_now()
+            result["duration_seconds"] = round(time.monotonic() - started_mono, 2)
 
             with state_lock:
                 state.running = False
-                state.finished_at = result.finished_at
-                state.last_result = asdict(result)
-                state.last_error = "; ".join(result.errors) if result.errors else None
-                state.total_found += result.found_total
-                state.total_new += result.new_total
-                state.telegram_sent += result.telegram_sent
-                state.sheets_saved += result.sheets_saved
-                if result.status in {"success", "partial_success"}:
+                state.finished_at = result["finished_at"]
+                state.last_result = result
+                state.last_error = "; ".join(result["errors"]) if result["errors"] else None
+                state.total_found += result["found_total"]
+                state.total_accepted += result["accepted_total"]
+                state.total_new += result["new_total"]
+                state.total_duplicates += result["duplicates"]
+                state.telegram_sent += result["telegram_sent"]
+                state.sheets_saved += result["sheets_saved"]
+                if result["status"] in {"success", "partial_success"}:
                     state.successful_scans += 1
                 else:
                     state.failed_scans += 1
@@ -1167,16 +1196,12 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
 
             logger.info(
                 "Scan finished | status=%s found=%s accepted=%s new=%s duplicates=%s duration=%ss",
-                result.status,
-                result.found_total,
-                result.accepted_total,
-                result.new_total,
-                result.duplicates,
-                result.duration_seconds,
+                result["status"], result["found_total"], result["accepted_total"],
+                result["new_total"], result["duplicates"], result["duration_seconds"],
             )
             active_scan_task = None
 
-        return asdict(result)
+        return result
 
 
 async def run_scan_with_timeout(trigger: str) -> Dict[str, Any]:
@@ -1192,7 +1217,6 @@ async def run_scan_with_timeout(trigger: str) -> Dict[str, Any]:
             state.last_error = f"scan_timeout:{SCAN_TIMEOUT_SECONDS}s"
             state.failed_scans += 1
             save_state()
-        logger.error("Scan timed out after %s seconds", SCAN_TIMEOUT_SECONDS)
         return {
             "status": "timeout",
             "version": VERSION,
@@ -1209,10 +1233,7 @@ def start_scan_task(trigger: str) -> bool:
 
 
 async def scheduler_loop() -> None:
-    logger.info(
-        "Internal scheduler started | interval=%s minutes",
-        SCAN_INTERVAL_MINUTES,
-    )
+    logger.info("Scheduler started | interval=%s minutes", SCAN_INTERVAL_MINUTES)
     while True:
         try:
             next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
@@ -1222,26 +1243,10 @@ async def scheduler_loop() -> None:
 
             await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
 
-            if state.running and state.started_at:
-                try:
-                    started = datetime.strptime(
-                        state.started_at,
-                        "%d.%m.%Y %H:%M:%S",
-                    ).replace(tzinfo=TZ)
-                    if now_local() - started > timedelta(minutes=STUCK_SCAN_MINUTES):
-                        logger.warning("Stuck scan flag reset")
-                        with state_lock:
-                            state.running = False
-                            state.last_error = "stuck_scan_flag_reset"
-                            save_state()
-                except Exception:
-                    pass
-
             if not state.running:
                 start_scan_task("internal_scheduler")
             else:
-                logger.info("Scheduled scan skipped: another scan is running")
-
+                logger.info("Scheduled scan skipped: scan already running")
         except asyncio.CancelledError:
             logger.info("Scheduler stopped")
             raise
@@ -1255,7 +1260,6 @@ async def lifespan(app: FastAPI):
     global scheduler_task
     load_state()
     logger.info("%s starting", APP_NAME)
-
     scheduler_task = asyncio.create_task(scheduler_loop())
 
     if SCAN_ON_STARTUP:
@@ -1270,35 +1274,25 @@ async def lifespan(app: FastAPI):
             await scheduler_task
         except asyncio.CancelledError:
             pass
-
     if active_scan_task and not active_scan_task.done():
         active_scan_task.cancel()
-
     logger.info("%s stopped", APP_NAME)
 
 
-app = FastAPI(
-    title=APP_NAME,
-    version=VERSION,
-    lifespan=lifespan,
-)
+app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
 
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
-        "status": APP_NAME + " is running",
+        "status": f"{APP_NAME} is running",
         "version": VERSION,
         "running": state.running,
         "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
+        "deduplication": "Google Sheets Stable Key + ID + URL",
         "endpoints": [
-            "/health",
-            "/version",
-            "/scan",
-            "/scan_status",
-            "/metrics",
-            "/logs",
-            "/docs",
+            "/health", "/version", "/scan", "/scan_status",
+            "/metrics", "/logs", "/debug/uzex", "/debug/lot/{lot_id}", "/docs",
         ],
     }
 
@@ -1320,22 +1314,18 @@ async def health(deep: bool = Query(False)) -> Dict[str, Any]:
     }
     if not deep:
         return basic
-    detailed = await integration_health()
-    return {**basic, **detailed}
+    return {**basic, **(await integrations_health())}
 
 
-async def start_manual_scan() -> Dict[str, Any]:
-    started = start_scan_task("manual_http")
-
-    if not started:
+async def manual_scan_response() -> Dict[str, Any]:
+    if not start_scan_task("manual_http"):
         return {
             "status": "already_running",
             "version": VERSION,
             "running": True,
             "started_at": state.started_at,
-            "message": "Scan is already running. Check /scan_status.",
+            "message": "Scan already running. Check /scan_status.",
         }
-
     return {
         "status": "accepted",
         "version": VERSION,
@@ -1347,12 +1337,12 @@ async def start_manual_scan() -> Dict[str, Any]:
 
 @app.get("/scan", operation_id="scan_get")
 async def scan_get() -> Dict[str, Any]:
-    return await start_manual_scan()
+    return await manual_scan_response()
 
 
 @app.post("/scan", operation_id="scan_post")
 async def scan_post() -> Dict[str, Any]:
-    return await start_manual_scan()
+    return await manual_scan_response()
 
 
 @app.get("/scan_status")
@@ -1374,43 +1364,40 @@ async def scan_status() -> Dict[str, Any]:
 @app.get("/metrics")
 async def metrics() -> Dict[str, Any]:
     uptime = now_local() - datetime.fromisoformat(state.app_started_at)
-    with state_lock:
-        return {
-            "version": VERSION,
-            "uptime_seconds": int(uptime.total_seconds()),
-            "running": state.running,
-            "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
-            "scan_timeout_seconds": SCAN_TIMEOUT_SECONDS,
-            "scan_count": state.scan_count,
-            "successful_scans": state.successful_scans,
-            "failed_scans": state.failed_scans,
-            "success_rate_percent": round(
-                (state.successful_scans / state.scan_count * 100)
-                if state.scan_count else 0,
-                2,
-            ),
-            "total_found": state.total_found,
-            "total_new": state.total_new,
-            "telegram_sent": state.telegram_sent,
-            "sheets_saved": state.sheets_saved,
-            "last_started_at": state.started_at,
-            "last_finished_at": state.finished_at,
-            "next_scheduled_run": state.next_scheduled_run,
-            "last_error": state.last_error,
-        }
+    return {
+        "version": VERSION,
+        "uptime_seconds": int(uptime.total_seconds()),
+        "running": state.running,
+        "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
+        "scan_count": state.scan_count,
+        "successful_scans": state.successful_scans,
+        "failed_scans": state.failed_scans,
+        "total_found": state.total_found,
+        "total_accepted": state.total_accepted,
+        "total_new": state.total_new,
+        "total_duplicates": state.total_duplicates,
+        "telegram_sent": state.telegram_sent,
+        "sheets_saved": state.sheets_saved,
+        "last_started_at": state.started_at,
+        "last_finished_at": state.finished_at,
+        "next_scheduled_run": state.next_scheduled_run,
+        "last_error": state.last_error,
+    }
 
 
 @app.get("/metrics/prometheus", response_class=PlainTextResponse)
-async def prometheus_metrics() -> str:
+async def prometheus() -> str:
     return "\n".join([
-        f'cargo_scan_running {1 if state.running else 0}',
-        f'cargo_scan_count_total {state.scan_count}',
-        f'cargo_scan_success_total {state.successful_scans}',
-        f'cargo_scan_failed_total {state.failed_scans}',
-        f'cargo_tenders_found_total {state.total_found}',
-        f'cargo_tenders_new_total {state.total_new}',
-        f'cargo_telegram_sent_total {state.telegram_sent}',
-        f'cargo_sheets_saved_total {state.sheets_saved}',
+        f"cargo_scan_running {1 if state.running else 0}",
+        f"cargo_scan_count_total {state.scan_count}",
+        f"cargo_scan_success_total {state.successful_scans}",
+        f"cargo_scan_failed_total {state.failed_scans}",
+        f"cargo_tenders_found_total {state.total_found}",
+        f"cargo_tenders_accepted_total {state.total_accepted}",
+        f"cargo_tenders_new_total {state.total_new}",
+        f"cargo_tenders_duplicates_total {state.total_duplicates}",
+        f"cargo_telegram_sent_total {state.telegram_sent}",
+        f"cargo_sheets_saved_total {state.sheets_saved}",
         "",
     ])
 
@@ -1418,47 +1405,85 @@ async def prometheus_metrics() -> str:
 @app.get("/logs")
 async def logs(limit: int = Query(100, ge=1, le=500)) -> Dict[str, Any]:
     records = list(ring_handler.records)[-limit:]
-    return {
-        "version": VERSION,
-        "count": len(records),
-        "logs": records,
-    }
+    return {"version": VERSION, "count": len(records), "logs": records}
 
 
 @app.get("/debug/uzex")
 async def debug_uzex(limit: int = Query(10, ge=1, le=100)) -> Dict[str, Any]:
     timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        rows = await fetch_uzex_list(client)
+        rows = await fetch_trade_list(client)
 
-    parsed = []
+    items = []
     for raw in rows[:limit]:
         item = parse_trade(raw)
-        accepted, reason = is_logistics_tender(
-            item["title"],
-            item["description"],
-            item["category"],
+        accepted, reason = detect_logistics(
+            item["title"], item["description"], item["category"]
         )
         item["accepted"] = accepted
         item["filter_reason"] = reason
         item.pop("raw", None)
-        parsed.append(item)
+        items.append(item)
+    return {"version": VERSION, "count": len(items), "items": items}
 
-    return {
-        "version": VERSION,
-        "count": len(parsed),
-        "items": parsed,
-    }
+
+@app.get("/debug/lot/{lot_id}")
+async def debug_lot(lot_id: int) -> Dict[str, Any]:
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        seed = {
+            "source": "UZEX",
+            "lot_id": str(lot_id),
+            "lot_no": str(lot_id),
+            "title": "",
+            "customer": "",
+            "amount": "",
+            "currency": "UZS",
+            "start_date": "",
+            "end_date": "",
+            "category": "",
+            "description": "",
+            "payment": "",
+            "payment_days": "",
+            "delivery_days": "",
+            "routes": [],
+            "transport_types": [],
+            "documents": [],
+            "url": f"{UZEX_SITE_BASE}/lot/{lot_id}",
+            "raw": {"id": lot_id},
+            "stable_key": f"uzex:{lot_id}",
+        }
+        item = await fetch_trade_detail(client, seed)
+        accepted, reason = detect_logistics(
+            item["title"], item["description"], item["category"]
+        )
+        item["accepted"] = accepted
+        item["filter_reason"] = reason
+        item["completeness_score"] = completeness_score(item)
+        item["ai_score"] = ai_score(item)
+        item.pop("raw", None)
+        return {"version": VERSION, "item": item}
+
+
+@app.post("/admin/rebuild_dedup_cache")
+async def rebuild_dedup_cache() -> Dict[str, Any]:
+    try:
+        keys = await asyncio.to_thread(load_permanent_seen_keys_sync)
+        save_local_seen_keys(keys)
+        return {
+            "status": "ok",
+            "version": VERSION,
+            "keys_loaded": len(keys),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/admin/reset_stuck_scan")
 async def reset_stuck_scan() -> Dict[str, Any]:
+    if active_scan_task and not active_scan_task.done():
+        raise HTTPException(status_code=409, detail="Active scan task is still running")
     with state_lock:
-        if active_scan_task and not active_scan_task.done():
-            raise HTTPException(
-                status_code=409,
-                detail="Active scan task is still running",
-            )
         state.running = False
         state.started_at = None
         state.last_error = "manual_stuck_flag_reset"
@@ -1471,17 +1496,12 @@ async def unhandled_exception_handler(request, exc: Exception):
     logger.exception("Unhandled request error")
     return JSONResponse(
         status_code=500,
-        content={
-            "status": "error",
-            "version": VERSION,
-            "detail": str(exc),
-        },
+        content={"status": "error", "version": VERSION, "detail": str(exc)},
     )
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(
         "main_v2:app",
         host="0.0.0.0",
