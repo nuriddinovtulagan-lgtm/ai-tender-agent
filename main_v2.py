@@ -57,8 +57,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v32_enterprise_ai"
-APP_NAME = "AI Tender Agent Cargo V32 Enterprise AI"
+VERSION = "cargo_v32_1_parser_accuracy"
+APP_NAME = "AI Tender Agent Cargo V32.1 Parser Accuracy"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -123,6 +123,85 @@ STRONG_REJECT = [
     "шины", "аккумулятор", "ehtiyot qismlar",
     "avtomobil sotib olish",
 ]
+
+
+ROUTE_EXCLUDE_PHRASES = [
+    "банкрот", "банкротлик", "солиқ", "налог", "миб",
+    "инсофсиз", "реестр", "квалифика", "талаб",
+    "шартномани бажариш", "жорий этилган",
+    "мавжуд эмаслиги", "таомил",
+]
+
+DOCUMENT_NOISE = {
+    "pdf", "docx", "doc", "xls", "xlsx", "fayl", "file",
+    "документ", "document", "attachment",
+}
+
+
+def clean_title(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def extract_best_title(raw: Dict[str, Any]) -> str:
+    candidates: List[str] = []
+    for obj in flatten_dicts(raw):
+        for key in (
+            "trade_name", "tradeName", "TradeName", "name", "Name",
+            "nameRu", "NameRu", "title", "Title", "titleRu",
+            "lotName", "lot_name", "subject", "Subject",
+        ):
+            value = obj.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+
+    scored: List[Tuple[int, int, str]] = []
+    for value in candidates:
+        title = clean_title(value)
+        if len(title) < 12:
+            continue
+        text = normalize_text(title)
+        score = 0
+        if any(phrase in text for phrase in ACCEPT_PHRASES):
+            score += 100
+        if 25 <= len(title) <= 300:
+            score += 20
+        if not any(phrase in text for phrase in ROUTE_EXCLUDE_PHRASES):
+            score += 10
+        scored.append((score, len(title), title))
+
+    if not scored:
+        return ""
+    scored.sort(reverse=True)
+    return scored[0][2]
+
+
+def extract_category(raw: Dict[str, Any]) -> str:
+    candidates: List[str] = []
+    for obj in flatten_dicts(raw):
+        for key in (
+            "category_name", "categoryName", "CategoryName",
+            "classifier_name", "classifierName",
+            "classificationName", "productCategoryName",
+            "budget_product_name", "budgetProductName",
+        ):
+            value = obj.get(key)
+            if isinstance(value, str) and len(value.strip()) > 5:
+                candidates.append(clean_title(value))
+    return candidates[0] if candidates else ""
+
+
+def is_route_candidate(text: str) -> bool:
+    normalized = normalize_text(text)
+    if len(normalized) < 12:
+        return False
+    if any(phrase in normalized for phrase in ROUTE_EXCLUDE_PHRASES):
+        return False
+    signals = (
+        " sh.dan ", " dan ", "дан ", " из ", " до ", " ga ",
+        "га ", "yetkazib berish", "достав", "маршрут",
+    )
+    return any(signal in f" {normalized} " for signal in signals)
+
 
 SHEET_HEADERS = [
     "ID", "Источник", "Номер лота", "Название", "Заказчик",
@@ -388,47 +467,88 @@ def extract_lot_identity(raw: Dict[str, Any]) -> Tuple[str, str]:
 
 def extract_documents(raw: Dict[str, Any]) -> List[Dict[str, str]]:
     docs: List[Dict[str, str]] = []
-    seen: Set[str] = set()
-    file_keys = (
-        "tech_file", "tech_doc_file", "additional_file",
-        "contract_proform_file", "contract_file",
-        "expertise_file", "file", "document", "attachment",
-    )
+    seen_names: Set[str] = set()
+    seen_urls: Set[str] = set()
+
+    def canonical_url(url: Any) -> str:
+        value = str(url or "").strip()
+        if not value:
+            return ""
+        if not value.startswith("http"):
+            value = urljoin(UZEX_API_BASE + "/", value.lstrip("/"))
+        return value
 
     def add_doc(name: Any, url: Any) -> None:
+        url_s = canonical_url(url)
         name_s = str(name or "").strip()
-        url_s = str(url or "").strip()
-        if not name_s and not url_s:
+        if not name_s and url_s:
+            name_s = url_s.rsplit("/", 1)[-1]
+
+        real_name = name_s.rsplit("/", 1)[-1].strip()
+        name_key = normalize_text(real_name)
+        if not real_name or name_key in DOCUMENT_NOISE:
             return
-        if url_s and not url_s.startswith("http"):
-            url_s = urljoin(UZEX_API_BASE + "/", url_s.lstrip("/"))
-        marker = url_s or name_s
-        if marker in seen:
+        if "." not in real_name and not re.search(r"\.(pdf|docx?|xlsx?)$", url_s, re.I):
             return
-        seen.add(marker)
-        docs.append({"name": name_s or url_s.rsplit("/", 1)[-1], "url": url_s})
+        if url_s.rstrip("/").rsplit("/", 1)[-1].lower() in DOCUMENT_NOISE:
+            return
+        if url_s and url_s in seen_urls:
+            return
+        if real_name.lower() in seen_names and not url_s:
+            return
+
+        seen_names.add(real_name.lower())
+        if url_s:
+            seen_urls.add(url_s)
+        docs.append({"name": real_name, "url": url_s})
+
+    tokens = (
+        "tech_file", "tech_doc_file", "additional_file",
+        "contract_proform_file", "contract_file",
+        "expertise_file", "attachment", "document_file",
+    )
 
     for obj in flatten_dicts(raw):
         for key, value in obj.items():
-            key_l = str(key).lower()
-            if any(token in key_l for token in file_keys):
-                if isinstance(value, str):
-                    add_doc(value.rsplit("/", 1)[-1], value)
-                elif isinstance(value, dict):
-                    add_doc(
-                        first_nonempty(value.get("name"), value.get("fileName"), value.get("filename")),
-                        first_nonempty(value.get("url"), value.get("path"), value.get("filePath")),
-                    )
-                elif isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, str):
-                            add_doc(item.rsplit("/", 1)[-1], item)
-                        elif isinstance(item, dict):
-                            add_doc(
-                                first_nonempty(item.get("name"), item.get("fileName"), item.get("filename")),
-                                first_nonempty(item.get("url"), item.get("path"), item.get("filePath")),
-                            )
-    return docs
+            if not any(token in str(key).lower() for token in tokens):
+                continue
+            if isinstance(value, str):
+                add_doc(value.rsplit("/", 1)[-1], value)
+            elif isinstance(value, dict):
+                add_doc(
+                    first_nonempty(
+                        value.get("name"), value.get("fileName"),
+                        value.get("filename"), value.get("originalName"),
+                    ),
+                    first_nonempty(
+                        value.get("url"), value.get("path"),
+                        value.get("filePath"), value.get("downloadUrl"),
+                    ),
+                )
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str):
+                        add_doc(item.rsplit("/", 1)[-1], item)
+                    elif isinstance(item, dict):
+                        add_doc(
+                            first_nonempty(
+                                item.get("name"), item.get("fileName"),
+                                item.get("filename"), item.get("originalName"),
+                            ),
+                            first_nonempty(
+                                item.get("url"), item.get("path"),
+                                item.get("filePath"), item.get("downloadUrl"),
+                            ),
+                        )
+
+    best: Dict[str, Dict[str, str]] = {}
+    for doc in docs:
+        key = doc["name"].lower()
+        current = best.get(key)
+        if current is None or len(doc.get("url", "")) > len(current.get("url", "")):
+            best[key] = doc
+    return list(best.values())
+
 
 
 def extract_product_texts(raw: Dict[str, Any]) -> List[str]:
@@ -450,26 +570,37 @@ def extract_routes(texts: Sequence[str]) -> List[str]:
     seen: Set[str] = set()
 
     patterns = [
-        r"(?P<from>[^.;\n]{3,80}?)\s+(?:dan|дан|из)\s+(?P<to>[^.;\n]{3,100}?)\s+(?:ga|га|до|в)\b",
-        r"(?P<from>[A-ZА-ЯЁЎҚҒҲ][^.;\n]{2,60})\s*[–—-]\s*(?P<to>[A-ZА-ЯЁЎҚҒҲ][^.;\n]{2,60})",
+        r"(?P<from>[A-ZА-ЯЁЎҚҒҲO‘ʻ'][^.;\n]{2,80}?)\s+(?:sh\.dan|дан|dan|из)\s+(?P<to>[A-ZА-ЯЁЎҚҒҲO‘ʻ'][^.;\n]{2,100}?)(?:\s+(?:sh\.ga|ga|га|до|в)\b|[,.;])",
+        r"(?P<from>[A-ZА-ЯЁЎҚҒҲO‘ʻ'][^.;\n]{2,60})\s*[–—-]\s*(?P<to>[A-ZА-ЯЁЎҚҒҲO‘ʻ'][^.;\n]{2,60})",
     ]
 
     for text in texts:
-        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = clean_title(text)
+        if not is_route_candidate(cleaned):
+            continue
+
+        found_here = False
         for pattern in patterns:
             for match in re.finditer(pattern, cleaned, flags=re.IGNORECASE):
-                route = f"{match.group('from').strip()} → {match.group('to').strip()}"
-                route = route[:220]
+                origin = match.group("from").strip(" ,.;:-")
+                destination = match.group("to").strip(" ,.;:-")
+                route = f"{origin} → {destination}"
+                if any(p in normalize_text(route) for p in ROUTE_EXCLUDE_PHRASES):
+                    continue
+                if len(origin) < 2 or len(destination) < 2:
+                    continue
                 if route not in seen:
                     seen.add(route)
-                    routes.append(route)
+                    routes.append(route[:240])
+                    found_here = True
 
-        if not routes and any(token in normalize_text(cleaned) for token in ("sh.dan", "дан", "га yetkazib", "yetkazib berish")):
+        if not found_here and "yetkazib berish" in normalize_text(cleaned):
             if cleaned not in seen:
                 seen.add(cleaned)
-                routes.append(cleaned[:300])
+                routes.append(cleaned[:320])
 
     return routes[:20]
+
 
 
 def infer_transport(text: str) -> List[str]:
@@ -493,12 +624,8 @@ def infer_transport(text: str) -> List[str]:
 
 def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
     lot_id, lot_no = extract_lot_identity(raw)
+    title = extract_best_title(raw)
 
-    title = first_nonempty(
-        deep_get(raw, "name", "Name", "nameRu", "NameRu"),
-        deep_get(raw, "title", "Title", "titleRu"),
-        deep_get(raw, "trade_name", "tradeName", "lotName"),
-    )
     customer = first_nonempty(
         deep_get(raw, "customer_name", "customerName", "CustomerName"),
         deep_get(raw, "organization_name", "organizationName"),
@@ -534,23 +661,34 @@ def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
     delivery_days = first_nonempty(
         deep_get(raw, "delivery_term_days", "deliveryTermDays", "termDays"),
     )
-    category = first_nonempty(
-        deep_get(raw, "category_name", "categoryName", "CategoryName"),
-        deep_get(raw, "classifier_name", "classifierName"),
-        deep_get(raw, "category.name"),
-    )
-    description = first_nonempty(
-        deep_get(raw, "description", "Description", "descriptionRu"),
-        deep_get(raw, "technical_description", "technicalDescription"),
-    )
+    category = extract_category(raw)
 
     product_texts = extract_product_texts(raw)
-    if not description and product_texts:
-        description = "\n".join(product_texts[:10])
+    description = ""
+    for value in [
+        deep_get(raw, "description", "Description", "descriptionRu"),
+        deep_get(raw, "technical_description", "technicalDescription"),
+        *product_texts,
+    ]:
+        candidate = clean_title(value)
+        if len(candidate) >= 10 and not any(
+            p in normalize_text(candidate) for p in ROUTE_EXCLUDE_PHRASES
+        ):
+            description = candidate
+            break
 
     documents = extract_documents(raw)
-    routes = extract_routes(product_texts + [str(description or "")])
-    transport_types = infer_transport(" ".join(product_texts + [str(title), str(description)]))
+    routes = extract_routes([t for t in product_texts if is_route_candidate(t)])
+
+    combined = " ".join([title, description] + product_texts)
+    transport_types = infer_transport(combined)
+    if any(token in normalize_text(combined) for token in (
+        "qishloq xo'jaligi texnika", "qishloq xo‘jaligi texnika",
+        "трактор", "сельскохозяйственной техник",
+    )):
+        for name in ("Трал/низкорамный транспорт", "Тентованная фура"):
+            if name not in transport_types:
+                transport_types.append(name)
 
     url = first_nonempty(deep_get(raw, "url", "Url", "link", "Link"))
     if not url and lot_id:
@@ -560,7 +698,7 @@ def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
         "source": "UZEX",
         "lot_id": lot_id,
         "lot_no": lot_no,
-        "title": str(title or "").strip(),
+        "title": title,
         "customer": str(customer or "").strip(),
         "amount": safe_number(amount),
         "currency": str(currency or "UZS"),
@@ -581,12 +719,21 @@ def parse_trade(raw: Dict[str, Any]) -> Dict[str, Any]:
     return item
 
 
+
 def completeness_score(item: Dict[str, Any]) -> int:
     important = ("title", "customer", "amount", "end_date", "category", "description")
     return sum(1 for key in important if item.get(key))
 
 
 def ai_score(item: Dict[str, Any]) -> int:
+    accepted, _ = detect_logistics(
+        item.get("title", ""),
+        item.get("description", ""),
+        item.get("category", ""),
+    )
+    if not accepted:
+        return 0
+
     score = 35
     text = normalize_text(" ".join([
         item.get("title", ""), item.get("description", ""), item.get("category", "")
@@ -598,6 +745,7 @@ def ai_score(item: Dict[str, Any]) -> int:
     if item.get("documents"): score += 10
     if "международ" in text or "xalqaro" in text: score += 10
     return min(score, 100)
+
 
 
 def priority(score: int) -> str:
@@ -747,10 +895,32 @@ async def fetch_trade_detail(
             merged_raw = deep_merge(list_item.get("raw") or {}, detail)
             merged = parse_trade(merged_raw)
 
-            # Preserve every populated TradeList value when detail is incomplete.
-            for key, value in list_item.items():
+            for key in (
+                "title", "customer", "amount", "currency",
+                "start_date", "end_date", "category", "url", "lot_no",
+            ):
                 if merged.get(key) in (None, "", [], {}):
-                    merged[key] = value
+                    merged[key] = list_item.get(key)
+
+            list_title = str(list_item.get("title") or "")
+            merged_title = str(merged.get("title") or "")
+            list_is_logistics = any(p in normalize_text(list_title) for p in ACCEPT_PHRASES)
+            merged_is_logistics = any(p in normalize_text(merged_title) for p in ACCEPT_PHRASES)
+            if list_is_logistics and not merged_is_logistics:
+                merged["title"] = list_title
+
+            merged["routes"] = merge_value(
+                list_item.get("routes") or [],
+                merged.get("routes") or [],
+            )
+            merged["documents"] = merge_value(
+                list_item.get("documents") or [],
+                merged.get("documents") or [],
+            )
+            merged["transport_types"] = merge_value(
+                list_item.get("transport_types") or [],
+                merged.get("transport_types") or [],
+            )
 
             merged["raw"] = merged_raw
             merged["stable_key"] = stable_key(merged)
@@ -762,6 +932,7 @@ async def fetch_trade_detail(
 
     logger.warning("GetTrade failed for %s: %s", lot_id, last_error)
     return list_item
+
 
 
 def column_letter(number: int) -> str:
