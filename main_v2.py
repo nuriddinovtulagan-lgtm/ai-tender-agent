@@ -57,8 +57,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v32_1_parser_accuracy"
-APP_NAME = "AI Tender Agent Cargo V32.1 Parser Accuracy"
+VERSION = "cargo_v33_enterprise_production"
+APP_NAME = "AI Tender Agent Cargo V33 Enterprise Production"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -94,8 +94,8 @@ UZEX_GET_TRADE_URL = os.getenv(
 UZEX_TYPE_ID = int(os.getenv("UZEX_TYPE_ID", "1"))
 UZEX_SYSTEM_ID = int(os.getenv("UZEX_SYSTEM_ID", "0"))
 
-SCAN_INTERVAL_MINUTES = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
-SCAN_ON_STARTUP = os.getenv("SCAN_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
+WARMUP_SECONDS = max(0, int(os.getenv("WARMUP_SECONDS", "45")))
+SCAN_ON_STARTUP = os.getenv("SCAN_ON_STARTUP", "false").lower() in {"1", "true", "yes", "on"}
 UZEX_PAGE_SIZE = max(20, int(os.getenv("UZEX_PAGE_SIZE", "100")))
 MAX_PAGES = max(1, int(os.getenv("MAX_PAGES", "5")))
 REQUEST_TIMEOUT_SECONDS = max(5, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")))
@@ -227,6 +227,18 @@ def iso_now() -> str:
     return now_local().isoformat(timespec="seconds")
 
 
+def app_uptime_seconds() -> int:
+    try:
+        started = datetime.fromisoformat(state.app_started_at)
+        return max(0, int((now_local() - started).total_seconds()))
+    except Exception:
+        return 0
+
+
+def is_warming_up() -> bool:
+    return app_uptime_seconds() < WARMUP_SECONDS
+
+
 class RingBufferHandler(logging.Handler):
     def __init__(self, capacity: int = 500):
         super().__init__()
@@ -286,7 +298,6 @@ class RuntimeState:
 state = RuntimeState()
 state_lock = threading.RLock()
 scan_lock = asyncio.Lock()
-scheduler_task: Optional[asyncio.Task] = None
 active_scan_task: Optional[asyncio.Task] = None
 
 
@@ -1403,48 +1414,19 @@ def start_scan_task(trigger: str) -> bool:
     return True
 
 
-async def scheduler_loop() -> None:
-    logger.info("Scheduler started | interval=%s minutes", SCAN_INTERVAL_MINUTES)
-    while True:
-        try:
-            next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
-            with state_lock:
-                state.next_scheduled_run = next_run.isoformat(timespec="seconds")
-                save_state()
-
-            await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
-
-            if not state.running:
-                start_scan_task("internal_scheduler")
-            else:
-                logger.info("Scheduled scan skipped: scan already running")
-        except asyncio.CancelledError:
-            logger.info("Scheduler stopped")
-            raise
-        except Exception:
-            logger.exception("Scheduler loop error")
-            await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global scheduler_task
     load_state()
     logger.info("%s starting", APP_NAME)
-    scheduler_task = asyncio.create_task(scheduler_loop())
 
     if SCAN_ON_STARTUP:
-        await asyncio.sleep(3)
+        await asyncio.sleep(min(3, WARMUP_SECONDS))
         start_scan_task("startup")
 
     yield
 
-    if scheduler_task:
-        scheduler_task.cancel()
-        try:
-            await scheduler_task
-        except asyncio.CancelledError:
-            pass
     if active_scan_task and not active_scan_task.done():
         active_scan_task.cancel()
     logger.info("%s stopped", APP_NAME)
@@ -1459,11 +1441,14 @@ async def root() -> Dict[str, Any]:
         "status": f"{APP_NAME} is running",
         "version": VERSION,
         "running": state.running,
-        "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
+        "warming_up": is_warming_up(),
+        "warmup_seconds": WARMUP_SECONDS,
+        "trigger_mode": "external_cron_only",
         "deduplication": "Google Sheets Stable Key + ID + URL",
         "endpoints": [
-            "/health", "/version", "/scan", "/scan_status",
-            "/metrics", "/logs", "/debug/uzex", "/debug/lot/{lot_id}", "/docs",
+            "/health", "/health/production", "/version", "/scan",
+            "/scan_status", "/metrics", "/logs", "/debug/uzex",
+            "/debug/lot/{lot_id}", "/admin/rebuild_dedup_cache", "/docs",
         ],
     }
 
@@ -1488,8 +1473,55 @@ async def health(deep: bool = Query(False)) -> Dict[str, Any]:
     return {**basic, **(await integrations_health())}
 
 
+@app.get("/health/production")
+async def health_production() -> Dict[str, Any]:
+    deep = await integrations_health()
+    status = "ok"
+    if deep.get("errors") or state.last_error:
+        status = "degraded"
+
+    return {
+        "status": status,
+        "version": VERSION,
+        "service": APP_NAME,
+        "trigger_mode": "external_cron_only",
+        "uptime_seconds": app_uptime_seconds(),
+        "warming_up": is_warming_up(),
+        "warmup_seconds": WARMUP_SECONDS,
+        "running": state.running,
+        "last_trigger": state.last_trigger,
+        "last_started_at": state.started_at,
+        "last_finished_at": state.finished_at,
+        "last_result_status": (
+            state.last_result.get("status")
+            if isinstance(state.last_result, dict)
+            else None
+        ),
+        "last_error": state.last_error,
+        "scan_count": state.scan_count,
+        "successful_scans": state.successful_scans,
+        "failed_scans": state.failed_scans,
+        "telegram": deep.get("telegram"),
+        "google_sheets": deep.get("google_sheets"),
+        "uzex_trade_list": deep.get("uzex_trade_list"),
+        "uzex_get_trade": deep.get("uzex_get_trade"),
+        "errors": deep.get("errors", []),
+        "time": pretty_now(),
+    }
+
+
 async def manual_scan_response() -> Dict[str, Any]:
-    if not start_scan_task("manual_http"):
+    if is_warming_up():
+        return {
+            "status": "warming_up",
+            "version": VERSION,
+            "running": False,
+            "uptime_seconds": app_uptime_seconds(),
+            "retry_after_seconds": max(0, WARMUP_SECONDS - app_uptime_seconds()),
+            "message": "Service is warming up. Retry later.",
+        }
+
+    if not start_scan_task("cron_http"):
         return {
             "status": "already_running",
             "version": VERSION,
@@ -1497,6 +1529,7 @@ async def manual_scan_response() -> Dict[str, Any]:
             "started_at": state.started_at,
             "message": "Scan already running. Check /scan_status.",
         }
+
     return {
         "status": "accepted",
         "version": VERSION,
@@ -1523,26 +1556,34 @@ async def scan_status() -> Dict[str, Any]:
             "status": "ok",
             "version": VERSION,
             "running": state.running,
+            "warming_up": is_warming_up(),
             "started_at": state.started_at,
             "finished_at": state.finished_at,
             "last_trigger": state.last_trigger,
             "last_result": state.last_result,
             "last_error": state.last_error,
-            "next_scheduled_run": state.next_scheduled_run,
+            "trigger_mode": "external_cron_only",
+            "next_scheduled_run": None,
         }
 
 
 @app.get("/metrics")
 async def metrics() -> Dict[str, Any]:
-    uptime = now_local() - datetime.fromisoformat(state.app_started_at)
     return {
         "version": VERSION,
-        "uptime_seconds": int(uptime.total_seconds()),
+        "uptime_seconds": app_uptime_seconds(),
         "running": state.running,
-        "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
+        "warming_up": is_warming_up(),
+        "warmup_seconds": WARMUP_SECONDS,
+        "trigger_mode": "external_cron_only",
         "scan_count": state.scan_count,
         "successful_scans": state.successful_scans,
         "failed_scans": state.failed_scans,
+        "success_rate_percent": round(
+            (state.successful_scans / state.scan_count * 100)
+            if state.scan_count else 0,
+            2,
+        ),
         "total_found": state.total_found,
         "total_accepted": state.total_accepted,
         "total_new": state.total_new,
@@ -1551,7 +1592,6 @@ async def metrics() -> Dict[str, Any]:
         "sheets_saved": state.sheets_saved,
         "last_started_at": state.started_at,
         "last_finished_at": state.finished_at,
-        "next_scheduled_run": state.next_scheduled_run,
         "last_error": state.last_error,
     }
 
