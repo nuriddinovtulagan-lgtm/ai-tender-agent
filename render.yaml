@@ -15,11 +15,13 @@ services:
       - key: SCAN_ON_STARTUP
         value: "true"
       - key: REQUEST_TIMEOUT_SECONDS
-        value: "25"
+        value: "30"
       - key: SCAN_TIMEOUT_SECONDS
-        value: "240"
-      - key: STUCK_SCAN_MINUTES
-        value: "10"
+        value: "300"
+      - key: DETAIL_CONCURRENCY
+        value: "6"
+      - key: DETAIL_RETRIES
+        value: "3"
       - key: UZEX_API_BASE
         value: "https://apietender.uzex.uz"
       - key: UZEX_TYPE_ID
