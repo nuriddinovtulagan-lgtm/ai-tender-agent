@@ -10,10 +10,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.3
-      - key: SCAN_INTERVAL_MINUTES
-        value: "30"
+      - key: WARMUP_SECONDS
+        value: "45"
       - key: SCAN_ON_STARTUP
-        value: "true"
+        value: "false"
       - key: REQUEST_TIMEOUT_SECONDS
         value: "30"
       - key: SCAN_TIMEOUT_SECONDS
