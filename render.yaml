@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main_v2:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -20,3 +20,9 @@ services:
         value: "240"
       - key: STUCK_SCAN_MINUTES
         value: "10"
+      - key: UZEX_API_BASE
+        value: "https://apietender.uzex.uz"
+      - key: UZEX_TYPE_ID
+        value: "1"
+      - key: UZEX_SYSTEM_ID
+        value: "0"
