@@ -57,8 +57,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v33_enterprise_production"
-APP_NAME = "AI Tender Agent Cargo V33 Enterprise Production"
+VERSION = "cargo_v34_tender_follow_up"
+APP_NAME = "AI Tender Agent Cargo V34 Tender Follow-up"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -103,6 +103,17 @@ SCAN_TIMEOUT_SECONDS = max(60, int(os.getenv("SCAN_TIMEOUT_SECONDS", "300")))
 DETAIL_CONCURRENCY = max(1, min(12, int(os.getenv("DETAIL_CONCURRENCY", "6"))))
 DETAIL_RETRIES = max(1, min(5, int(os.getenv("DETAIL_RETRIES", "3"))))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+REMINDER_WORKSHEET_NAME = os.getenv("REMINDER_WORKSHEET_NAME", "Системные данные").strip()
+MORNING_REMINDER_HOUR = int(os.getenv("MORNING_REMINDER_HOUR", "9"))
+EVENING_REMINDER_HOUR = int(os.getenv("EVENING_REMINDER_HOUR", "17"))
+REMINDER_WINDOW_MINUTES = max(30, int(os.getenv("REMINDER_WINDOW_MINUTES", "90")))
+DEADLINE_ALERT_DAYS = [
+    int(value.strip())
+    for value in os.getenv("DEADLINE_ALERT_DAYS", "7,3,1,0").split(",")
+    if value.strip().lstrip("-").isdigit()
+]
+MAX_DIGEST_ITEMS = max(5, int(os.getenv("MAX_DIGEST_ITEMS", "20")))
 
 ACCEPT_PHRASES = [
     "перевозка груз", "грузоперевоз", "транспортные услуги",
@@ -801,6 +812,290 @@ def responsible_tasks() -> str:
     )
 
 
+
+def parse_deadline(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    cleaned = text.replace("Z", "").split("+")[0]
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M",
+        "%Y-%m-%d", "%d.%m.%Y",
+    ):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=TZ)
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=TZ)
+        return parsed.astimezone(TZ)
+    except Exception:
+        return None
+
+
+def format_amount(value: Any) -> str:
+    if value in (None, ""):
+        return "не указана"
+    try:
+        number = float(str(value).replace(" ", "").replace(",", "."))
+        return f"{number:,.0f}".replace(",", " ")
+    except Exception:
+        return str(value)
+
+
+def reminder_window_open(target_hour: int) -> bool:
+    now = now_local()
+    target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+    delta_minutes = (now - target).total_seconds() / 60
+    return 0 <= delta_minutes <= REMINDER_WINDOW_MINUTES
+
+
+def get_or_create_reminder_worksheet():
+    client = get_gspread_client()
+    if client is None:
+        return None
+    spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        worksheet = spreadsheet.worksheet(REMINDER_WORKSHEET_NAME)
+    except Exception:
+        worksheet = spreadsheet.add_worksheet(
+            title=REMINDER_WORKSHEET_NAME,
+            rows=2000,
+            cols=4,
+        )
+        worksheet.append_row(
+            ["Ключ", "Значение", "Дата обновления", "Описание"],
+            value_input_option="USER_ENTERED",
+        )
+    return worksheet
+
+
+def load_reminder_registry_sync() -> Dict[str, str]:
+    worksheet = get_or_create_reminder_worksheet()
+    if worksheet is None:
+        return {}
+    values = worksheet.get_all_values()
+    registry: Dict[str, str] = {}
+    for row in values[1:]:
+        key = row[0].strip() if len(row) > 0 else ""
+        value = row[1].strip() if len(row) > 1 else ""
+        if key:
+            registry[key] = value
+    return registry
+
+
+def save_reminder_registry_entry_sync(key: str, value: str, description: str) -> None:
+    worksheet = get_or_create_reminder_worksheet()
+    if worksheet is None:
+        return
+    values = worksheet.get_all_values()
+    for row_number, row in enumerate(values[1:], start=2):
+        if row and row[0].strip() == key:
+            worksheet.update(
+                range_name=f"A{row_number}:D{row_number}",
+                values=[[key, value, pretty_now(), description]],
+            )
+            return
+    worksheet.append_row(
+        [key, value, pretty_now(), description],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def load_active_tenders_sync() -> List[Dict[str, Any]]:
+    worksheet = open_worksheet()
+    if worksheet is None:
+        return []
+    values = worksheet.get_all_values()
+    if not values:
+        return []
+
+    headers = values[0]
+    index = {header: i for i, header in enumerate(headers)}
+
+    def cell(row: List[str], *names: str) -> str:
+        for name in names:
+            position = index.get(name)
+            if position is not None and position < len(row):
+                value = row[position].strip()
+                if value:
+                    return value
+        return ""
+
+    active: List[Dict[str, Any]] = []
+    now = now_local()
+
+    for row_number, row in enumerate(values[1:], start=2):
+        status = normalize_text(cell(row, "Статус"))
+        if any(token in status for token in ("заверш", "закрыт", "отказ", "архив", "проигран")):
+            continue
+
+        deadline_raw = cell(row, "Срок окончания", "Окончание")
+        deadline = parse_deadline(deadline_raw)
+        if deadline is None or deadline < now - timedelta(hours=12):
+            continue
+
+        lot_id = cell(row, "ID", "Номер лота")
+        url = cell(row, "Ссылка")
+        stable = cell(row, "Stable Key")
+        if not stable:
+            lot_from_any = normalize_sheet_lot_id(lot_id) or normalize_sheet_lot_id(url)
+            stable = f"uzex:{lot_from_any}" if lot_from_any else f"sheet-row:{row_number}"
+
+        active.append({
+            "stable_key": stable,
+            "lot_id": lot_id,
+            "lot_no": cell(row, "Номер лота"),
+            "title": cell(row, "Название"),
+            "customer": cell(row, "Заказчик"),
+            "amount": cell(row, "Сумма"),
+            "currency": cell(row, "Валюта") or "UZS",
+            "deadline": deadline,
+            "priority": cell(row, "Приоритет"),
+            "status": cell(row, "Статус") or "Новый",
+            "url": url,
+        })
+
+    active.sort(key=lambda item: item["deadline"])
+    return active
+
+
+async def send_plain_telegram(client: httpx.AsyncClient, text: str) -> bool:
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
+    response = await client.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={
+            "chat_id": CHAT_ID,
+            "text": text[:4096],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        },
+    )
+    response.raise_for_status()
+    return bool(response.json().get("ok"))
+
+
+def tender_digest_text(tenders: List[Dict[str, Any]], period_name: str) -> str:
+    now = now_local()
+    lines = [
+        f"📊 <b>{period_name}</b>",
+        "",
+        f"Активных тендеров: <b>{len(tenders)}</b>",
+        "",
+    ]
+    for number, tender in enumerate(tenders[:MAX_DIGEST_ITEMS], start=1):
+        days_left = max(0, (tender["deadline"].date() - now.date()).days)
+        lines.extend([
+            f"{number}️⃣ <b>{html.escape(tender.get('title') or 'Без названия')}</b>",
+            f"🏢 {html.escape(tender.get('customer') or 'Заказчик не указан')}",
+            f"💰 {html.escape(format_amount(tender.get('amount')))} {html.escape(tender.get('currency') or 'UZS')}",
+            f"⏳ Осталось дней: <b>{days_left}</b>",
+            f"📅 Окончание: {tender['deadline'].strftime('%d.%m.%Y %H:%M')}",
+            f"🎯 Приоритет: {html.escape(tender.get('priority') or 'Не указан')}",
+            f"📌 Статус: {html.escape(tender.get('status') or 'Новый')}",
+        ])
+        if tender.get("url"):
+            lines.append(f"🔗 {html.escape(tender['url'])}")
+        lines.append("")
+    if not tenders:
+        lines.append("Активных тендеров с будущим сроком окончания нет.")
+    return "\n".join(lines)
+
+
+def deadline_alert_text(tender: Dict[str, Any], days_left: int) -> str:
+    if days_left == 0:
+        heading = "⛔ <b>ПОСЛЕДНИЙ ДЕНЬ ПОДАЧИ</b>"
+    elif days_left == 1:
+        heading = "🚨 <b>СРОЧНО: ОСТАЛСЯ 1 ДЕНЬ</b>"
+    else:
+        heading = f"⏰ <b>До окончания осталось {days_left} дня/дней</b>"
+
+    lines = [
+        heading,
+        "",
+        f"<b>{html.escape(tender.get('title') or 'Без названия')}</b>",
+        f"🏢 {html.escape(tender.get('customer') or 'Заказчик не указан')}",
+        f"💰 {html.escape(format_amount(tender.get('amount')))} {html.escape(tender.get('currency') or 'UZS')}",
+        f"📅 Окончание: {tender['deadline'].strftime('%d.%m.%Y %H:%M')}",
+        "",
+        "Проверьте:",
+        "• коммерческое предложение;",
+        "• квалификационные документы;",
+        "• транспорт и маршрут;",
+        "• окончательную цену;",
+        "• подачу заявки на UZEX.",
+    ]
+    if tender.get("url"):
+        lines.extend(["", f"🔗 {html.escape(tender['url'])}"])
+    return "\n".join(lines)
+
+
+async def process_follow_up_reminders(client: httpx.AsyncClient) -> Dict[str, Any]:
+    result = {
+        "morning_digest_sent": False,
+        "evening_digest_sent": False,
+        "deadline_alerts_sent": 0,
+        "active_tenders": 0,
+        "errors": [],
+    }
+    try:
+        tenders = await asyncio.to_thread(load_active_tenders_sync)
+        registry = await asyncio.to_thread(load_reminder_registry_sync)
+        result["active_tenders"] = len(tenders)
+        today = now_local().strftime("%Y-%m-%d")
+
+        if reminder_window_open(MORNING_REMINDER_HOUR):
+            key = f"digest:morning:{today}"
+            if key not in registry and await send_plain_telegram(
+                client,
+                tender_digest_text(tenders, "Утренний отчёт AI Tender Agent"),
+            ):
+                await asyncio.to_thread(
+                    save_reminder_registry_entry_sync,
+                    key, "sent", "Утренняя сводка активных тендеров",
+                )
+                registry[key] = "sent"
+                result["morning_digest_sent"] = True
+
+        if reminder_window_open(EVENING_REMINDER_HOUR):
+            key = f"digest:evening:{today}"
+            if key not in registry and await send_plain_telegram(
+                client,
+                tender_digest_text(tenders, "Вечерний отчёт AI Tender Agent"),
+            ):
+                await asyncio.to_thread(
+                    save_reminder_registry_entry_sync,
+                    key, "sent", "Вечерняя сводка активных тендеров",
+                )
+                registry[key] = "sent"
+                result["evening_digest_sent"] = True
+
+        current_date = now_local().date()
+        for tender in tenders:
+            days_left = (tender["deadline"].date() - current_date).days
+            if days_left not in DEADLINE_ALERT_DAYS:
+                continue
+            key = f"deadline:{tender['stable_key']}:{tender['deadline'].date().isoformat()}:{days_left}"
+            if key in registry:
+                continue
+            if await send_plain_telegram(client, deadline_alert_text(tender, days_left)):
+                await asyncio.to_thread(
+                    save_reminder_registry_entry_sync,
+                    key, "sent", f"Напоминание за {days_left} дней",
+                )
+                registry[key] = "sent"
+                result["deadline_alerts_sent"] += 1
+                await asyncio.sleep(0.2)
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        logger.exception("Follow-up reminder processing failed")
+    return result
+
+
 async def http_json(
     client: httpx.AsyncClient,
     method: str,
@@ -1235,6 +1530,13 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
             "detail_incomplete": 0,
             "telegram_sent": 0,
             "sheets_saved": 0,
+            "reminders": {
+                "morning_digest_sent": False,
+                "evening_digest_sent": False,
+                "deadline_alerts_sent": 0,
+                "active_tenders": 0,
+                "errors": [],
+            },
             "errors": [],
         }
 
@@ -1345,6 +1647,12 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
                             "telegram_skipped:rows_not_confirmed_in_google_sheets"
                         )
 
+                reminder_result = await process_follow_up_reminders(client)
+                result["reminders"] = reminder_result
+                if reminder_result.get("errors"):
+                    result["errors"].extend(
+                        f"reminders:{error}" for error in reminder_result["errors"]
+                    )
                 result["status"] = "success" if not result["errors"] else "partial_success"
 
         except asyncio.CancelledError:
@@ -1448,7 +1756,7 @@ async def root() -> Dict[str, Any]:
         "endpoints": [
             "/health", "/health/production", "/version", "/scan",
             "/scan_status", "/metrics", "/logs", "/debug/uzex",
-            "/debug/lot/{lot_id}", "/admin/rebuild_dedup_cache", "/docs",
+            "/debug/lot/{lot_id}", "/reminders/run", "/reminders/status", "/admin/rebuild_dedup_cache", "/docs",
         ],
     }
 
@@ -1674,6 +1982,36 @@ async def debug_lot(lot_id: int) -> Dict[str, Any]:
         item["ai_score"] = ai_score(item)
         item.pop("raw", None)
         return {"version": VERSION, "item": item}
+
+
+@app.post("/reminders/run")
+async def run_reminders_now() -> Dict[str, Any]:
+    timeout = httpx.Timeout(REQUEST_TIMEOUT_SECONDS)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        result = await process_follow_up_reminders(client)
+    return {
+        "status": "ok" if not result.get("errors") else "partial_success",
+        "version": VERSION,
+        "result": result,
+    }
+
+
+@app.get("/reminders/status")
+async def reminders_status() -> Dict[str, Any]:
+    tenders = await asyncio.to_thread(load_active_tenders_sync)
+    registry = await asyncio.to_thread(load_reminder_registry_sync)
+    today = now_local().strftime("%Y-%m-%d")
+    return {
+        "status": "ok",
+        "version": VERSION,
+        "active_tenders": len(tenders),
+        "morning_sent_today": f"digest:morning:{today}" in registry,
+        "evening_sent_today": f"digest:evening:{today}" in registry,
+        "morning_hour": MORNING_REMINDER_HOUR,
+        "evening_hour": EVENING_REMINDER_HOUR,
+        "deadline_alert_days": DEADLINE_ALERT_DAYS,
+        "registry_entries": len(registry),
+    }
 
 
 @app.post("/admin/rebuild_dedup_cache")
