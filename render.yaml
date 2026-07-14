@@ -28,3 +28,13 @@ services:
         value: "1"
       - key: UZEX_SYSTEM_ID
         value: "0"
+      - key: MORNING_REMINDER_HOUR
+        value: "9"
+      - key: EVENING_REMINDER_HOUR
+        value: "17"
+      - key: REMINDER_WINDOW_MINUTES
+        value: "90"
+      - key: DEADLINE_ALERT_DAYS
+        value: "7,3,1,0"
+      - key: REMINDER_WORKSHEET_NAME
+        value: "Системные данные"
