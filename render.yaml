@@ -14,6 +14,12 @@ services:
         value: "45"
       - key: SCAN_ON_STARTUP
         value: "false"
+      - key: SCHEDULER_ENABLED
+        value: "true"
+      - key: SCAN_INTERVAL_MINUTES
+        value: "30"
+      - key: FAILURE_ALERT_COOLDOWN_MINUTES
+        value: "180"
       - key: REQUEST_TIMEOUT_SECONDS
         value: "30"
       - key: SCAN_TIMEOUT_SECONDS
