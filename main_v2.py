@@ -9,7 +9,10 @@ Core guarantees:
 - Extraction of routes, payment data, product descriptions and documents.
 - Google Sheets is the source of truth for permanent deduplication.
 - Local state is only a fast cache and may be recreated after a Render restart.
-- Internal scheduler resumes automatically after every process restart.
+- V35: built-in scheduler scans every SCAN_INTERVAL_MINUTES while awake;
+  /health keep-alive pings also start a scan when one is due.
+- V35: sheet columns are read by fixed position; a stale header row is repaired.
+- V35: scan failures are reported to the Telegram group.
 - External cron may call /health or /scan; duplicate runs are protected.
 
 Required environment variables:
@@ -57,8 +60,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v35_dedup_fix"
-APP_NAME = "AI Tender Agent Cargo V35 Dedup Fix"
+VERSION = "cargo_v35_scheduler_dedup"
+APP_NAME = "AI Tender Agent Cargo V35"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -114,6 +117,12 @@ DEADLINE_ALERT_DAYS = [
     if value.strip().lstrip("-").isdigit()
 ]
 MAX_DIGEST_ITEMS = max(5, int(os.getenv("MAX_DIGEST_ITEMS", "20")))
+
+# V35: built-in scheduler. Works on its own; external cron is only a backup.
+SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SCAN_INTERVAL_MINUTES = max(10, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
+# Failure alerts to Telegram are sent at most once per this many minutes.
+FAILURE_ALERT_COOLDOWN_MINUTES = max(30, int(os.getenv("FAILURE_ALERT_COOLDOWN_MINUTES", "180")))
 
 ACCEPT_PHRASES = [
     "перевозка груз", "грузоперевоз", "транспортные услуги",
@@ -224,6 +233,9 @@ SHEET_HEADERS = [
     "Решение", "Статус", "Ссылка", "Дата добавления",
     "Дата обновления", "Причина фильтра", "Stable Key",
 ]
+
+
+TRIGGER_MODE = "internal_scheduler+external_cron" if SCHEDULER_ENABLED else "external_cron_only"
 
 
 def now_local() -> datetime:
@@ -913,8 +925,7 @@ def load_active_tenders_sync() -> List[Dict[str, Any]]:
     if not values:
         return []
 
-    headers = values[0]
-    index = {header: i for i, header in enumerate(headers)}
+    index = SHEET_INDEX
 
     def cell(row: List[str], *names: str) -> str:
         for name in names:
@@ -1285,15 +1296,36 @@ def open_worksheet():
     first_row = worksheet.row_values(1)
     if not first_row:
         worksheet.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
-    else:
-        missing = [header for header in SHEET_HEADERS if header not in first_row]
-        if missing:
-            new_headers = first_row + missing
-            worksheet.update(
-                range_name=f"A1:{column_letter(len(new_headers))}1",
-                values=[new_headers],
-            )
+    elif first_row[:len(SHEET_HEADERS)] != SHEET_HEADERS:
+        # V35: rows are always written positionally in SHEET_HEADERS order,
+        # so the header row must match that order exactly. Older versions
+        # left a header row from V28 with missing names appended at the end,
+        # which made "Название", "Заказчик", "Сумма" point to wrong columns.
+        repair_header_row(worksheet, first_row)
     return worksheet
+
+
+def repair_header_row(worksheet, old_headers: List[str]) -> None:
+    width = max(len(old_headers), len(SHEET_HEADERS))
+    fixed = SHEET_HEADERS + [""] * (width - len(SHEET_HEADERS))
+    worksheet.update(
+        range_name=f"A1:{column_letter(width)}1",
+        values=[fixed],
+    )
+    logger.warning("Sheet header row repaired. Old headers: %s", old_headers)
+    try:
+        save_reminder_registry_entry_sync(
+            f"backup:old_headers:{now_local().strftime('%Y-%m-%d %H:%M')}",
+            " | ".join(old_headers),
+            "Старая строка заголовков листа Тендеры до исправления V35",
+        )
+    except Exception:
+        logger.exception("Could not back up old header row")
+
+
+# Fixed column positions, independent of what the header row says.
+SHEET_INDEX = {name: i for i, name in enumerate(SHEET_HEADERS)}
+LOT_URL_RE = re.compile(r"/lot/(\d{4,})")
 
 
 def normalize_sheet_lot_id(value: Any) -> Optional[str]:
@@ -1332,8 +1364,14 @@ def load_permanent_seen_keys_sync() -> Set[str]:
     candidates = ("Stable Key", "ID", "Номер лота", "Ссылка", "Хеш")
     if not any(h in index for h in candidates):
         raise RuntimeError("Google Sheets missing dedup identity columns")
+    rows = values[1:]
     keys: Set[str] = set()
-    for row in values[1:]:
+    # V35: lot links may sit in any column of old rows written by earlier versions.
+    for row in rows:
+        for value in row:
+            for lot_id in LOT_URL_RE.findall(value or ""):
+                keys.add(f"uzex:{lot_id}")
+    for row in rows:
         for header in candidates:
             i = index.get(header)
             if i is None or i >= len(row):
@@ -1712,7 +1750,41 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
             )
             active_scan_task = None
 
+        if result["status"] in {"error", "timeout"} or (
+            result["status"] == "partial_success" and result["errors"]
+        ):
+            await send_failure_alert(result)
+
         return result
+
+
+_last_failure_alert_mono: Optional[float] = None
+
+
+async def send_failure_alert(result: Dict[str, Any]) -> None:
+    """Tell the Telegram group that a scan failed, at most once per cooldown."""
+    global _last_failure_alert_mono
+    now_mono = time.monotonic()
+    if (
+        _last_failure_alert_mono is not None
+        and now_mono - _last_failure_alert_mono < FAILURE_ALERT_COOLDOWN_MINUTES * 60
+    ):
+        return
+    errors = result.get("errors") or [result.get("status", "unknown")]
+    text = (
+        "⚠️ <b>AI Tender Agent: сбой проверки тендеров</b>\n\n"
+        f"Статус: {html.escape(str(result.get('status')))}\n"
+        f"Время: {html.escape(pretty_now())}\n"
+        "Ошибки:\n"
+        + "\n".join(f"• {html.escape(str(e))[:300]}" for e in errors[:5])
+        + "\n\nБот попробует снова при следующей проверке."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS)) as client:
+            if await send_plain_telegram(client, text):
+                _last_failure_alert_mono = now_mono
+    except Exception:
+        logger.exception("Failure alert could not be sent")
 
 
 async def run_scan_with_timeout(trigger: str) -> Dict[str, Any]:
@@ -1728,11 +1800,14 @@ async def run_scan_with_timeout(trigger: str) -> Dict[str, Any]:
             state.last_error = f"scan_timeout:{SCAN_TIMEOUT_SECONDS}s"
             state.failed_scans += 1
             save_state()
-        return {
+        timeout_result = {
             "status": "timeout",
             "version": VERSION,
             "timeout_seconds": SCAN_TIMEOUT_SECONDS,
+            "errors": [f"Проверка не уложилась в {SCAN_TIMEOUT_SECONDS} секунд"],
         }
+        await send_failure_alert(timeout_result)
+        return timeout_result
 
 
 def start_scan_task(trigger: str) -> bool:
@@ -1745,17 +1820,58 @@ def start_scan_task(trigger: str) -> bool:
 
 
 
+_last_scan_started_mono: Optional[float] = None
+
+
+def scan_is_due() -> bool:
+    if _last_scan_started_mono is None:
+        return True
+    return time.monotonic() - _last_scan_started_mono >= SCAN_INTERVAL_MINUTES * 60
+
+
+def start_scheduled_scan(trigger: str) -> bool:
+    """Start a scan if one is due and none is running. Used by the scheduler and /health."""
+    global _last_scan_started_mono
+    if is_warming_up() or not scan_is_due():
+        return False
+    if start_scan_task(trigger):
+        _last_scan_started_mono = time.monotonic()
+        return True
+    return False
+
+
+async def scheduler_loop() -> None:
+    """V35 built-in scheduler: scans every SCAN_INTERVAL_MINUTES while the process is awake.
+    Reminders (9:00 / 17:00 digests, deadline alerts) run inside every scan."""
+    await asyncio.sleep(WARMUP_SECONDS + 5)
+    while True:
+        try:
+            start_scheduled_scan("scheduler")
+            next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
+            with state_lock:
+                state.next_scheduled_run = next_run.strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            logger.exception("Scheduler tick failed")
+        await asyncio.sleep(60)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
     logger.info("%s starting", APP_NAME)
 
-    if SCAN_ON_STARTUP:
+    scheduler_task: Optional[asyncio.Task] = None
+    if SCHEDULER_ENABLED:
+        scheduler_task = asyncio.create_task(scheduler_loop())
+        logger.info("Built-in scheduler enabled: every %s minutes", SCAN_INTERVAL_MINUTES)
+    elif SCAN_ON_STARTUP:
         await asyncio.sleep(min(3, WARMUP_SECONDS))
         start_scan_task("startup")
 
     yield
 
+    if scheduler_task:
+        scheduler_task.cancel()
     if active_scan_task and not active_scan_task.done():
         active_scan_task.cancel()
     logger.info("%s stopped", APP_NAME)
@@ -1772,7 +1888,7 @@ async def root() -> Dict[str, Any]:
         "running": state.running,
         "warming_up": is_warming_up(),
         "warmup_seconds": WARMUP_SECONDS,
-        "trigger_mode": "external_cron_only",
+        "trigger_mode": TRIGGER_MODE,
         "deduplication": "Google Sheets Stable Key + ID + URL",
         "endpoints": [
             "/health", "/health/production", "/version", "/scan",
@@ -1797,6 +1913,9 @@ async def health(deep: bool = Query(False)) -> Dict[str, Any]:
         "app_started_at": state.app_started_at,
         "time": pretty_now(),
     }
+    if SCHEDULER_ENABLED:
+        basic["scan_started"] = start_scheduled_scan("health_catch_up")
+        basic["next_scheduled_run"] = state.next_scheduled_run
     if not deep:
         return basic
     return {**basic, **(await integrations_health())}
@@ -1813,7 +1932,7 @@ async def health_production() -> Dict[str, Any]:
         "status": status,
         "version": VERSION,
         "service": APP_NAME,
-        "trigger_mode": "external_cron_only",
+        "trigger_mode": TRIGGER_MODE,
         "uptime_seconds": app_uptime_seconds(),
         "warming_up": is_warming_up(),
         "warmup_seconds": WARMUP_SECONDS,
@@ -1850,6 +1969,7 @@ async def manual_scan_response() -> Dict[str, Any]:
             "message": "Service is warming up. Retry later.",
         }
 
+    global _last_scan_started_mono
     if not start_scan_task("cron_http"):
         return {
             "status": "already_running",
@@ -1859,6 +1979,7 @@ async def manual_scan_response() -> Dict[str, Any]:
             "message": "Scan already running. Check /scan_status.",
         }
 
+    _last_scan_started_mono = time.monotonic()
     return {
         "status": "accepted",
         "version": VERSION,
@@ -1891,8 +2012,8 @@ async def scan_status() -> Dict[str, Any]:
             "last_trigger": state.last_trigger,
             "last_result": state.last_result,
             "last_error": state.last_error,
-            "trigger_mode": "external_cron_only",
-            "next_scheduled_run": None,
+            "trigger_mode": TRIGGER_MODE,
+            "next_scheduled_run": state.next_scheduled_run,
         }
 
 
@@ -1904,7 +2025,7 @@ async def metrics() -> Dict[str, Any]:
         "running": state.running,
         "warming_up": is_warming_up(),
         "warmup_seconds": WARMUP_SECONDS,
-        "trigger_mode": "external_cron_only",
+        "trigger_mode": TRIGGER_MODE,
         "scan_count": state.scan_count,
         "successful_scans": state.successful_scans,
         "failed_scans": state.failed_scans,
