@@ -57,8 +57,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v34_tender_follow_up"
-APP_NAME = "AI Tender Agent Cargo V34 Tender Follow-up"
+VERSION = "cargo_v35_dedup_fix"
+APP_NAME = "AI Tender Agent Cargo V35 Dedup Fix"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1200,6 +1200,11 @@ async def fetch_trade_detail(
 
             merged_raw = deep_merge(list_item.get("raw") or {}, detail)
             merged = parse_trade(merged_raw)
+            # TradeList ID is the canonical URL identifier; GetTrade may contain nested IDs.
+            merged["lot_id"] = list_item.get("lot_id") or merged.get("lot_id")
+            merged["lot_no"] = list_item.get("lot_no") or merged.get("lot_no")
+            if merged.get("lot_id"):
+                merged["url"] = f"{UZEX_SITE_BASE}/lot/{merged['lot_id']}"
 
             for key in (
                 "title", "customer", "amount", "currency",
@@ -1274,8 +1279,8 @@ def open_worksheet():
     spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
     try:
         worksheet = spreadsheet.worksheet(SHEET_WORKSHEET_NAME)
-    except Exception:
-        worksheet = spreadsheet.sheet1
+    except Exception as exc:
+        raise RuntimeError(f"Worksheet {SHEET_WORKSHEET_NAME!r} not found") from exc
 
     first_row = worksheet.row_values(1)
     if not first_row:
@@ -1297,42 +1302,59 @@ def normalize_sheet_lot_id(value: Any) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def lot_aliases(item: Dict[str, Any]) -> Set[str]:
+    """Exact identity aliases only; never equate unrelated numeric suffixes."""
+    aliases = set()
+    for field in ("lot_id", "lot_no"):
+        value = str(item.get(field) or "").strip()
+        if value.isdigit():
+            aliases.add(f"uzex:{value}")
+    url = str(item.get("url") or "")
+    match = re.search(r"/lot/(\d+)(?:[/?#]|$)", url)
+    if match:
+        aliases.add(f"uzex:{match.group(1)}")
+    stable = str(item.get("stable_key") or "").strip()
+    if stable:
+        aliases.add(stable)
+    return aliases
+
+
 def load_permanent_seen_keys_sync() -> Set[str]:
-    """
-    Google Sheets is the permanent source of truth.
-    Reads Stable Key, ID, Number and URL columns to remain compatible
-    with all older Cargo versions.
-    """
+    """Fail closed if Sheets is unavailable; read historical ID/number/URL aliases."""
     worksheet = open_worksheet()
     if worksheet is None:
-        return set()
-
+        raise RuntimeError("Google Sheets unavailable: dedup cannot be verified")
     values = worksheet.get_all_values()
     if not values:
-        return set()
-
-    headers = values[0]
-    rows = values[1:]
+        raise RuntimeError("Google Sheets empty: dedup cannot be verified")
+    headers = [str(h).strip() for h in values[0]]
     index = {name: i for i, name in enumerate(headers)}
+    candidates = ("Stable Key", "ID", "Номер лота", "Ссылка", "Хеш")
+    if not any(h in index for h in candidates):
+        raise RuntimeError("Google Sheets missing dedup identity columns")
     keys: Set[str] = set()
-
-    candidate_headers = [
-        "Stable Key", "ID", "Номер лота", "Ссылка", "Хеш",
-    ]
-
-    for row in rows:
-        for header in candidate_headers:
+    for row in values[1:]:
+        for header in candidates:
             i = index.get(header)
             if i is None or i >= len(row):
                 continue
-            value = row[i].strip()
+            value = str(row[i]).strip()
             if not value:
                 continue
             if header == "Stable Key" and value.startswith(("uzex:", "uzex-no:", "fallback:")):
                 keys.add(value)
-            lot_id = normalize_sheet_lot_id(value)
-            if lot_id:
-                keys.add(f"uzex:{lot_id}")
+                if value.startswith("uzex-no:"):
+                    keys.add("uzex:" + value[len("uzex-no:"):])
+            if header == "Ссылка":
+                match = re.search(r"/lot/(\d+)(?:[/?#]|$)", value)
+                if match:
+                    keys.add("uzex:" + match.group(1))
+            elif header in ("ID", "Номер лота", "Хеш"):
+                # Only complete numeric IDs, not a substring from arbitrary text.
+                if value.isdigit():
+                    keys.add("uzex:" + value)
+                elif re.fullmatch(r"uzex:(\d+)", value):
+                    keys.add(value)
     return keys
 
 
@@ -1404,10 +1426,12 @@ def append_items_sync(items: List[Dict[str, Any]]) -> int:
     worksheet = open_worksheet()
     if worksheet is None:
         return 0
-    worksheet.append_rows(
-        [sheet_row(item) for item in items],
-        value_input_option="USER_ENTERED",
-    )
+    actual_headers = worksheet.row_values(1)
+    records = []
+    for item in items:
+        record = dict(zip(SHEET_HEADERS, sheet_row(item)))
+        records.append([record.get(header, "") for header in actual_headers])
+    worksheet.append_rows(records, value_input_option="USER_ENTERED")
     return len(items)
 
 
@@ -1601,51 +1625,48 @@ async def perform_scan(trigger: str) -> Dict[str, Any]:
 
                 result["accepted_total"] = len(final_items)
 
-                local_seen = load_local_seen_keys()
-                permanent_seen: Set[str] = set()
+                # Deduplication must be confirmed by durable Google Sheets storage.
+                # Never send when Sheets cannot be read: Render's disk is ephemeral.
                 try:
                     permanent_seen = await asyncio.to_thread(load_permanent_seen_keys_sync)
                 except Exception as exc:
-                    result["errors"].append(f"dedup_sheet:{exc}")
-                    logger.exception("Permanent dedup read failed")
+                    result["errors"].append(f"dedup_sheet_unavailable:{exc}")
+                    logger.exception("Dedup read failed; notifications disabled for this scan")
+                    permanent_seen = None
 
-                all_seen = local_seen | permanent_seen
-                new_items = [
-                    item for item in final_items
-                    if item["stable_key"] not in all_seen
-                    and completeness_score(item) >= 3
-                ]
+                if permanent_seen is not None:
+                    all_seen = permanent_seen | load_local_seen_keys()
+                    new_items = []
+                    for item in final_items:
+                        aliases = lot_aliases(item)
+                        if aliases & all_seen or completeness_score(item) < 3:
+                            continue
+                        new_items.append(item)
+                        # Also deduplicate duplicates within the current UZEX response.
+                        all_seen.update(aliases)
+                    result["new_total"] = len(new_items)
+                    result["duplicates"] = len(final_items) - len(new_items)
 
-                result["new_total"] = len(new_items)
-                result["duplicates"] = len(final_items) - len(new_items)
+                    if new_items:
+                        try:
+                            result["sheets_saved"] = await asyncio.to_thread(append_items_sync, new_items)
+                        except Exception as exc:
+                            result["errors"].append(f"google_sheets:{exc}")
+                            logger.exception("Google Sheets save failed")
 
-                # Save first. Telegram is sent only after Google Sheets accepted the rows.
-                if new_items:
-                    try:
-                        result["sheets_saved"] = await asyncio.to_thread(
-                            append_items_sync,
-                            new_items,
-                        )
-                    except Exception as exc:
-                        result["errors"].append(f"google_sheets:{exc}")
-                        logger.exception("Google Sheets save failed")
-
-                    if result["sheets_saved"] == len(new_items):
-                        for item in new_items:
-                            try:
-                                if await send_telegram(client, item):
-                                    result["telegram_sent"] += 1
-                            except Exception as exc:
-                                result["errors"].append(
-                                    f"telegram:{item.get('stable_key')}:{exc}"
-                                )
-
-                        all_seen.update(item["stable_key"] for item in new_items)
-                        save_local_seen_keys(all_seen)
-                    else:
-                        result["errors"].append(
-                            "telegram_skipped:rows_not_confirmed_in_google_sheets"
-                        )
+                        if result["sheets_saved"] == len(new_items):
+                            # Persist local aliases after confirmed Sheets write.
+                            save_local_seen_keys(all_seen)
+                            for item in new_items:
+                                try:
+                                    if await send_telegram(client, item):
+                                        result["telegram_sent"] += 1
+                                except Exception as exc:
+                                    result["errors"].append(
+                                        f"telegram:{item.get('stable_key')}:{exc}"
+                                    )
+                        else:
+                            result["errors"].append("telegram_skipped:rows_not_confirmed_in_google_sheets")
 
                 reminder_result = await process_follow_up_reminders(client)
                 result["reminders"] = reminder_result
