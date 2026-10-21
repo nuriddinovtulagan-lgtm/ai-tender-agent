@@ -14,6 +14,8 @@ Core guarantees:
 - V35: sheet columns are read by fixed position; a stale header row is repaired.
 - V35: scan failures are reported to the Telegram group.
 - External cron may call /health or /scan; duplicate runs are protected.
+- V36 (stage 0): shared base in the same spreadsheet (package trans_ocean) and the
+  Coordinator agent: 9:00 digest, approval tasks with Telegram buttons, journal.
 
 Required environment variables:
 BOT_TOKEN
@@ -49,8 +51,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urljoin
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+
+from trans_ocean.base import Base
+from trans_ocean.coordinator import Coordinator, Settings as CoordinatorSettings
+from trans_ocean.telegram import Telegram
 
 try:
     import gspread
@@ -60,8 +66,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v35_scheduler_dedup"
-APP_NAME = "AI Tender Agent Cargo V35"
+VERSION = "cargo_v36_stage0_coordinator"
+APP_NAME = "AI Tender Agent Cargo V36"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -123,6 +129,16 @@ SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() in {"1", "tru
 SCAN_INTERVAL_MINUTES = max(10, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
 # Failure alerts to Telegram are sent at most once per this many minutes.
 FAILURE_ALERT_COOLDOWN_MINUTES = max(30, int(os.getenv("FAILURE_ALERT_COOLDOWN_MINUTES", "180")))
+
+# V36 (stage 0): shared base + Coordinator agent.
+COORDINATOR_ENABLED = os.getenv("COORDINATOR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+MANAGEMENT_CHAT_ID = os.getenv("MANAGEMENT_CHAT_ID", "").strip() or os.getenv("CHAT_ID", "").strip()
+COORDINATOR_DIGEST_HOUR = int(os.getenv("COORDINATOR_DIGEST_HOUR", "9"))
+COORDINATOR_TICK_MINUTES = max(1, int(os.getenv("COORDINATOR_TICK_MINUTES", "5")))
+FOLLOW_UP_DAYS = max(1, int(os.getenv("FOLLOW_UP_DAYS", "5")))
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
 ACCEPT_PHRASES = [
     "перевозка груз", "грузоперевоз", "транспортные услуги",
@@ -1059,7 +1075,7 @@ async def process_follow_up_reminders(client: httpx.AsyncClient) -> Dict[str, An
         result["active_tenders"] = len(tenders)
         today = now_local().strftime("%Y-%m-%d")
 
-        if reminder_window_open(MORNING_REMINDER_HOUR):
+        if not COORDINATOR_ENABLED and reminder_window_open(MORNING_REMINDER_HOUR):
             key = f"digest:morning:{today}"
             if key not in registry and await send_plain_telegram(
                 client,
@@ -1282,6 +1298,14 @@ def get_gspread_client():
     return gspread.authorize(credentials)
 
 
+def open_base() -> Optional[Base]:
+    """V36: the shared base (same spreadsheet as the tender sheet)."""
+    client = get_gspread_client()
+    if client is None:
+        return None
+    return Base(client.open_by_key(GOOGLE_SHEET_ID))
+
+
 def open_worksheet():
     client = get_gspread_client()
     if client is None:
@@ -1291,6 +1315,9 @@ def open_worksheet():
     try:
         worksheet = spreadsheet.worksheet(SHEET_WORKSHEET_NAME)
     except Exception as exc:
+        # Never fall back to the first sheet (in the shared base that is "Компании")
+        # and never auto-create an empty one: an empty sheet would pass dedup with
+        # zero known lots and resend every old tender. Copy the old sheet first.
         raise RuntimeError(f"Worksheet {SHEET_WORKSHEET_NAME!r} not found") from exc
 
     first_row = worksheet.row_values(1)
@@ -1840,6 +1867,9 @@ def start_scheduled_scan(trigger: str) -> bool:
     return False
 
 
+_background_tasks: Set[asyncio.Task] = set()
+
+
 async def scheduler_loop() -> None:
     """V35 built-in scheduler: scans every SCAN_INTERVAL_MINUTES while the process is awake.
     Reminders (9:00 / 17:00 digests, deadline alerts) run inside every scan."""
@@ -1847,6 +1877,10 @@ async def scheduler_loop() -> None:
     while True:
         try:
             start_scheduled_scan("scheduler")
+            if COORDINATOR_ENABLED:
+                tick_task = asyncio.create_task(coordinator.tick())
+                _background_tasks.add(tick_task)
+                tick_task.add_done_callback(_background_tasks.discard)
             next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
             with state_lock:
                 state.next_scheduled_run = next_run.strftime("%d.%m.%Y %H:%M")
@@ -1861,6 +1895,13 @@ async def lifespan(app: FastAPI):
     logger.info("%s starting", APP_NAME)
 
     scheduler_task: Optional[asyncio.Task] = None
+    if COORDINATOR_ENABLED and TELEGRAM_WEBHOOK_SECRET and PUBLIC_BASE_URL and BOT_TOKEN:
+        try:
+            await coordinator.telegram.set_webhook(
+                f"{PUBLIC_BASE_URL}/telegram/webhook", TELEGRAM_WEBHOOK_SECRET)
+            logger.info("Telegram webhook set for approval buttons")
+        except Exception:
+            logger.exception("Telegram webhook could not be set")
     if SCHEDULER_ENABLED:
         scheduler_task = asyncio.create_task(scheduler_loop())
         logger.info("Built-in scheduler enabled: every %s minutes", SCAN_INTERVAL_MINUTES)
@@ -1876,6 +1917,20 @@ async def lifespan(app: FastAPI):
         active_scan_task.cancel()
     logger.info("%s stopped", APP_NAME)
 
+
+coordinator = Coordinator(
+    base_factory=open_base,
+    telegram=Telegram(BOT_TOKEN, MANAGEMENT_CHAT_ID, timeout=REQUEST_TIMEOUT_SECONDS),
+    registry_load=load_reminder_registry_sync,
+    registry_save=save_reminder_registry_entry_sync,
+    tenders_loader=load_active_tenders_sync,
+    settings=CoordinatorSettings(
+        digest_hour=COORDINATOR_DIGEST_HOUR,
+        window_minutes=REMINDER_WINDOW_MINUTES,
+        tick_minutes=COORDINATOR_TICK_MINUTES,
+        follow_up_days=FOLLOW_UP_DAYS,
+    ),
+)
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
@@ -1893,7 +1948,9 @@ async def root() -> Dict[str, Any]:
         "endpoints": [
             "/health", "/health/production", "/version", "/scan",
             "/scan_status", "/metrics", "/logs", "/debug/uzex",
-            "/debug/lot/{lot_id}", "/reminders/run", "/reminders/status", "/admin/rebuild_dedup_cache", "/docs",
+            "/debug/lot/{lot_id}", "/reminders/run", "/reminders/status", "/admin/rebuild_dedup_cache",
+            "/admin/setup_base", "/coordinator/status", "/coordinator/digest", "/coordinator/tick",
+            "/tasks", "/telegram/webhook", "/admin/set_webhook", "/docs",
         ],
     }
 
@@ -2180,6 +2237,111 @@ async def reset_stuck_scan() -> Dict[str, Any]:
         state.last_error = "manual_stuck_flag_reset"
         save_state()
     return {"status": "ok", "version": VERSION, "running": False}
+
+
+# ---------------------------------------------------------------------------
+# V36 stage 0: shared base + Coordinator
+# ---------------------------------------------------------------------------
+
+def require_admin(token: Optional[str]) -> None:
+    if ADMIN_TOKEN and token != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="admin token required")
+
+
+@app.post("/admin/setup_base")
+async def setup_base(x_admin_token: Optional[str] = Header(None),
+                     token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Create the shared-base sheets that are missing and copy start companies into "Компании"."""
+    require_admin(x_admin_token or token)
+    base = await asyncio.to_thread(open_base)
+    if base is None:
+        raise HTTPException(status_code=400, detail="Google Sheets is not configured")
+    sheets = await asyncio.to_thread(base.ensure_sheets)
+    companies = await asyncio.to_thread(base.migrate_start_companies)
+    await asyncio.to_thread(base.log, "Координатор", "Настройка общей базы",
+                            json.dumps(sheets, ensure_ascii=False))
+    return {"status": "ok", "sheets": sheets, "companies_added": companies}
+
+
+@app.post("/coordinator/digest")
+async def coordinator_digest(x_admin_token: Optional[str] = Header(None),
+                             token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    require_admin(x_admin_token or token)
+    return await coordinator.send_digest(force=True)
+
+
+@app.post("/coordinator/tick")
+async def coordinator_tick(x_admin_token: Optional[str] = Header(None),
+                           token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    require_admin(x_admin_token or token)
+    return await coordinator.tick(force=True)
+
+
+@app.get("/coordinator/status")
+async def coordinator_status() -> Dict[str, Any]:
+    webhook: Dict[str, Any] = {}
+    if BOT_TOKEN:
+        try:
+            info = await coordinator.telegram.webhook_info()
+            webhook = {"url_set": bool(info.get("url")), "pending": info.get("pending_update_count"),
+                       "last_error": info.get("last_error_message")}
+        except Exception as exc:
+            webhook = {"error": str(exc)}
+    return {
+        "enabled": COORDINATOR_ENABLED,
+        "management_chat_configured": bool(MANAGEMENT_CHAT_ID),
+        "digest_hour": COORDINATOR_DIGEST_HOUR,
+        "tick_minutes": COORDINATOR_TICK_MINUTES,
+        "last_result": coordinator.last_result,
+        "webhook": webhook,
+    }
+
+
+@app.post("/tasks")
+async def create_task_endpoint(payload: Dict[str, Any],
+                               x_admin_token: Optional[str] = Header(None),
+                               token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Create a task in "Задачи". Fields: title (required), agent, assignee, due,
+    needs_approval (bool), link, notes. Approval tasks are posted to Telegram on the next tick."""
+    require_admin(x_admin_token or token)
+    title = str(payload.get("title", "")).strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    base = await asyncio.to_thread(open_base)
+    if base is None:
+        raise HTTPException(status_code=400, detail="Google Sheets is not configured")
+    task_id = await asyncio.to_thread(
+        base.create_task, title, str(payload.get("agent") or "Владелец"),
+        str(payload.get("assignee") or ""), str(payload.get("due") or ""),
+        bool(payload.get("needs_approval")), str(payload.get("link") or ""),
+        str(payload.get("notes") or ""),
+    )
+    return {"status": "ok", "task_id": task_id}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request,
+                           x_telegram_bot_api_secret_token: Optional[str] = Header(None)) -> Dict[str, Any]:
+    if not TELEGRAM_WEBHOOK_SECRET or x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="bad secret")
+    update = await request.json()
+    try:
+        return await coordinator.handle_update(update)
+    except Exception as exc:
+        logger.exception("Telegram update failed")
+        return {"handled": False, "error": str(exc)}
+
+
+@app.post("/admin/set_webhook")
+async def set_webhook(x_admin_token: Optional[str] = Header(None),
+                      token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    require_admin(x_admin_token or token)
+    if not (TELEGRAM_WEBHOOK_SECRET and PUBLIC_BASE_URL and BOT_TOKEN):
+        raise HTTPException(status_code=400,
+                            detail="TELEGRAM_WEBHOOK_SECRET and PUBLIC_BASE_URL (or RENDER_EXTERNAL_URL) are required")
+    result = await coordinator.telegram.set_webhook(
+        f"{PUBLIC_BASE_URL}/telegram/webhook", TELEGRAM_WEBHOOK_SECRET)
+    return {"status": "ok", "result": result}
 
 
 @app.exception_handler(Exception)

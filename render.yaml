@@ -44,3 +44,17 @@ services:
         value: "7,3,1,0"
       - key: REMINDER_WORKSHEET_NAME
         value: "Системные данные"
+      - key: COORDINATOR_ENABLED
+        value: "true"
+      - key: COORDINATOR_DIGEST_HOUR
+        value: "9"
+      - key: COORDINATOR_TICK_MINUTES
+        value: "5"
+      - key: FOLLOW_UP_DAYS
+        value: "5"
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: MANAGEMENT_CHAT_ID
+        sync: false
