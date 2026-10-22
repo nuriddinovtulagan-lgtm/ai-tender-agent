@@ -121,7 +121,11 @@ def approval_text(task: Dict[str, str]) -> str:
     if task.get("Срок"):
         parts.append(f"Срок: {esc(task.get('Срок'))}")
     if task.get("Заметки"):
-        parts.append(f"\n{esc(task.get('Заметки'))[:1500]}")
+        notes = task.get("Заметки") or ""
+        shown = esc(notes[:3200])
+        if len(notes) > 3200:
+            shown += "\n… (полный текст — в листе «Задачи»)"
+        parts.append(f"\n{shown}")
     if task.get("Ссылка"):
         parts.append(f"\n🔗 {esc(task.get('Ссылка'))}")
     parts.append(f"\nID: {esc(task.get('ID'))}")
