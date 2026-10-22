@@ -83,6 +83,8 @@ CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 SHEET_WORKSHEET_NAME = os.getenv("SHEET_WORKSHEET_NAME", "Тендеры").strip()
+# Old tender sheet copied into the base as an archive: read only for dedup, never rewritten.
+TENDER_ARCHIVE_SHEET = os.getenv("TENDER_ARCHIVE_SHEET", "Тендеры (архив)").strip()
 
 UZEX_API_BASE = os.getenv(
     "UZEX_API_BASE",
@@ -941,7 +943,7 @@ def load_active_tenders_sync() -> List[Dict[str, Any]]:
     if not values:
         return []
 
-    index = SHEET_INDEX
+    index = {str(name).strip(): i for i, name in enumerate(values[0])}
 
     def cell(row: List[str], *names: str) -> str:
         for name in names:
@@ -1315,39 +1317,44 @@ def open_worksheet():
     try:
         worksheet = spreadsheet.worksheet(SHEET_WORKSHEET_NAME)
     except Exception as exc:
-        # Never fall back to the first sheet (in the shared base that is "Компании")
-        # and never auto-create an empty one: an empty sheet would pass dedup with
-        # zero known lots and resend every old tender. Copy the old sheet first.
-        raise RuntimeError(f"Worksheet {SHEET_WORKSHEET_NAME!r} not found") from exc
+        # Never fall back to the first sheet (in the shared base that is "Компании").
+        # A new empty tender sheet is created only when the archive of the old one is
+        # present: dedup then reads known lots from the archive and does not resend them.
+        if not TENDER_ARCHIVE_SHEET or TENDER_ARCHIVE_SHEET not in {
+                ws.title for ws in spreadsheet.worksheets()}:
+            raise RuntimeError(
+                f"Worksheet {SHEET_WORKSHEET_NAME!r} not found and no archive "
+                f"{TENDER_ARCHIVE_SHEET!r}: copy the old tender sheet first") from exc
+        worksheet = spreadsheet.add_worksheet(
+            title=SHEET_WORKSHEET_NAME, rows=2000, cols=max(len(SHEET_HEADERS), 10))
+        worksheet.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
+        logger.warning("Created empty %r next to archive %r", SHEET_WORKSHEET_NAME, TENDER_ARCHIVE_SHEET)
+        return worksheet
 
     first_row = worksheet.row_values(1)
     if not first_row:
         worksheet.append_row(SHEET_HEADERS, value_input_option="USER_ENTERED")
-    elif first_row[:len(SHEET_HEADERS)] != SHEET_HEADERS:
-        # V35: rows are always written positionally in SHEET_HEADERS order,
-        # so the header row must match that order exactly. Older versions
-        # left a header row from V28 with missing names appended at the end,
-        # which made "Название", "Заказчик", "Сумма" point to wrong columns.
-        repair_header_row(worksheet, first_row)
+    else:
+        # Non-destructive: rows are written and read by header name, so an older
+        # header order is kept as is; only missing names are added at the end.
+        extend_header_row(worksheet, first_row)
     return worksheet
 
 
-def repair_header_row(worksheet, old_headers: List[str]) -> None:
-    width = max(len(old_headers), len(SHEET_HEADERS))
-    fixed = SHEET_HEADERS + [""] * (width - len(SHEET_HEADERS))
+def extend_header_row(worksheet, old_headers: List[str]) -> None:
+    present = {str(h).strip() for h in old_headers}
+    missing = [h for h in SHEET_HEADERS if h not in present]
+    if not missing:
+        return
+    start = len(old_headers) + 1
+    end = start + len(missing) - 1
+    if worksheet.col_count < end:
+        worksheet.add_cols(end - worksheet.col_count)
     worksheet.update(
-        range_name=f"A1:{column_letter(width)}1",
-        values=[fixed],
+        range_name=f"{column_letter(start)}1:{column_letter(end)}1",
+        values=[missing],
     )
-    logger.warning("Sheet header row repaired. Old headers: %s", old_headers)
-    try:
-        save_reminder_registry_entry_sync(
-            f"backup:old_headers:{now_local().strftime('%Y-%m-%d %H:%M')}",
-            " | ".join(old_headers),
-            "Старая строка заголовков листа Тендеры до исправления V35",
-        )
-    except Exception:
-        logger.exception("Could not back up old header row")
+    logger.warning("Tender sheet: added missing headers %s", missing)
 
 
 # Fixed column positions, independent of what the header row says.
@@ -1379,21 +1386,39 @@ def lot_aliases(item: Dict[str, Any]) -> Set[str]:
 
 
 def load_permanent_seen_keys_sync() -> Set[str]:
-    """Fail closed if Sheets is unavailable; read historical ID/number/URL aliases."""
+    """Fail closed if Sheets is unavailable; read historical ID/number/URL aliases
+    from the tender sheet and, if present, its archive."""
     worksheet = open_worksheet()
     if worksheet is None:
         raise RuntimeError("Google Sheets unavailable: dedup cannot be verified")
     values = worksheet.get_all_values()
     if not values:
         raise RuntimeError("Google Sheets empty: dedup cannot be verified")
-    headers = [str(h).strip() for h in values[0]]
-    index = {name: i for i, name in enumerate(headers)}
     candidates = ("Stable Key", "ID", "Номер лота", "Ссылка", "Хеш")
-    if not any(h in index for h in candidates):
+    headers = {str(h).strip() for h in values[0]}
+    if not any(h in headers for h in candidates):
         raise RuntimeError("Google Sheets missing dedup identity columns")
+    tables = [values]
+    if TENDER_ARCHIVE_SHEET:
+        try:
+            archive = worksheet.spreadsheet.worksheet(TENDER_ARCHIVE_SHEET)
+        except Exception:
+            archive = None
+        if archive is not None:
+            tables.append(archive.get_all_values())
+    keys: Set[str] = set()
+    for table in tables:
+        keys |= seen_keys_from_values(table, candidates)
+    return keys
+
+
+def seen_keys_from_values(values: List[List[str]], candidates: Tuple[str, ...]) -> Set[str]:
+    if not values:
+        return set()
+    index = {str(name).strip(): i for i, name in enumerate(values[0])}
     rows = values[1:]
     keys: Set[str] = set()
-    # V35: lot links may sit in any column of old rows written by earlier versions.
+    # Lot links may sit in any column of old rows written by earlier versions.
     for row in rows:
         for value in row:
             for lot_id in LOT_URL_RE.findall(value or ""):
