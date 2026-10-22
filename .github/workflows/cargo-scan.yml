@@ -1,0 +1,77 @@
+name: Cargo scan - monitored
+
+on:
+  schedule:
+    - cron: "0,30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-production-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BASE_URL: https://ai-tender-agent.onrender.com
+    steps:
+      - name: Wake, start and verify scan
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          base = os.environ["CARGO_BASE_URL"].rstrip("/")
+          def get(path, timeout=35):
+              req = urllib.request.Request(base + path, headers={"User-Agent":"Cargo-Monitored-Scheduler/1.0"})
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  return json.load(response)
+          deadline = time.monotonic() + 600
+          while True:
+              try:
+                  health = get("/health")
+                  if health.get("status") == "ok":
+                      print("Health OK:", health.get("version"))
+                      break
+              except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                  print("Wake-up retry:", str(exc), flush=True)
+              if time.monotonic() >= deadline:
+                  raise SystemExit("Service did not become healthy within 10 minutes")
+              time.sleep(20)
+          before = get("/scan_status")
+          baseline = (before.get("started_at"), before.get("finished_at"))
+          deadline = time.monotonic() + 300
+          while True:
+              try:
+                  reply = get("/scan")
+                  print("Scan trigger:", reply.get("status"))
+                  if reply.get("status") in ("accepted", "already_running"):
+                      break
+                  if reply.get("status") not in ("warming_up", "warming_up_retry"):
+                      raise SystemExit("Unexpected scan response: " + str(reply))
+              except (urllib.error.URLError, TimeoutError) as exc:
+                  print("Scan trigger retry:", str(exc), flush=True)
+              if time.monotonic() >= deadline:
+                  raise SystemExit("Scan was not accepted within 5 minutes")
+              time.sleep(15)
+          deadline = time.monotonic() + 480
+          while time.monotonic() < deadline:
+              try:
+                  current = get("/scan_status")
+                  changed = (current.get("started_at"), current.get("finished_at")) != baseline
+                  if changed and not current.get("running") and current.get("last_result"):
+                      result = current["last_result"]
+                      print("Scan result:", json.dumps(result, ensure_ascii=False))
+                      if result.get("status") != "success" or result.get("errors"):
+                          raise SystemExit("Scan failed or partially succeeded")
+                      print("Verified completed scan")
+                      break
+              except (urllib.error.URLError, TimeoutError) as exc:
+                  print("Status retry:", str(exc), flush=True)
+              time.sleep(15)
+          else:
+              raise SystemExit("Scan did not complete within 8 minutes")
+          PY
