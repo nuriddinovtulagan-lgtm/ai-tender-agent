@@ -16,6 +16,9 @@ Core guarantees:
 - External cron may call /health or /scan; duplicate runs are protected.
 - V36 (stage 0): shared base in the same spreadsheet (package trans_ocean) and the
   Coordinator agent: 9:00 digest, approval tasks with Telegram buttons, journal.
+- V37 (stage 1): Sales agent (trans_ocean/sales.py): letters to forwarders and
+  international carriers from "Компании" -> approval in Telegram -> sent via mail.ru SMTP,
+  deals in "Сделки", one follow-up after FOLLOW_UP_DAYS. Nothing is sent without approval.
 
 Required environment variables:
 BOT_TOKEN
@@ -56,6 +59,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from trans_ocean.base import Base
 from trans_ocean.coordinator import Coordinator, Settings as CoordinatorSettings
+from trans_ocean.sales import Mailer, SalesAgent, SalesSettings
 from trans_ocean.telegram import Telegram
 
 try:
@@ -66,7 +70,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v36_stage0_coordinator"
+VERSION = "cargo_v37_stage1_sales"
 APP_NAME = "AI Tender Agent Cargo V36"
 TZ = timezone(timedelta(hours=5))
 
@@ -141,6 +145,22 @@ FOLLOW_UP_DAYS = max(1, int(os.getenv("FOLLOW_UP_DAYS", "5")))
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL", "").strip() or os.getenv("RENDER_EXTERNAL_URL", "").strip()).rstrip("/")
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+# V37 (stage 1): Sales agent. Letters go out only after approval in Telegram.
+SALES_ENABLED = os.getenv("SALES_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SALES_AUTO_PREPARE = os.getenv("SALES_AUTO_PREPARE", "false").lower() in {"1", "true", "yes", "on"}
+SALES_DAILY_LIMIT = max(0, int(os.getenv("SALES_DAILY_LIMIT", "5")))
+SALES_PREPARE_HOUR = int(os.getenv("SALES_PREPARE_HOUR", "10"))
+MAIL_SMTP_HOST = os.getenv("MAIL_SMTP_HOST", "smtp.mail.ru").strip()
+MAIL_SMTP_PORT = int(os.getenv("MAIL_SMTP_PORT", "465"))
+MAIL_USER = os.getenv("MAIL_USER", "ocean_logistics@mail.ru").strip()
+MAIL_APP_PASSWORD = os.getenv("MAIL_APP_PASSWORD", "").strip()
+
+# V37: keep the free Render instance awake by pinging our own public URL
+# (an idle free instance is stopped after ~15 minutes and then nothing runs: no scans,
+# no 9:00 digest). Harmless on a paid plan.
+KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+KEEPALIVE_MINUTES = max(5, int(os.getenv("KEEPALIVE_MINUTES", "10")))
 
 ACCEPT_PHRASES = [
     "перевозка груз", "грузоперевоз", "транспортные услуги",
@@ -1895,6 +1915,17 @@ def start_scheduled_scan(trigger: str) -> bool:
 _background_tasks: Set[asyncio.Task] = set()
 
 
+_last_keepalive_mono = 0.0
+
+
+async def keepalive_ping() -> None:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            await client.get(f"{PUBLIC_BASE_URL}/version")
+    except Exception as exc:
+        logger.warning("Keep-alive ping failed: %s", exc)
+
+
 async def scheduler_loop() -> None:
     """V35 built-in scheduler: scans every SCAN_INTERVAL_MINUTES while the process is awake.
     Reminders (9:00 / 17:00 digests, deadline alerts) run inside every scan."""
@@ -1906,6 +1937,18 @@ async def scheduler_loop() -> None:
                 tick_task = asyncio.create_task(coordinator.tick())
                 _background_tasks.add(tick_task)
                 tick_task.add_done_callback(_background_tasks.discard)
+            if SALES_ENABLED:
+                sales_task = asyncio.create_task(sales.tick())
+                _background_tasks.add(sales_task)
+                sales_task.add_done_callback(_background_tasks.discard)
+            if KEEPALIVE_ENABLED and PUBLIC_BASE_URL:
+                global _last_keepalive_mono
+                now_mono = time.monotonic()
+                if now_mono - _last_keepalive_mono >= KEEPALIVE_MINUTES * 60:
+                    _last_keepalive_mono = now_mono
+                    ping_task = asyncio.create_task(keepalive_ping())
+                    _background_tasks.add(ping_task)
+                    ping_task.add_done_callback(_background_tasks.discard)
             next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
             with state_lock:
                 state.next_scheduled_run = next_run.strftime("%d.%m.%Y %H:%M")
@@ -1957,6 +2000,22 @@ coordinator = Coordinator(
     ),
 )
 
+sales = SalesAgent(
+    base_factory=open_base,
+    mailer=Mailer(MAIL_SMTP_HOST, MAIL_SMTP_PORT, MAIL_USER, MAIL_APP_PASSWORD,
+                  timeout=REQUEST_TIMEOUT_SECONDS),
+    notify=lambda text: coordinator.telegram.send(text) if coordinator.telegram.configured else None,
+    registry_load=load_reminder_registry_sync,
+    registry_save=save_reminder_registry_entry_sync,
+    settings=SalesSettings(
+        auto_prepare=SALES_AUTO_PREPARE,
+        daily_limit=SALES_DAILY_LIMIT,
+        prepare_hour=SALES_PREPARE_HOUR,
+        follow_up_days=FOLLOW_UP_DAYS,
+        tick_minutes=COORDINATOR_TICK_MINUTES,
+    ),
+)
+
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
 
@@ -1975,7 +2034,8 @@ async def root() -> Dict[str, Any]:
             "/scan_status", "/metrics", "/logs", "/debug/uzex",
             "/debug/lot/{lot_id}", "/reminders/run", "/reminders/status", "/admin/rebuild_dedup_cache",
             "/admin/setup_base", "/coordinator/status", "/coordinator/digest", "/coordinator/tick",
-            "/tasks", "/telegram/webhook", "/admin/set_webhook", "/docs",
+            "/tasks", "/telegram/webhook", "/admin/set_webhook",
+            "/sales/status", "/sales/prepare", "/sales/followups", "/sales/send", "/sales/test_email", "/docs",
         ],
     }
 
@@ -2317,6 +2377,11 @@ async def coordinator_status() -> Dict[str, Any]:
         "management_chat_configured": bool(MANAGEMENT_CHAT_ID),
         "digest_hour": COORDINATOR_DIGEST_HOUR,
         "tick_minutes": COORDINATOR_TICK_MINUTES,
+        "process_started_at": coordinator.started_at,
+        "now": now_local().strftime("%Y-%m-%d %H:%M"),
+        "scheduler_enabled": SCHEDULER_ENABLED,
+        "last_tick_attempt": coordinator.last_tick_attempt,
+        "ticks_skipped_busy": coordinator.ticks_skipped_busy,
         "last_result": coordinator.last_result,
         "webhook": webhook,
     }
@@ -2351,7 +2416,13 @@ async def telegram_webhook(request: Request,
         raise HTTPException(status_code=403, detail="bad secret")
     update = await request.json()
     try:
-        return await coordinator.handle_update(update)
+        result = await coordinator.handle_update(update)
+        if SALES_ENABLED and result.get("status") == "Утверждено":
+            # Send an approved letter right away instead of waiting for the next tick.
+            send_task = asyncio.create_task(sales.run_send())
+            _background_tasks.add(send_task)
+            send_task.add_done_callback(_background_tasks.discard)
+        return result
     except Exception as exc:
         logger.exception("Telegram update failed")
         return {"handled": False, "error": str(exc)}
@@ -2367,6 +2438,66 @@ async def set_webhook(x_admin_token: Optional[str] = Header(None),
     result = await coordinator.telegram.set_webhook(
         f"{PUBLIC_BASE_URL}/telegram/webhook", TELEGRAM_WEBHOOK_SECRET)
     return {"status": "ok", "result": result}
+
+
+# ---------------------------------------------------------------------------
+# V37 stage 1: Sales agent
+# ---------------------------------------------------------------------------
+
+@app.get("/sales/status")
+async def sales_status() -> Dict[str, Any]:
+    return {
+        "enabled": SALES_ENABLED,
+        "auto_prepare": SALES_AUTO_PREPARE,
+        "daily_limit": SALES_DAILY_LIMIT,
+        "prepare_hour": SALES_PREPARE_HOUR,
+        "mail_configured": sales.mailer.configured,
+        "mail_user": MAIL_USER,
+        "last_result": sales.last_result,
+    }
+
+
+@app.post("/sales/prepare")
+async def sales_prepare(limit: int = Query(3, ge=1, le=20),
+                        x_admin_token: Optional[str] = Header(None),
+                        token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Prepare up to `limit` first letters; each goes to Telegram for approval."""
+    require_admin(x_admin_token or token)
+    result = await asyncio.to_thread(sales.prepare, limit)
+    await coordinator.tick(force=True)
+    return result
+
+
+@app.post("/sales/followups")
+async def sales_followups(limit: int = Query(5, ge=1, le=20),
+                          x_admin_token: Optional[str] = Header(None),
+                          token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    require_admin(x_admin_token or token)
+    result = await asyncio.to_thread(sales.prepare_followups, limit)
+    await coordinator.tick(force=True)
+    return result
+
+
+@app.post("/sales/send")
+async def sales_send(x_admin_token: Optional[str] = Header(None),
+                     token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Send letters already approved in Telegram (normally happens by itself)."""
+    require_admin(x_admin_token or token)
+    return await sales.run_send()
+
+
+@app.post("/sales/test_email")
+async def sales_test_email(to: str = Query(...),
+                           x_admin_token: Optional[str] = Header(None),
+                           token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Send a short test e-mail to check the mailbox settings."""
+    require_admin(x_admin_token or token)
+    if not sales.mailer.configured:
+        raise HTTPException(status_code=400, detail="MAIL_USER / MAIL_APP_PASSWORD are not set")
+    message_id = await asyncio.to_thread(
+        sales.mailer.send, to, "Trans Ocean Logistics — проверка почты",
+        "Это тестовое письмо агента Продаж. Если вы его получили, отправка писем настроена правильно.")
+    return {"status": "sent", "to": to, "message_id": message_id}
 
 
 @app.exception_handler(Exception)
