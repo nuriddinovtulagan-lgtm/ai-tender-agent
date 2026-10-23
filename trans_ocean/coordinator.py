@@ -32,6 +32,10 @@ class Settings:
     follow_up_days: int = 5
     document_warn_days: int = 30
     max_items: int = 5
+    # If the bot was asleep at digest time, send the digest when it wakes up, until this hour.
+    digest_last_hour: int = 20
+    # A tick that takes longer than this is cancelled, so one hung request cannot block the agent.
+    tick_timeout_seconds: int = 240
 
 
 def esc(value: Any) -> str:
@@ -147,6 +151,9 @@ class Coordinator:
         self._last_tick: Optional[float] = None
         self._lock = asyncio.Lock()
         self.last_result: Dict[str, Any] = {}
+        self.started_at = stamp()
+        self.last_tick_attempt = ""
+        self.ticks_skipped_busy = 0
 
     def _base(self) -> Base:
         base = self.base_factory()
@@ -155,9 +162,11 @@ class Coordinator:
         return base
 
     def digest_window_open(self) -> bool:
+        """From digest_hour until digest_last_hour. send_digest() sends once per day, so a bot
+        that was asleep at 9:00 still sends the digest as soon as it wakes up."""
         now = now_local()
-        start = now.replace(hour=self.settings.digest_hour, minute=0, second=0, microsecond=0)
-        return 0 <= (now - start).total_seconds() <= self.settings.window_minutes * 60
+        return self.settings.digest_hour <= now.hour < max(self.settings.digest_last_hour,
+                                                         self.settings.digest_hour + 1)
 
     async def send_digest(self, force: bool = False) -> Dict[str, Any]:
         key = f"coordinator:digest:{now_local().strftime('%Y-%m-%d')}"
@@ -213,23 +222,32 @@ class Coordinator:
         if not force and self._last_tick is not None and now_mono - self._last_tick < self.settings.tick_minutes * 60:
             return {"skipped": "not_due"}
         if self._lock.locked():
+            self.ticks_skipped_busy += 1
             return {"skipped": "busy"}
         async with self._lock:
             self._last_tick = now_mono
+            self.last_tick_attempt = stamp()
             result: Dict[str, Any] = {"time": stamp(), "errors": []}
             try:
-                result["approvals_posted"] = await self.post_pending_approvals()
-            except Exception as exc:
-                result["errors"].append(f"approvals: {exc}")
-                logger.exception("Coordinator approvals failed")
-            if self.digest_window_open():
-                try:
-                    result["digest"] = await self.send_digest()
-                except Exception as exc:
-                    result["errors"].append(f"digest: {exc}")
-                    logger.exception("Coordinator digest failed")
+                await asyncio.wait_for(self._tick_body(result), timeout=self.settings.tick_timeout_seconds)
+            except asyncio.TimeoutError:
+                result["errors"].append(f"tick timeout after {self.settings.tick_timeout_seconds}s")
+                logger.error("Coordinator tick timed out")
             self.last_result = result
             return result
+
+    async def _tick_body(self, result: Dict[str, Any]) -> None:
+        try:
+            result["approvals_posted"] = await self.post_pending_approvals()
+        except Exception as exc:
+            result["errors"].append(f"approvals: {exc!r}")
+            logger.exception("Coordinator approvals failed")
+        if self.digest_window_open():
+            try:
+                result["digest"] = await self.send_digest()
+            except Exception as exc:
+                result["errors"].append(f"digest: {exc!r}")
+                logger.exception("Coordinator digest failed")
 
     async def handle_update(self, update: Dict[str, Any]) -> Dict[str, Any]:
         callback = update.get("callback_query")

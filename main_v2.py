@@ -156,6 +156,12 @@ MAIL_SMTP_PORT = int(os.getenv("MAIL_SMTP_PORT", "465"))
 MAIL_USER = os.getenv("MAIL_USER", "ocean_logistics@mail.ru").strip()
 MAIL_APP_PASSWORD = os.getenv("MAIL_APP_PASSWORD", "").strip()
 
+# V37: keep the free Render instance awake by pinging our own public URL
+# (an idle free instance is stopped after ~15 minutes and then nothing runs: no scans,
+# no 9:00 digest). Harmless on a paid plan.
+KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+KEEPALIVE_MINUTES = max(5, int(os.getenv("KEEPALIVE_MINUTES", "10")))
+
 ACCEPT_PHRASES = [
     "перевозка груз", "грузоперевоз", "транспортные услуги",
     "транспортная услуга", "транспортно-экспедицион",
@@ -1909,6 +1915,17 @@ def start_scheduled_scan(trigger: str) -> bool:
 _background_tasks: Set[asyncio.Task] = set()
 
 
+_last_keepalive_mono = 0.0
+
+
+async def keepalive_ping() -> None:
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            await client.get(f"{PUBLIC_BASE_URL}/version")
+    except Exception as exc:
+        logger.warning("Keep-alive ping failed: %s", exc)
+
+
 async def scheduler_loop() -> None:
     """V35 built-in scheduler: scans every SCAN_INTERVAL_MINUTES while the process is awake.
     Reminders (9:00 / 17:00 digests, deadline alerts) run inside every scan."""
@@ -1924,6 +1941,14 @@ async def scheduler_loop() -> None:
                 sales_task = asyncio.create_task(sales.tick())
                 _background_tasks.add(sales_task)
                 sales_task.add_done_callback(_background_tasks.discard)
+            if KEEPALIVE_ENABLED and PUBLIC_BASE_URL:
+                global _last_keepalive_mono
+                now_mono = time.monotonic()
+                if now_mono - _last_keepalive_mono >= KEEPALIVE_MINUTES * 60:
+                    _last_keepalive_mono = now_mono
+                    ping_task = asyncio.create_task(keepalive_ping())
+                    _background_tasks.add(ping_task)
+                    ping_task.add_done_callback(_background_tasks.discard)
             next_run = now_local() + timedelta(minutes=SCAN_INTERVAL_MINUTES)
             with state_lock:
                 state.next_scheduled_run = next_run.strftime("%d.%m.%Y %H:%M")
@@ -2352,6 +2377,11 @@ async def coordinator_status() -> Dict[str, Any]:
         "management_chat_configured": bool(MANAGEMENT_CHAT_ID),
         "digest_hour": COORDINATOR_DIGEST_HOUR,
         "tick_minutes": COORDINATOR_TICK_MINUTES,
+        "process_started_at": coordinator.started_at,
+        "now": now_local().strftime("%Y-%m-%d %H:%M"),
+        "scheduler_enabled": SCHEDULER_ENABLED,
+        "last_tick_attempt": coordinator.last_tick_attempt,
+        "ticks_skipped_busy": coordinator.ticks_skipped_busy,
         "last_result": coordinator.last_result,
         "webhook": webhook,
     }

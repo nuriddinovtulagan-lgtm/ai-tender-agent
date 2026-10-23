@@ -160,3 +160,22 @@ def test_followup_after_due_date():
     assert agent.send_approved()["sent"][0]["followup"] is True
     assert base.records("Сделки")[0]["Следующий шаг"] == "Звонок / ждём ответа"
     assert agent.prepare_followups()["followups"] == 0
+
+
+def test_coordinator_catches_up_digest_and_times_out():
+    import asyncio
+    from trans_ocean.coordinator import Coordinator, Settings
+
+    class SlowTelegram:
+        configured = True
+        chat_id = "1"
+
+        async def send(self, text, buttons=None):
+            await asyncio.sleep(5)
+
+    c = Coordinator(lambda: make_base(), SlowTelegram(), lambda: {}, lambda k, v, d: None,
+                    lambda: [], Settings(digest_hour=0, digest_last_hour=24, tick_timeout_seconds=1))
+    assert c.digest_window_open()
+    result = asyncio.run(c.tick(force=True))
+    assert any("timeout" in e for e in result["errors"])
+    assert c.last_tick_attempt and not c._lock.locked()
