@@ -23,6 +23,8 @@ Core guarantees:
   "Параметры машин" / "Параметры цены" / "Расстояния"; /price command in the management group.
 - V39: hired truck is the default (the company mostly hires): price = market average from
   "Ставки рынка" + overhead + risk + payment delay + margin; /rate records a hire price.
+- V40 (stage 3): Document specialist (trans_ocean/documents.py): company requisites and documents
+  with expiry dates; /documents status; /paket <лот> sends a draft tender package (Word) to the group.
 
 Required environment variables:
 BOT_TOKEN
@@ -65,6 +67,7 @@ from trans_ocean.base import Base
 from trans_ocean.coordinator import Coordinator, Settings as CoordinatorSettings
 from trans_ocean.sales import Mailer, SalesAgent, SalesSettings
 from trans_ocean.economist import Economist
+from trans_ocean.documents import DocumentAgent, HELP as DOCS_HELP
 from trans_ocean.telegram import Telegram
 
 try:
@@ -75,8 +78,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v39_hired_pricing"
-APP_NAME = "AI Tender Agent Cargo V39"
+VERSION = "cargo_v40_documents"
+APP_NAME = "AI Tender Agent Cargo V40"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2022,6 +2025,7 @@ sales = SalesAgent(
 )
 
 economist = Economist(open_base)
+document_agent = DocumentAgent(open_base)
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
@@ -2352,10 +2356,11 @@ async def setup_base(x_admin_token: Optional[str] = Header(None),
     sheets = await asyncio.to_thread(base.ensure_sheets)
     companies = await asyncio.to_thread(base.migrate_start_companies)
     economist_rows = await asyncio.to_thread(economist.setup, base)
+    document_rows = await asyncio.to_thread(document_agent.setup, base)
     await asyncio.to_thread(base.log, "Координатор", "Настройка общей базы",
                             json.dumps(sheets, ensure_ascii=False))
     return {"status": "ok", "sheets": sheets, "companies_added": companies,
-            "economist_rows_added": economist_rows}
+            "economist_rows_added": economist_rows, "document_rows_added": document_rows}
 
 
 @app.post("/coordinator/digest")
@@ -2435,6 +2440,31 @@ async def telegram_webhook(request: Request,
             f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
             chat_id=str(chat.get("id", "")))
         return {"handled": True, "command": "chatid"}
+    if text.lower().startswith(("/documents", "/paket")):
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            return {"handled": False, "reason": "wrong_chat"}
+        try:
+            if text.lower().startswith("/documents"):
+                reply, files = await asyncio.to_thread(document_agent.status_text), []
+            else:
+                await coordinator.telegram.send("⏳ Готовлю пакет документов…", chat_id=chat_id)
+                reply, files = await asyncio.to_thread(document_agent.package, text)
+        except Exception as exc:
+            logger.exception("Document agent failed")
+            if type(exc).__name__ == "WorksheetNotFound":
+                reply = (f"⚠️ В базе нет листа «{html.escape(str(exc))}». "
+                         "Откройте /docs и выполните POST /admin/setup_base.")
+            else:
+                reply = f"⚠️ Ошибка: {html.escape(str(exc))[:300]}"
+            files = []
+        await coordinator.telegram.send(reply, chat_id=chat_id)
+        for name, content in files:
+            try:
+                await coordinator.telegram.send_document(name, content, chat_id=chat_id)
+            except Exception:
+                logger.exception("Sending %s failed", name)
+        return {"handled": True, "command": "documents", "files": len(files)}
     if text.lower().startswith(("/price", "/rate")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
