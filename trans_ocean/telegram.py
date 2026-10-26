@@ -56,6 +56,18 @@ class Telegram:
                 raise RuntimeError(f"Telegram sendDocument: {result.get('description', response.status_code)}")
             return result.get("result") or {}
 
+    async def download(self, file_id: str, max_bytes: int = 20 * 1024 * 1024) -> bytes:
+        """Download a file sent to the bot (Telegram allows bots up to 20 MB)."""
+        import httpx
+
+        info = await self.call("getFile", {"file_id": file_id})
+        if int(info.get("file_size") or 0) > max_bytes:
+            raise RuntimeError("Файл больше 20 МБ")
+        async with httpx.AsyncClient(timeout=max(self.timeout, 60)) as client:
+            response = await client.get(f"https://api.telegram.org/file/bot{self.token}/{info['file_path']}")
+            response.raise_for_status()
+            return response.content
+
     async def edit(self, chat_id: Any, message_id: Any, text: str) -> None:
         await self.call("editMessageText", {
             "chat_id": chat_id, "message_id": message_id, "text": text[:4096],
