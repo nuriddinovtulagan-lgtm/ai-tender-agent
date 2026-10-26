@@ -19,6 +19,8 @@ Core guarantees:
 - V37 (stage 1): Sales agent (trans_ocean/sales.py): letters to forwarders and
   international carriers from "Компании" -> approval in Telegram -> sent via mail.ru SMTP,
   deals in "Сделки", one follow-up after FOLLOW_UP_DAYS. Nothing is sent without approval.
+- V38 (stage 2): Economist agent (trans_ocean/economist.py): trip cost and minimum price from
+  "Параметры машин" / "Параметры цены" / "Расстояния"; /price command in the management group.
 
 Required environment variables:
 BOT_TOKEN
@@ -60,6 +62,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from trans_ocean.base import Base
 from trans_ocean.coordinator import Coordinator, Settings as CoordinatorSettings
 from trans_ocean.sales import Mailer, SalesAgent, SalesSettings
+from trans_ocean.economist import Economist
 from trans_ocean.telegram import Telegram
 
 try:
@@ -70,8 +73,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v37_stage1_sales"
-APP_NAME = "AI Tender Agent Cargo V36"
+VERSION = "cargo_v38_stage2_economist"
+APP_NAME = "AI Tender Agent Cargo V38"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2016,6 +2019,8 @@ sales = SalesAgent(
     ),
 )
 
+economist = Economist(open_base)
+
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
 
@@ -2035,7 +2040,8 @@ async def root() -> Dict[str, Any]:
             "/debug/lot/{lot_id}", "/reminders/run", "/reminders/status", "/admin/rebuild_dedup_cache",
             "/admin/setup_base", "/coordinator/status", "/coordinator/digest", "/coordinator/tick",
             "/tasks", "/telegram/webhook", "/admin/set_webhook",
-            "/sales/status", "/sales/prepare", "/sales/followups", "/sales/send", "/sales/test_email", "/docs",
+            "/sales/status", "/sales/prepare", "/sales/followups", "/sales/send", "/sales/test_email",
+            "/economist/calc", "/docs",
         ],
     }
 
@@ -2343,9 +2349,11 @@ async def setup_base(x_admin_token: Optional[str] = Header(None),
         raise HTTPException(status_code=400, detail="Google Sheets is not configured")
     sheets = await asyncio.to_thread(base.ensure_sheets)
     companies = await asyncio.to_thread(base.migrate_start_companies)
+    economist_rows = await asyncio.to_thread(economist.setup, base)
     await asyncio.to_thread(base.log, "Координатор", "Настройка общей базы",
                             json.dumps(sheets, ensure_ascii=False))
-    return {"status": "ok", "sheets": sheets, "companies_added": companies}
+    return {"status": "ok", "sheets": sheets, "companies_added": companies,
+            "economist_rows_added": economist_rows}
 
 
 @app.post("/coordinator/digest")
@@ -2415,6 +2423,27 @@ async def telegram_webhook(request: Request,
     if not TELEGRAM_WEBHOOK_SECRET or x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="bad secret")
     update = await request.json()
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    if text.lower().startswith("/chatid"):
+        # Lets the owner find a group's ID for MANAGEMENT_CHAT_ID / CHAT_ID (getUpdates does not work with a webhook).
+        chat = message.get("chat") or {}
+        await coordinator.telegram.send(
+            f"ID этой группы: <code>{html.escape(str(chat.get('id', '')))}</code>\n"
+            f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
+            chat_id=str(chat.get("id", "")))
+        return {"handled": True, "command": "chatid"}
+    if text.lower().startswith("/price"):
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            return {"handled": False, "reason": "wrong_chat"}
+        try:
+            reply = await asyncio.to_thread(economist.answer, text)
+        except Exception as exc:
+            logger.exception("Economist /price failed")
+            reply = f"⚠️ Ошибка расчёта: {html.escape(str(exc))[:300]}"
+        await coordinator.telegram.send(reply, chat_id=chat_id)
+        return {"handled": True, "command": "price"}
     try:
         result = await coordinator.handle_update(update)
         if SALES_ENABLED and result.get("status") == "Утверждено":
@@ -2498,6 +2527,36 @@ async def sales_test_email(to: str = Query(...),
         sales.mailer.send, to, "Trans Ocean Logistics — проверка почты",
         "Это тестовое письмо агента Продаж. Если вы его получили, отправка писем настроена правильно.")
     return {"status": "sent", "to": to, "message_id": message_id}
+
+
+# ---------------------------------------------------------------------------
+# V38 stage 2: Economist agent
+# ---------------------------------------------------------------------------
+
+@app.post("/economist/calc")
+async def economist_calc(origin: str = Query("", description="Откуда, например Ташкент"),
+                         destination: str = Query("", description="Куда, например Нукус"),
+                         vehicle: str = Query(..., description="Трал / Тент / Контейнеровоз / Бортовой"),
+                         km: Optional[float] = Query(None, description="Расстояние, если городов нет в листе"),
+                         hired_rate: Optional[float] = Query(None, description="Цена наёмной машины, сум"),
+                         purpose: str = Query("", description="Для какого тендера / сделки"),
+                         x_admin_token: Optional[str] = Header(None),
+                         token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Trip cost and minimum price; saved to "Расчёты цены" as a draft."""
+    require_admin(x_admin_token or token)
+    from trans_ocean.economist import MissingParams
+    try:
+        calc = await asyncio.to_thread(economist.calculate, origin, destination, vehicle, km,
+                                       hired_rate, purpose)
+    except MissingParams as exc:
+        raise HTTPException(status_code=400, detail={"missing_params": exc.missing})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok", "record_id": calc.record_id, "route": calc.route, "vehicle": calc.vehicle,
+            "km": calc.km, "days": calc.days, "fuel": round(calc.fuel), "driver": round(calc.driver),
+            "fixed": round(calc.fixed), "other": round(calc.other), "hired": round(calc.hired),
+            "cost": round(calc.cost), "min_price": round(calc.min_price),
+            "min_price_with_vat": round(calc.min_price_vat), "market_rates": calc.market}
 
 
 @app.exception_handler(Exception)
