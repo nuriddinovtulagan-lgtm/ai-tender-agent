@@ -39,6 +39,23 @@ class Telegram:
             payload["reply_markup"] = {"inline_keyboard": buttons}
         return await self.call("sendMessage", payload)
 
+    async def send_document(self, filename: str, content: bytes, caption: str = "",
+                            chat_id: Optional[str] = None) -> Dict[str, Any]:
+        import httpx
+
+        data = {"chat_id": str(chat_id or self.chat_id)}
+        if caption:
+            data.update({"caption": caption[:1024], "parse_mode": "HTML"})
+        async with httpx.AsyncClient(timeout=max(self.timeout, 60)) as client:
+            response = await client.post(
+                API.format(token=self.token, method="sendDocument"), data=data,
+                files={"document": (filename, content,
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document")})
+            result = response.json()
+            if not result.get("ok"):
+                raise RuntimeError(f"Telegram sendDocument: {result.get('description', response.status_code)}")
+            return result.get("result") or {}
+
     async def edit(self, chat_id: Any, message_id: Any, text: str) -> None:
         await self.call("editMessageText", {
             "chat_id": chat_id, "message_id": message_id, "text": text[:4096],
