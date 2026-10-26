@@ -21,6 +21,8 @@ Core guarantees:
   deals in "Сделки", one follow-up after FOLLOW_UP_DAYS. Nothing is sent without approval.
 - V38 (stage 2): Economist agent (trans_ocean/economist.py): trip cost and minimum price from
   "Параметры машин" / "Параметры цены" / "Расстояния"; /price command in the management group.
+- V39: hired truck is the default (the company mostly hires): price = market average from
+  "Ставки рынка" + overhead + risk + payment delay + margin; /rate records a hire price.
 
 Required environment variables:
 BOT_TOKEN
@@ -73,8 +75,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v38_stage2_economist"
-APP_NAME = "AI Tender Agent Cargo V38"
+VERSION = "cargo_v39_hired_pricing"
+APP_NAME = "AI Tender Agent Cargo V39"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2433,17 +2435,27 @@ async def telegram_webhook(request: Request,
             f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
             chat_id=str(chat.get("id", "")))
         return {"handled": True, "command": "chatid"}
-    if text.lower().startswith("/price"):
+    if text.lower().startswith(("/price", "/rate")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
             return {"handled": False, "reason": "wrong_chat"}
+        sender = message.get("from") or {}
+        who = " ".join(x for x in [sender.get("first_name"), sender.get("last_name")] if x) or sender.get("username") or ""
+        command = "rate" if text.lower().startswith("/rate") else "price"
         try:
-            reply = await asyncio.to_thread(economist.answer, text)
+            if command == "rate":
+                reply = await asyncio.to_thread(economist.add_rate, text, who)
+            else:
+                reply = await asyncio.to_thread(economist.answer, text)
         except Exception as exc:
-            logger.exception("Economist /price failed")
-            reply = f"⚠️ Ошибка расчёта: {html.escape(str(exc))[:300]}"
+            logger.exception("Economist /%s failed", command)
+            if type(exc).__name__ == "WorksheetNotFound":
+                reply = (f"⚠️ В базе нет листа «{html.escape(str(exc))}». "
+                         "Откройте /docs и выполните POST /admin/setup_base.")
+            else:
+                reply = f"⚠️ Ошибка: {html.escape(str(exc))[:300]}"
         await coordinator.telegram.send(reply, chat_id=chat_id)
-        return {"handled": True, "command": "price"}
+        return {"handled": True, "command": command}
     try:
         result = await coordinator.handle_update(update)
         if SALES_ENABLED and result.get("status") == "Утверждено":

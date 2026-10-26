@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import Base, new_id, now_local, stamp
+from .base import Base, new_id, now_local, parse_date, stamp
 
 AGENT = "Экономист"
 
@@ -49,6 +49,11 @@ DEFAULT_PRICE_PARAMS = [
     ("Маржа (%)", "15", "Наценка на себестоимость. Уточнить у руководителя."),
     ("НДС (%)", "12", "Ставка НДС. 0 — если цена без НДС."),
     ("Округление (сум)", "10000", "Минимальная цена округляется вверх до этой суммы."),
+    ("Накладные на рейс (сум)", "0", "Расходы компании на один рейс: диспетчер, связь, документы, погрузка."),
+    ("Риск (%)", "0", "Запас на простой, порчу, штрафы — % от себестоимости."),
+    ("Отсрочка оплаты (дней)", "0", "Через сколько дней заказчик обычно платит (госзаказчики — часто 30–60)."),
+    ("Стоимость денег (% в месяц)", "0", "Во что обходятся деньги, отданные перевозчику до оплаты заказчиком."),
+    ("Ставки рынка за (дней)", "90", "Для средней цены найма берутся ставки не старше этого срока."),
 ]
 
 # Approximate road distances from Tashkent. Check and correct in the sheet.
@@ -78,13 +83,23 @@ CITY_ALIASES = {
 }
 
 HIRE_WORDS = {"наём", "наем", "найм", "наёмная", "наемная", "hire", "yollanma"}
+OWN_WORDS = {"своя", "свой", "собственная", "own"}
 
 HELP = (
     "💰 <b>Экономист — расчёт цены рейса</b>\n\n"
-    "<code>/price Ташкент Нукус трал</code> — своя машина\n"
-    "<code>/price Ташкент Самарканд тент наём 4500000</code> — наёмная машина за 4,5 млн\n"
-    "<code>/price 450км контейнеровоз</code> — по расстоянию\n\n"
+    "<code>/price Ташкент Нукус тент</code> — наёмная машина по средней цене из «Ставок рынка»\n"
+    "<code>/price Ташкент Нукус тент наём 4500000</code> — наёмная машина за 4,5 млн\n"
+    "<code>/price Ташкент Нукус трал своя</code> — своя машина (нужны «Параметры машин»)\n"
+    "<code>/price 450км контейнеровоз своя</code> — по расстоянию\n\n"
+    "📝 Записать цену найма: <code>/rate Ташкент Нукус тент 4500000</code>\n\n"
     "Параметры — в листах «Параметры машин», «Параметры цены», «Расстояния»."
+)
+
+RATE_HELP = (
+    "📝 <b>Записать цену найма машины</b>\n\n"
+    "<code>/rate Ташкент Нукус тент 4500000</code>\n"
+    "<code>/rate Ташкент Самарканд трал 20т 6000000</code> — с тоннажем\n\n"
+    "Записывается в «Ставки рынка». По этим ценам Экономист считает наёмные рейсы."
 )
 
 
@@ -108,6 +123,10 @@ class Calculation:
     fixed: float = 0
     other: float = 0
     hired: float = 0
+    hired_source: str = ""
+    overhead: float = 0
+    risk: float = 0
+    financing: float = 0
     cost: float = 0
     margin_pct: float = 0
     vat_pct: float = 0
@@ -171,11 +190,17 @@ def find_distance(rows: List[Dict[str, str]], origin: str, destination: str) -> 
     return None
 
 
-def market_rates(rows: List[Dict[str, str]], origin: str, destination: str, vehicle: str) -> List[float]:
+def market_rates(rows: List[Dict[str, str]], origin: str, destination: str, vehicle: str,
+                 max_age_days: Optional[float] = None) -> List[float]:
     a, b = city_key(origin), city_key(destination)
     v = (vehicle or "").lower()[:4]
+    now = now_local()
     out = []
     for row in rows:
+        if max_age_days:
+            when = parse_date(row.get("Дата"))
+            if when is not None and (now - when).days > max_age_days:
+                continue
         if city_key(row.get("Откуда", "")) != a or city_key(row.get("Куда", "")) != b:
             continue
         if v and v not in (row.get("Тип машины") or "").lower():
@@ -200,8 +225,8 @@ def price_params(rows: List[Dict[str, str]]) -> Dict[str, float]:
 
 def compute(vehicle: Dict[str, str], km: float, prices: Dict[str, float],
             origin: str = "", destination: str = "", hired_rate: Optional[float] = None,
-            market: Optional[List[float]] = None) -> Calculation:
-    """Pure calculation. Raises MissingParams if the truck type row is not filled."""
+            market: Optional[List[float]] = None, hired_source: str = "") -> Calculation:
+    """Pure calculation. Raises MissingParams if an own-truck row is not filled."""
     margin = prices.get("Маржа (%)", 15.0)
     vat = prices.get("НДС (%)", 12.0)
     step = prices.get("Округление (сум)", 10000.0)
@@ -209,7 +234,8 @@ def compute(vehicle: Dict[str, str], km: float, prices: Dict[str, float],
                        own=hired_rate is None, margin_pct=margin, vat_pct=vat, market=market or [])
     if hired_rate is not None:
         calc.hired = hired_rate
-        calc.cost = hired_rate
+        calc.hired_source = hired_source or "указана"
+        base_cost = hired_rate
     else:
         missing = [f"{calc.vehicle}: {name}" for name in REQUIRED_VEHICLE if number(vehicle.get(name)) is None]
         if missing:
@@ -222,7 +248,12 @@ def compute(vehicle: Dict[str, str], km: float, prices: Dict[str, float],
         work_days = number(vehicle.get(V_WORK_DAYS)) or 22
         calc.fixed = (number(vehicle.get(V_FIXED_MONTH)) or 0) / work_days * calc.days
         calc.other = number(vehicle.get(V_OTHER)) or 0
-        calc.cost = calc.fuel + calc.driver + calc.fixed + calc.other
+        base_cost = calc.fuel + calc.driver + calc.fixed + calc.other
+    calc.overhead = prices.get("Накладные на рейс (сум)", 0.0)
+    calc.risk = (base_cost + calc.overhead) * prices.get("Риск (%)", 0.0) / 100
+    calc.financing = (base_cost * prices.get("Стоимость денег (% в месяц)", 0.0) / 100
+                      * prices.get("Отсрочка оплаты (дней)", 0.0) / 30)
+    calc.cost = base_cost + calc.overhead + calc.risk + calc.financing
     calc.min_price = round_up(calc.cost * (1 + margin / 100), step)
     calc.min_price_vat = round_up(calc.min_price * (1 + vat / 100), step)
     return calc
@@ -233,7 +264,8 @@ def parse_command(text: str, vehicle_rows: List[Dict[str, str]]) -> Dict[str, An
     body = re.sub(r"^/price(@\w+)?", "", (text or "").strip(), flags=re.I)
     body = re.sub(r"(\d)\s+(км|km)\b", r"\1км", body, flags=re.I)
     tokens = [t for t in re.split(r"[\s,;→—–\-]+", body) if t]
-    result: Dict[str, Any] = {"origin": "", "destination": "", "vehicle": None, "km": None, "hired": None}
+    result: Dict[str, Any] = {"origin": "", "destination": "", "vehicle": None, "km": None, "hired": None,
+                              "own": False}
     cities: List[str] = []
     i = 0
     while i < len(tokens):
@@ -242,6 +274,8 @@ def parse_command(text: str, vehicle_rows: List[Dict[str, str]]) -> Dict[str, An
         km_match = re.fullmatch(r"(\d+(?:[.,]\d+)?)(км|km)", low)
         if km_match:
             result["km"] = number(km_match.group(1))
+        elif low in OWN_WORDS:
+            result["own"] = True
         elif low in HIRE_WORDS:
             if i + 1 < len(tokens) and number(tokens[i + 1]) is not None:
                 result["hired"] = number(tokens[i + 1])
@@ -272,7 +306,13 @@ def format_result(calc: Calculation) -> str:
             f"📎 Прочие: {money(calc.other)}",
         ]
     else:
-        lines += ["", f"🚚 Наёмная машина: {money(calc.hired)}"]
+        lines += ["", f"🚚 Наёмная машина: {money(calc.hired)} ({html.escape(calc.hired_source)})"]
+    if calc.overhead:
+        lines.append(f"🗂 Накладные на рейс: {money(calc.overhead)}")
+    if calc.risk:
+        lines.append(f"🛡 Риск: {money(calc.risk)}")
+    if calc.financing:
+        lines.append(f"⏳ Отсрочка оплаты: {money(calc.financing)}")
     lines += [
         f"<b>Себестоимость: {money(calc.cost)}</b>",
         "",
@@ -308,9 +348,11 @@ class Economist:
         added = {}
         if not base.records(VEHICLE_SHEET):
             added[VEHICLE_SHEET] = base.append_many(VEHICLE_SHEET, DEFAULT_VEHICLES)
-        if not base.records(PRICE_SHEET):
-            added[PRICE_SHEET] = base.append_many(PRICE_SHEET, [
-                {"Параметр": n, "Значение": v, "Описание": d} for n, v, d in DEFAULT_PRICE_PARAMS])
+        known = {(r.get("Параметр") or "").strip() for r in base.records(PRICE_SHEET)}
+        new_params = [{"Параметр": n, "Значение": v, "Описание": d}
+                      for n, v, d in DEFAULT_PRICE_PARAMS if n not in known]
+        if new_params:
+            added[PRICE_SHEET] = base.append_many(PRICE_SHEET, new_params)
         if not base.records(DISTANCE_SHEET):
             added[DISTANCE_SHEET] = base.append_many(DISTANCE_SHEET, [
                 {"Откуда": a, "Куда": b, "Км": km, "Заметки": "примерно, проверить"} for a, b, km in DEFAULT_DISTANCES])
@@ -320,36 +362,53 @@ class Economist:
 
     def calculate(self, origin: str = "", destination: str = "", vehicle: str = "",
                   km: Optional[float] = None, hired_rate: Optional[float] = None,
-                  purpose: str = "", save: bool = True) -> Calculation:
+                  purpose: str = "", save: bool = True, own: bool = False) -> Calculation:
+        """hired_rate: a number = hired truck at that price; 0 = hired at the market average;
+        None = market average if there are rates (the company mostly hires), else own truck."""
         base = self._base()
         vehicles = base.records(VEHICLE_SHEET)
         row = find_vehicle(vehicles, vehicle)
         if row is None:
             names = ", ".join(v.get("Тип машины", "") for v in vehicles) or "лист пуст"
             raise ValueError(f"Тип машины «{vehicle}» не найден. Есть: {names}")
-        if km is None:
-            if not (origin and destination):
-                raise ValueError("Укажите два города или расстояние, например 450км")
+        if km is None and origin and destination:
             km = find_distance(base.records(DISTANCE_SHEET), origin, destination)
-            if km is None:
-                raise ValueError(f"Нет расстояния {origin} — {destination}. Добавьте его в лист «Расстояния» или укажите км.")
+        prices = price_params(base.records(PRICE_SHEET))
         try:
-            market = market_rates(base.records("Ставки рынка"), origin, destination, row.get("Тип машины", ""))
+            market = market_rates(base.records("Ставки рынка"), origin, destination, row.get("Тип машины", ""),
+                                  prices.get("Ставки рынка за (дней)", 90.0))
         except Exception:
             market = []
-        if hired_rate == 0.0 and market:
-            hired_rate = sum(market) / len(market)
-        elif hired_rate == 0.0:
-            raise ValueError("Для наёмной машины укажите её цену: … наём 4500000")
-        calc = compute(row, km, price_params(base.records(PRICE_SHEET)), origin, destination, hired_rate, market)
+        source = ""
+        if not own and hired_rate in (None, 0.0):
+            if market:
+                hired_rate = sum(market) / len(market)
+                source = f"средняя по {len(market)} ставкам"
+            elif hired_rate == 0.0 or km is None:
+                raise ValueError(f"Нет ставок найма по маршруту {origin} — {destination} ({row.get('Тип машины')}). "
+                                 "Укажите цену: … наём 4500000, или запишите ставку: /rate …")
+            elif any(number(row.get(n)) is None for n in REQUIRED_VEHICLE):
+                raise ValueError(f"Нет ставок найма по маршруту {origin} — {destination} ({row.get('Тип машины')}). "
+                                 "Укажите цену: … наём 4500000, или запишите ставку: /rate …")
+            else:
+                hired_rate = None          # no market data, own-truck parameters filled: own truck
+        if km is None:
+            if hired_rate is None:
+                if not (origin and destination):
+                    raise ValueError("Укажите два города или расстояние, например 450км")
+                raise ValueError(f"Нет расстояния {origin} — {destination}. Добавьте его в лист «Расстояния» или укажите км.")
+            km = 0.0
+        calc = compute(row, km, prices, origin, destination, hired_rate, market, source)
         if save:
             calc.record_id = new_id("R")
+            km_text = f" ({calc.km:g} км)" if calc.km else ""
             base.append(RESULT_SHEET, {
                 "ID": calc.record_id, "Дата": stamp(), "Для (тендер / сделка)": purpose,
-                "Маршрут": f"{calc.route} ({calc.km:g} км)", "Тип машины": calc.vehicle,
-                "Своя / наёмная": "своя" if calc.own else "наёмная",
+                "Маршрут": f"{calc.route}{km_text}", "Тип машины": calc.vehicle,
+                "Своя / наёмная": "своя" if calc.own else f"наёмная ({calc.hired_source})",
                 "Топливо (UZS)": round(calc.fuel), "Водитель (UZS)": round(calc.driver),
-                "Прочие расходы (UZS)": round(calc.fixed + calc.other + calc.hired),
+                "Прочие расходы (UZS)": round(calc.fixed + calc.other + calc.hired + calc.overhead
+                                              + calc.risk + calc.financing),
                 "Себестоимость (UZS)": round(calc.cost), "Маржа (%)": calc.margin_pct,
                 "Минимальная цена (UZS)": round(calc.min_price), "Итоговая цена (UZS)": "",
                 "Статус": "Черновик", "Утвердил": "",
@@ -357,6 +416,43 @@ class Economist:
             base.log(AGENT, "Расчёт цены", f"{calc.route}, {calc.vehicle}: себестоимость {round(calc.cost)}, "
                      f"мин. цена {round(calc.min_price)}", calc.record_id)
         return calc
+
+    def add_rate(self, text: str, who: str = "") -> str:
+        """/rate Ташкент Нукус тент [20т] 4500000 -> a row in "Ставки рынка"."""
+        base = self._base()
+        body = re.sub(r"^/rate(@\w+)?", "", (text or "").strip(), flags=re.I)
+        tonnage = ""
+        t_match = re.search(r"(\d+(?:[.,]\d+)?)\s*(т|тонн\w*|t)\b", body, flags=re.I)
+        if t_match:
+            tonnage = t_match.group(1).replace(",", ".")
+            body = body[:t_match.start()] + body[t_match.end():]
+        vehicles = base.records(VEHICLE_SHEET)
+        tokens = [t for t in re.split(r"[\s,;→—–\-]+", body) if t]
+        cities, vehicle, rate = [], None, None
+        for tok in tokens:
+            value = number(tok)
+            if value is not None and value >= 1000:
+                rate = value
+            elif vehicle is None and find_vehicle(vehicles, tok):
+                vehicle = find_vehicle(vehicles, tok)
+            elif value is None:
+                cities.append(tok)
+        if len(cities) < 2 or not vehicle or not rate:
+            return RATE_HELP
+        origin, destination = cities[0], cities[1]
+        base.append("Ставки рынка", {
+            "Дата": stamp(), "Откуда": origin, "Куда": destination,
+            "Тип машины": vehicle["Тип машины"], "Тоннаж (т)": tonnage, "Ставка": rate,
+            "Валюта": "UZS", "Источник": "диспетчер (Telegram)", "Ссылка": "", "Добавил": who,
+        })
+        base.log(AGENT, "Записана ставка найма", f"{origin} — {destination}, {vehicle['Тип машины']}: {rate:.0f}", "", who)
+        prices = price_params(base.records(PRICE_SHEET))
+        rates = market_rates(base.records("Ставки рынка"), origin, destination, vehicle["Тип машины"],
+                             prices.get("Ставки рынка за (дней)", 90.0))
+        avg = sum(rates) / len(rates) if rates else rate
+        return (f"📝 Записано: {html.escape(origin)} — {html.escape(destination)}, "
+                f"{html.escape(vehicle['Тип машины'])}: <b>{money(rate)}</b>\n"
+                f"Ставок по маршруту: {len(rates)}, средняя {money(avg)}")
 
     def answer(self, text: str) -> str:
         """Reply to a /price message in Telegram."""
@@ -366,11 +462,11 @@ class Economist:
             return HELP
         try:
             calc = self.calculate(args["origin"], args["destination"], args["vehicle"]["Тип машины"],
-                                  args["km"], args["hired"], purpose="запрос в Telegram")
+                                  args["km"], args["hired"], purpose="запрос в Telegram", own=args["own"])
         except MissingParams as exc:
-            return ("⚠️ Не заполнены параметры в листе «Параметры машин»:\n• "
+            return ("⚠️ Для своей машины не заполнены параметры в листе «Параметры машин»:\n• "
                     + "\n• ".join(html.escape(m) for m in exc.missing)
-                    + "\n\nПока можно посчитать наёмную машину: <code>… наём 4500000</code>")
+                    + "\n\nНаёмную машину можно посчитать сразу: <code>… наём 4500000</code>")
         except ValueError as exc:
             return f"⚠️ {html.escape(str(exc))}\n\n{HELP}"
         return format_result(calc)
