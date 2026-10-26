@@ -2425,6 +2425,14 @@ async def telegram_webhook(request: Request,
     update = await request.json()
     message = update.get("message") or {}
     text = (message.get("text") or "").strip()
+    if text.lower().startswith("/chatid"):
+        # Lets the owner find a group's ID for MANAGEMENT_CHAT_ID / CHAT_ID (getUpdates does not work with a webhook).
+        chat = message.get("chat") or {}
+        await coordinator.telegram.send(
+            f"ID этой группы: <code>{html.escape(str(chat.get('id', '')))}</code>\n"
+            f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
+            chat_id=str(chat.get("id", "")))
+        return {"handled": True, "command": "chatid"}
     if text.lower().startswith("/price"):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
