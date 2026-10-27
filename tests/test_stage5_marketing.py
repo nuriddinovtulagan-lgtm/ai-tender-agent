@@ -78,3 +78,24 @@ def test_collect_digest_and_buttons():
     assert any(c["Тип"] == "Проект" for c in base.records("Компании"))
     assert any(t["Агент"] == "Маркетинг" for t in base.records("Задачи"))
     assert asyncio.run(agent.post_digest(force=True))["posted"] == 0          # all already posted
+
+
+def test_broken_xml_and_atom_power_plant_headline():
+    broken = RSS.replace("</title>\n<link>https://www.spot.uz/ru/2026/10/26/acwa-wind/", " &nbsp; </title>\n<link>https://www.spot.uz/ru/2026/10/26/acwa-wind/")
+    broken += ("<item><title>В 2027 году на строительстве АЭС в Узбекистане начнутся масштабные работы — «Росатом»</title>"
+               "<link>https://www.spot.uz/ru/2026/10/24/aes/</link><pubDate>Sat, 24 Oct 2026 15:48:00 GMT</pubDate></item>")
+    items = parse_feed(broken, "spot.uz")
+    assert len(items) == 6
+    aes = score(items[-1])
+    assert aes.score >= 5 and "Энергетика" in aes.categories and "Росатом" in aes.companies
+
+
+def test_collect_reports_non_rss_source():
+    base = Base(FakeSpreadsheet([]))
+    base.ensure_sheets()
+
+    async def fetch(url):
+        return "<html><body>Checking your browser...</body></html>"
+
+    result = asyncio.run(MarketingAgent(lambda: base, FakeTelegram(), fetch=fetch, feeds=["https://x.uz/rss"]).collect())
+    assert result["per_feed"] == {"x.uz": 0} and "не RSS" in result["errors"][0]

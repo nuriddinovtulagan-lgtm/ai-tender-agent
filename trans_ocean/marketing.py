@@ -87,26 +87,39 @@ class Lead:
 
 # ---------------------------------------------------------------- pure helpers
 
+def _tag(block: str, name: str) -> str:
+    m = re.search(rf"<{name}[^>]*>(.*?)</{name}>", block, flags=re.S | re.I)
+    if not m:
+        return ""
+    value = m.group(1).strip()
+    cdata = re.match(r"<!\[CDATA\[(.*)\]\]>$", value, flags=re.S)
+    return cdata.group(1) if cdata else value
+
+
 def parse_feed(xml_text: str, source: str) -> List[Lead]:
+    """RSS items. Tolerant: if the XML is broken (stray HTML entities etc.), items are cut
+    out with regular expressions instead of failing silently."""
+    raw = []
     try:
         root = ET.fromstring(xml_text.encode("utf-8") if isinstance(xml_text, str) else xml_text)
+        for item in root.iter("item"):
+            raw.append((item.findtext("title") or "", item.findtext("link") or "",
+                        item.findtext("description") or "", item.findtext("pubDate") or ""))
     except ET.ParseError:
-        return []
+        for block in re.findall(r"<item[\s>].*?</item>", xml_text or "", flags=re.S | re.I):
+            raw.append((_tag(block, "title"), _tag(block, "link"), _tag(block, "description"), _tag(block, "pubDate")))
     items = []
-    for item in root.iter("item"):
-        title = (item.findtext("title") or "").strip()
-        link = (item.findtext("link") or "").strip()
-        desc = re.sub(r"<[^>]+>", " ", item.findtext("description") or "")
+    for title, link, desc, raw_date in raw:
+        title, link = html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(), link.strip()
         published = None
-        raw_date = item.findtext("pubDate")
         if raw_date:
             try:
-                published = email.utils.parsedate_to_datetime(raw_date)
+                published = email.utils.parsedate_to_datetime(raw_date.strip())
             except (TypeError, ValueError):
                 published = None
         if title and link:
-            items.append(Lead(title=html.unescape(title), link=link, source=source, published=published,
-                              text=html.unescape(re.sub(r"\s+", " ", desc)).strip()))
+            text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", desc))).strip()
+            items.append(Lead(title=title, link=link, source=source, published=published, text=text))
     return items
 
 
@@ -132,7 +145,7 @@ def score(lead: Lead) -> Lead:
 
 
 def pick_leads(items: List[Lead], known_links: set, now: Optional[datetime] = None,
-               max_age_days: int = 3) -> List[Lead]:
+               max_age_days: int = 5) -> List[Lead]:
     now = now or now_local()
     out, seen = [], set(known_links)
     for item in items:
@@ -203,11 +216,20 @@ class MarketingAgent:
     async def collect(self) -> Dict[str, Any]:
         items: List[Lead] = []
         errors = []
+        per_feed: Dict[str, int] = {}
         for url in self.feeds:
+            name = re.sub(r"^https?://(www\.)?", "", url).split("/")[0]
             try:
-                items += parse_feed(await self.fetch(url), re.sub(r"^https?://(www\.)?", "", url).split("/")[0])
+                body = await self.fetch(url)
+                parsed = parse_feed(body, name)
+                per_feed[name] = len(parsed)
+                if not parsed:
+                    start = re.sub(r"\s+", " ", body[:80])
+                    errors.append(f"{name}: 0 новостей (сайт вернул не RSS: {start!r})")
+                items += parsed
             except Exception as exc:
-                errors.append(f"{url}: {exc}")
+                per_feed[name] = 0
+                errors.append(f"{name}: {exc}")
         base = await asyncio.to_thread(self._base)
         known = {r.get("Ссылка", "") for r in await asyncio.to_thread(base.records, SHEET)}
         leads = pick_leads(items, known)
@@ -219,7 +241,7 @@ class MarketingAgent:
         if rows:
             await asyncio.to_thread(base.append_many, SHEET, rows)
             await asyncio.to_thread(base.log, AGENT, "Найдены новые лиды", f"{len(rows)} из {len(items)} новостей")
-        return {"news": len(items), "new_leads": len(rows), "errors": errors}
+        return {"news": len(items), "new_leads": len(rows), "errors": errors, "per_feed": per_feed}
 
     async def post_digest(self, force: bool = False, chat_id: Optional[str] = None) -> Dict[str, Any]:
         key = f"marketing:digest:{now_local().strftime('%Y-%m-%d')}"
