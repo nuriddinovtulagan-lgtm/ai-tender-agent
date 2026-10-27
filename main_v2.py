@@ -84,7 +84,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v42_1_marketing_fix"
+VERSION = "cargo_v42_2_companies_import"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -2650,6 +2650,27 @@ async def sales_test_email(to: str = Query(...),
         sales.mailer.send, to, "Trans Ocean Logistics — проверка почты",
         "Это тестовое письмо агента Продаж. Если вы его получили, отправка писем настроена правильно.")
     return {"status": "sent", "to": to, "message_id": message_id}
+
+
+@app.post("/admin/import_companies")
+async def import_companies_endpoint(batch: str = Query("2026_10_27", description="Набор данных из trans_ocean/data"),
+                                    x_admin_token: Optional[str] = Header(None),
+                                    token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Add companies / fill empty contacts from trans_ocean/data/companies_<batch>.json.
+    Existing filled values are never overwritten."""
+    require_admin(x_admin_token or token)
+    from trans_ocean.base import import_companies
+    if not re.fullmatch(r"[\w-]+", batch):
+        raise HTTPException(status_code=400, detail="bad batch name")
+    path = BASE_DIR / "trans_ocean" / "data" / f"companies_{batch}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"no file {path.name}")
+    items = json.loads(path.read_text(encoding="utf-8"))
+    base = await asyncio.to_thread(open_base)
+    if base is None:
+        raise HTTPException(status_code=400, detail="Google Sheets is not configured")
+    result = await asyncio.to_thread(import_companies, base, items, f"импорт {batch}")
+    return {"status": "ok", "added": len(result["added"]), "updated": len(result["updated"]), **result}
 
 
 @app.get("/marketing/status")
