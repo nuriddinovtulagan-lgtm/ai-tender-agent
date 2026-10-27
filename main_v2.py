@@ -84,7 +84,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v42_3_lawyer_knowledge"
+VERSION = "cargo_v42_4_import_file_fix"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -2665,7 +2665,7 @@ async def import_companies_endpoint(batch: str = Query("2026_10_27", description
     from trans_ocean.base import import_companies
     if not re.fullmatch(r"[\w-]+", batch):
         raise HTTPException(status_code=400, detail="bad batch name")
-    path = BASE_DIR / "trans_ocean" / "data" / f"companies_{batch}.json"
+    path = BASE_DIR / "trans_ocean" / "imports" / f"companies_{batch}.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no file {path.name}")
     items = json.loads(path.read_text(encoding="utf-8"))
