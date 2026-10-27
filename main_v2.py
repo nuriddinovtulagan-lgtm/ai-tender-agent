@@ -84,7 +84,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v42_marketing"
+VERSION = "cargo_v42_1_marketing_fix"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -2477,6 +2477,10 @@ async def telegram_webhook(request: Request,
         try:
             await coordinator.telegram.send("🔎 Смотрю свежие новости…", chat_id=chat_id)
             collected = await marketing.collect()
+            feeds = ", ".join(f"{k}: {v}" for k, v in collected.get("per_feed", {}).items())
+            await coordinator.telegram.send(
+                f"Прочитано новостей: {collected.get('news', 0)} ({html.escape(feeds)}); "
+                f"новых проектов: {collected.get('new_leads', 0)}", chat_id=chat_id)
             await marketing.post_digest(force=True, chat_id=chat_id)
             if collected.get("errors"):
                 await coordinator.telegram.send("⚠️ Не открылись: " + html.escape("; ".join(collected["errors"]))[:500],
