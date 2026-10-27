@@ -25,6 +25,8 @@ Core guarantees:
   "Ставки рынка" + overhead + risk + payment delay + margin; /rate records a hire price.
 - V40 (stage 3): Document specialist (trans_ocean/documents.py): company requisites and documents
   with expiry dates; /documents status; /paket <лот> sends a draft tender package (Word) to the group.
+- V41 (stage 4): Lawyer (trans_ocean/lawyer.py): /analiz of a tender PDF (terms and risks),
+  /etiroz draft objection to the protocol, /pretenziya late-payment claim with the contract penalty.
 
 Required environment variables:
 BOT_TOKEN
@@ -68,6 +70,7 @@ from trans_ocean.coordinator import Coordinator, Settings as CoordinatorSettings
 from trans_ocean.sales import Mailer, SalesAgent, SalesSettings
 from trans_ocean.economist import Economist
 from trans_ocean.documents import DocumentAgent, HELP as DOCS_HELP
+from trans_ocean.lawyer import LawyerAgent, HELP as LAWYER_HELP
 from trans_ocean.telegram import Telegram
 
 try:
@@ -78,8 +81,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v40_documents"
-APP_NAME = "AI Tender Agent Cargo V40"
+VERSION = "cargo_v41_lawyer"
+APP_NAME = "AI Tender Agent Cargo V41"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -2026,6 +2029,7 @@ sales = SalesAgent(
 
 economist = Economist(open_base)
 document_agent = DocumentAgent(open_base)
+lawyer = LawyerAgent(open_base, lambda base: document_agent._tender_tables(base))
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
@@ -2431,7 +2435,7 @@ async def telegram_webhook(request: Request,
         raise HTTPException(status_code=403, detail="bad secret")
     update = await request.json()
     message = update.get("message") or {}
-    text = (message.get("text") or "").strip()
+    text = (message.get("text") or message.get("caption") or "").strip()
     if text.lower().startswith("/chatid"):
         # Lets the owner find a group's ID for MANAGEMENT_CHAT_ID / CHAT_ID (getUpdates does not work with a webhook).
         chat = message.get("chat") or {}
@@ -2440,6 +2444,38 @@ async def telegram_webhook(request: Request,
             f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
             chat_id=str(chat.get("id", "")))
         return {"handled": True, "command": "chatid"}
+    if text.lower().startswith(("/analiz", "/etiroz", "/pretenziya", "/lawyer")):
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            return {"handled": False, "reason": "wrong_chat"}
+        files: List[Tuple[str, bytes]] = []
+        low = text.lower()
+        try:
+            if low.startswith("/analiz"):
+                document = message.get("document") or (message.get("reply_to_message") or {}).get("document")
+                if not document:
+                    reply = "📎 Отправьте PDF тендера с подписью /analiz или ответьте /analiz на сообщение с PDF."
+                elif not (document.get("file_name", "").lower().endswith(".pdf") or document.get("mime_type") == "application/pdf"):
+                    reply = "⚠️ Нужен файл PDF."
+                else:
+                    content = await coordinator.telegram.download(document["file_id"])
+                    reply = await asyncio.to_thread(lawyer.analyze_pdf, content, document.get("file_name", ""))
+            elif low.startswith("/etiroz"):
+                reply, files = await asyncio.to_thread(lawyer.objection, text)
+            elif low.startswith("/pretenziya"):
+                reply, files = await asyncio.to_thread(lawyer.claim, text)
+            else:
+                reply = LAWYER_HELP
+        except Exception as exc:
+            logger.exception("Lawyer failed")
+            reply = f"⚠️ Ошибка: {html.escape(str(exc))[:300]}"
+        await coordinator.telegram.send(reply, chat_id=chat_id)
+        for name, content in files:
+            try:
+                await coordinator.telegram.send_document(name, content, chat_id=chat_id)
+            except Exception:
+                logger.exception("Sending %s failed", name)
+        return {"handled": True, "command": "lawyer", "files": len(files)}
     if text.lower().startswith(("/documents", "/paket")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
