@@ -273,6 +273,56 @@ class Base:
         return added
 
 
+PLACEHOLDER_RE = ("xx", "уточнить", "найти", "форма на сайте")
+
+
+def is_placeholder(value: str) -> bool:
+    v = (value or "").strip().lower()
+    return not v or any(p in v for p in PLACEHOLDER_RE)
+
+
+def import_companies(base: "Base", items: List[Dict[str, Any]], who: str = "импорт") -> Dict[str, Any]:
+    """Add new companies and fill EMPTY fields of existing ones (matched by name, case-insensitive).
+    Filled values are never overwritten; placeholders like "+998 78 140-XX-XX (уточнить)" count as empty.
+    Notes are appended, not replaced."""
+    headers = SCHEMA["Компании"]
+    existing = {r.get("Название", "").strip().lower(): r for r in base.records("Компании")}
+    added, updated, unchanged = [], [], []
+    new_rows = []
+    for item in items:
+        name = str(item.get("Название", "")).strip()
+        if not name:
+            continue
+        row = existing.get(name.lower())
+        if row is None:
+            data = {h: "" for h in headers}
+            data.update({k: v for k, v in item.items() if k in headers})
+            data.update({"ID": new_id("C"), "Статус": item.get("Статус") or "Новый",
+                         "Добавлено": stamp(), "Добавил": who})
+            new_rows.append(data)
+            existing[name.lower()] = data
+            added.append(name)
+            continue
+        changes: Dict[str, Any] = {}
+        for key, value in item.items():
+            if key not in headers or key in ("ID", "Название") or not str(value).strip():
+                continue
+            if key == "Заметки":
+                if str(value) not in row.get("Заметки", ""):
+                    changes[key] = (row.get("Заметки", "") + "; " if row.get("Заметки") else "") + str(value)
+            elif is_placeholder(row.get(key, "")):
+                changes[key] = value
+        if changes:
+            base.update_fields("Компании", int(row["_row"]), changes)
+            updated.append(name)
+        else:
+            unchanged.append(name)
+    if new_rows:
+        base.append_many("Компании", new_rows)
+    base.log("Маркетинг", "Импорт компаний", f"{who}: добавлено {len(added)}, обновлено {len(updated)}")
+    return {"added": added, "updated": updated, "unchanged": unchanged}
+
+
 def map_start_record(record: Dict[str, str], kind: str) -> Dict[str, Any]:
     row: Dict[str, Any] = {h: "" for h in SCHEMA["Компании"]}
     for target, candidates in START_SHEET_COLUMNS.items():
