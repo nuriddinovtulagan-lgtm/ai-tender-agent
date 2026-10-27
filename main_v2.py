@@ -27,6 +27,8 @@ Core guarantees:
   with expiry dates; /documents status; /paket <лот> sends a draft tender package (Word) to the group.
 - V41 (stage 4): Lawyer (trans_ocean/lawyer.py): /analiz of a tender PDF (terms and risks),
   /etiroz draft objection to the protocol, /pretenziya late-payment claim with the contract penalty.
+- V42 (stage 5): Marketing (trans_ocean/marketing.py): hourly scan of Uzbek business news (RSS) for
+  projects that need transport -> sheet "Лиды"; daily digest with "В работу / Пропустить" buttons.
 
 Required environment variables:
 BOT_TOKEN
@@ -71,6 +73,7 @@ from trans_ocean.sales import Mailer, SalesAgent, SalesSettings
 from trans_ocean.economist import Economist
 from trans_ocean.documents import DocumentAgent, HELP as DOCS_HELP
 from trans_ocean.lawyer import LawyerAgent, HELP as LAWYER_HELP
+from trans_ocean.marketing import DEFAULT_FEEDS, MarketingAgent
 from trans_ocean.telegram import Telegram
 
 try:
@@ -81,8 +84,8 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v41_lawyer"
-APP_NAME = "AI Tender Agent Cargo V41"
+VERSION = "cargo_v42_marketing"
+APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -170,6 +173,10 @@ MAIL_APP_PASSWORD = os.getenv("MAIL_APP_PASSWORD", "").strip()
 # V37: keep the free Render instance awake by pinging our own public URL
 # (an idle free instance is stopped after ~15 minutes and then nothing runs: no scans,
 # no 9:00 digest). Harmless on a paid plan.
+MARKETING_ENABLED = os.getenv("MARKETING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+MARKETING_DIGEST_HOUR = int(os.getenv("MARKETING_DIGEST_HOUR", "10"))
+MARKETING_FEEDS = [u.strip() for u in os.getenv("MARKETING_FEEDS", "").split(",") if u.strip()] or DEFAULT_FEEDS
+
 KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 KEEPALIVE_MINUTES = max(5, int(os.getenv("KEEPALIVE_MINUTES", "10")))
 
@@ -1948,6 +1955,10 @@ async def scheduler_loop() -> None:
                 tick_task = asyncio.create_task(coordinator.tick())
                 _background_tasks.add(tick_task)
                 tick_task.add_done_callback(_background_tasks.discard)
+            if MARKETING_ENABLED and coordinator.telegram.configured:
+                marketing_task = asyncio.create_task(marketing.tick())
+                _background_tasks.add(marketing_task)
+                marketing_task.add_done_callback(_background_tasks.discard)
             if SALES_ENABLED:
                 sales_task = asyncio.create_task(sales.tick())
                 _background_tasks.add(sales_task)
@@ -2030,6 +2041,10 @@ sales = SalesAgent(
 economist = Economist(open_base)
 document_agent = DocumentAgent(open_base)
 lawyer = LawyerAgent(open_base, lambda base: document_agent._tender_tables(base))
+marketing = MarketingAgent(open_base, coordinator.telegram,
+                           registry_load=load_reminder_registry_sync,
+                           registry_save=save_reminder_registry_entry_sync,
+                           feeds=MARKETING_FEEDS, digest_hour=MARKETING_DIGEST_HOUR)
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
@@ -2051,7 +2066,7 @@ async def root() -> Dict[str, Any]:
             "/admin/setup_base", "/coordinator/status", "/coordinator/digest", "/coordinator/tick",
             "/tasks", "/telegram/webhook", "/admin/set_webhook",
             "/sales/status", "/sales/prepare", "/sales/followups", "/sales/send", "/sales/test_email",
-            "/economist/calc", "/docs",
+            "/economist/calc", "/marketing/status", "/docs",
         ],
     }
 
@@ -2434,6 +2449,17 @@ async def telegram_webhook(request: Request,
     if not TELEGRAM_WEBHOOK_SECRET or x_telegram_bot_api_secret_token != TELEGRAM_WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="bad secret")
     update = await request.json()
+    callback = update.get("callback_query") or {}
+    if str(callback.get("data", "")).startswith("l:"):
+        chat_id = str(((callback.get("message") or {}).get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            await coordinator.telegram.answer_callback(callback["id"], "Кнопка работает только в группе управления")
+            return {"handled": False, "reason": "wrong_chat"}
+        try:
+            return await marketing.handle_callback(callback)
+        except Exception as exc:
+            logger.exception("Marketing callback failed")
+            return {"handled": False, "error": str(exc)}
     message = update.get("message") or {}
     text = (message.get("text") or message.get("caption") or "").strip()
     if text.lower().startswith("/chatid"):
@@ -2444,6 +2470,21 @@ async def telegram_webhook(request: Request,
             f"Название: {html.escape(str(chat.get('title') or chat.get('first_name') or ''))}",
             chat_id=str(chat.get("id", "")))
         return {"handled": True, "command": "chatid"}
+    if text.lower().startswith("/leads"):
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            return {"handled": False, "reason": "wrong_chat"}
+        try:
+            await coordinator.telegram.send("🔎 Смотрю свежие новости…", chat_id=chat_id)
+            collected = await marketing.collect()
+            await marketing.post_digest(force=True, chat_id=chat_id)
+            if collected.get("errors"):
+                await coordinator.telegram.send("⚠️ Не открылись: " + html.escape("; ".join(collected["errors"]))[:500],
+                                                chat_id=chat_id)
+        except Exception as exc:
+            logger.exception("Marketing /leads failed")
+            await coordinator.telegram.send(f"⚠️ Ошибка: {html.escape(str(exc))[:300]}", chat_id=chat_id)
+        return {"handled": True, "command": "leads"}
     if text.lower().startswith(("/analiz", "/etiroz", "/pretenziya", "/lawyer")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
@@ -2605,6 +2646,12 @@ async def sales_test_email(to: str = Query(...),
         sales.mailer.send, to, "Trans Ocean Logistics — проверка почты",
         "Это тестовое письмо агента Продаж. Если вы его получили, отправка писем настроена правильно.")
     return {"status": "sent", "to": to, "message_id": message_id}
+
+
+@app.get("/marketing/status")
+async def marketing_status() -> Dict[str, Any]:
+    return {"enabled": MARKETING_ENABLED, "digest_hour": MARKETING_DIGEST_HOUR, "feeds": MARKETING_FEEDS,
+            "last_result": marketing.last_result}
 
 
 # ---------------------------------------------------------------------------
