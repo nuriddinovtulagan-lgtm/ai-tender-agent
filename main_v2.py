@@ -84,7 +84,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v42_2_companies_import"
+VERSION = "cargo_v42_3_lawyer_knowledge"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -2489,7 +2489,7 @@ async def telegram_webhook(request: Request,
             logger.exception("Marketing /leads failed")
             await coordinator.telegram.send(f"⚠️ Ошибка: {html.escape(str(exc))[:300]}", chat_id=chat_id)
         return {"handled": True, "command": "leads"}
-    if text.lower().startswith(("/analiz", "/etiroz", "/pretenziya", "/lawyer")):
+    if text.lower().startswith(("/analiz", "/etiroz", "/pretenziya", "/lawyer", "/pravo")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
             return {"handled": False, "reason": "wrong_chat"}
@@ -2509,6 +2509,9 @@ async def telegram_webhook(request: Request,
                 reply, files = await asyncio.to_thread(lawyer.objection, text)
             elif low.startswith("/pretenziya"):
                 reply, files = await asyncio.to_thread(lawyer.claim, text)
+            elif low.startswith("/pravo"):
+                from trans_ocean.legal_kb import answer as legal_answer
+                reply = legal_answer(text)
             else:
                 reply = LAWYER_HELP
         except Exception as exc:
