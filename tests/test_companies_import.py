@@ -6,7 +6,7 @@ from pathlib import Path
 from trans_ocean.base import Base, import_companies
 from tests.test_stage0 import start_spreadsheet
 
-DATA = Path(__file__).resolve().parent.parent / "trans_ocean" / "data" / "companies_2026_10_27.json"
+DATA = Path(__file__).resolve().parent.parent / "trans_ocean" / "imports" / "companies_2026_10_27.json"
 
 
 def test_import_real_batch():
