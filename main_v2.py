@@ -29,6 +29,8 @@ Core guarantees:
   /etiroz draft objection to the protocol, /pretenziya late-payment claim with the contract penalty.
 - V42 (stage 5): Marketing (trans_ocean/marketing.py): hourly scan of Uzbek business news (RSS) for
   projects that need transport -> sheet "Лиды"; daily digest with "В работу / Пропустить" buttons.
+- V43 (stage 6): Dispatcher + Price agent (trans_ocean/dispatcher.py): a separate Telegram account reads
+  freight groups -> "Объявления", "Ставки рынка" (used by /price), "Перевозчики"; /mashina, /stavka, /rynok.
 
 Required environment variables:
 BOT_TOKEN
@@ -74,6 +76,8 @@ from trans_ocean.economist import Economist
 from trans_ocean.documents import DocumentAgent, HELP as DOCS_HELP
 from trans_ocean.lawyer import LawyerAgent, HELP as LAWYER_HELP
 from trans_ocean.marketing import DEFAULT_FEEDS, MarketingAgent
+from trans_ocean.dispatcher import (HELP as DISPATCHER_HELP, DispatcherAgent, NeedPassword,
+                                    Settings as DispatcherSettings, TelethonReader)
 from trans_ocean.telegram import Telegram
 
 try:
@@ -84,7 +88,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v42_4_import_file_fix"
+VERSION = "cargo_v43_dispatcher"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -176,6 +180,15 @@ MAIL_APP_PASSWORD = os.getenv("MAIL_APP_PASSWORD", "").strip()
 MARKETING_ENABLED = os.getenv("MARKETING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 MARKETING_DIGEST_HOUR = int(os.getenv("MARKETING_DIGEST_HOUR", "10"))
 MARKETING_FEEDS = [u.strip() for u in os.getenv("MARKETING_FEEDS", "").split(",") if u.strip()] or DEFAULT_FEEDS
+
+# V43 (stage 6): Dispatcher + Price agent. Reads freight groups with a separate Telegram account; posts nothing there.
+DISPATCHER_ENABLED = os.getenv("DISPATCHER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+TG_API_ID = os.getenv("TG_API_ID", "").strip()
+TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
+TG_SESSION = os.getenv("TG_SESSION", "").strip()
+DISPATCHER_TICK_MINUTES = max(5, int(os.getenv("DISPATCHER_TICK_MINUTES", "15")))
+DISPATCHER_DIGEST_HOUR = int(os.getenv("DISPATCHER_DIGEST_HOUR", "18"))
+DISPATCHER_GROUPS = tuple(g.strip() for g in os.getenv("DISPATCHER_GROUPS", "").split(",") if g.strip())
 
 KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 KEEPALIVE_MINUTES = max(5, int(os.getenv("KEEPALIVE_MINUTES", "10")))
@@ -1959,6 +1972,10 @@ async def scheduler_loop() -> None:
                 marketing_task = asyncio.create_task(marketing.tick())
                 _background_tasks.add(marketing_task)
                 marketing_task.add_done_callback(_background_tasks.discard)
+            if DISPATCHER_ENABLED and dispatcher.reader.configured and dispatcher.reader.session:
+                dispatcher_task = asyncio.create_task(dispatcher.tick())
+                _background_tasks.add(dispatcher_task)
+                dispatcher_task.add_done_callback(_background_tasks.discard)
             if SALES_ENABLED:
                 sales_task = asyncio.create_task(sales.tick())
                 _background_tasks.add(sales_task)
@@ -2045,6 +2062,12 @@ marketing = MarketingAgent(open_base, coordinator.telegram,
                            registry_load=load_reminder_registry_sync,
                            registry_save=save_reminder_registry_entry_sync,
                            feeds=MARKETING_FEEDS, digest_hour=MARKETING_DIGEST_HOUR)
+dispatcher = DispatcherAgent(
+    open_base, coordinator.telegram, TelethonReader(TG_API_ID, TG_API_HASH, TG_SESSION),
+    registry_load=load_reminder_registry_sync, registry_save=save_reminder_registry_entry_sync,
+    settings=DispatcherSettings(tick_minutes=DISPATCHER_TICK_MINUTES, digest_hour=DISPATCHER_DIGEST_HOUR,
+                                groups_filter=DISPATCHER_GROUPS),
+)
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
 
@@ -2066,7 +2089,7 @@ async def root() -> Dict[str, Any]:
             "/admin/setup_base", "/coordinator/status", "/coordinator/digest", "/coordinator/tick",
             "/tasks", "/telegram/webhook", "/admin/set_webhook",
             "/sales/status", "/sales/prepare", "/sales/followups", "/sales/send", "/sales/test_email",
-            "/economist/calc", "/marketing/status", "/docs",
+            "/economist/calc", "/marketing/status", "/dispatcher/status", "/docs",
         ],
     }
 
@@ -2489,6 +2512,29 @@ async def telegram_webhook(request: Request,
             logger.exception("Marketing /leads failed")
             await coordinator.telegram.send(f"⚠️ Ошибка: {html.escape(str(exc))[:300]}", chat_id=chat_id)
         return {"handled": True, "command": "leads"}
+    if text.lower().startswith(("/mashina", "/stavka", "/rynok", "/dispatcher")):
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        if chat_id != str(MANAGEMENT_CHAT_ID):
+            return {"handled": False, "reason": "wrong_chat"}
+        low = text.lower()
+        try:
+            if low.startswith("/mashina"):
+                reply = await asyncio.to_thread(dispatcher.trucks, text)
+            elif low.startswith("/stavka"):
+                reply = await asyncio.to_thread(dispatcher.rates, text)
+            elif low.startswith("/rynok"):
+                reply = await asyncio.to_thread(dispatcher.summary)
+            else:
+                reply = DISPATCHER_HELP
+        except Exception as exc:
+            logger.exception("Dispatcher command failed")
+            if type(exc).__name__ == "WorksheetNotFound":
+                reply = (f"⚠️ В базе нет листа «{html.escape(str(exc))}». "
+                         "Откройте /docs и выполните POST /admin/setup_base.")
+            else:
+                reply = f"⚠️ Ошибка: {html.escape(str(exc))[:300]}"
+        await coordinator.telegram.send(reply, chat_id=chat_id)
+        return {"handled": True, "command": "dispatcher"}
     if text.lower().startswith(("/analiz", "/etiroz", "/pretenziya", "/lawyer", "/pravo")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
@@ -2674,6 +2720,66 @@ async def import_companies_endpoint(batch: str = Query("2026_10_27", description
         raise HTTPException(status_code=400, detail="Google Sheets is not configured")
     result = await asyncio.to_thread(import_companies, base, items, f"импорт {batch}")
     return {"status": "ok", "added": len(result["added"]), "updated": len(result["updated"]), **result}
+
+
+@app.post("/dispatcher/login/start")
+async def dispatcher_login_start(phone: str = Query(..., description="Номер аккаунта для чтения групп, +998..."),
+                                 x_admin_token: Optional[str] = Header(None),
+                                 token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Step 1 of 2: Telegram sends a login code to the reader account (in its Telegram app)."""
+    require_admin(x_admin_token or token)
+    try:
+        await dispatcher.reader.start_login(phone)
+    except Exception as exc:
+        logger.exception("Dispatcher login start failed")
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}")
+    return {"status": "code_sent",
+            "next": "Код пришёл в Telegram этого аккаунта. Введите его в POST /dispatcher/login/finish (поле code)."}
+
+
+@app.post("/dispatcher/login/finish")
+async def dispatcher_login_finish(code: str = Query("", description="Код из Telegram"),
+                                  password: str = Query("", description="Облачный пароль, только если включена двухэтапная проверка"),
+                                  x_admin_token: Optional[str] = Header(None),
+                                  token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Step 2 of 2: sign in. Returns the session string for Render (TG_SESSION). Reading starts at once."""
+    require_admin(x_admin_token or token)
+    try:
+        result = await dispatcher.reader.finish_login(code, password)
+    except NeedPassword:
+        return {"status": "password_needed",
+                "next": "У аккаунта включена двухэтапная проверка: повторите этот запрос с полем password (код повторно не нужен)."}
+    except Exception as exc:
+        logger.exception("Dispatcher login finish failed")
+        raise HTTPException(status_code=400, detail=f"{type(exc).__name__}: {exc}")
+    tick_task = asyncio.create_task(dispatcher.tick(force=True))
+    _background_tasks.add(tick_task)
+    tick_task.add_done_callback(_background_tasks.discard)
+    return {"status": "ok", "account": result["account"], "TG_SESSION": result["session"],
+            "next": "Скопируйте TG_SESSION в Render → Environment (это ключ доступа к аккаунту, никому не показывать). "
+                    "Без этого после перезапуска бот перестанет читать группы."}
+
+
+@app.post("/dispatcher/tick")
+async def dispatcher_tick(x_admin_token: Optional[str] = Header(None),
+                          token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    require_admin(x_admin_token or token)
+    return await dispatcher.tick(force=True)
+
+
+@app.get("/dispatcher/status")
+async def dispatcher_status() -> Dict[str, Any]:
+    logged_in = False
+    error = ""
+    if dispatcher.reader.configured and dispatcher.reader.session:
+        try:
+            logged_in = await dispatcher.reader.authorized()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+    return {"enabled": DISPATCHER_ENABLED, "api_keys_set": dispatcher.reader.configured,
+            "session_set": bool(dispatcher.reader.session), "logged_in": logged_in, "account": dispatcher.reader.account,
+            "error": error, "tick_minutes": DISPATCHER_TICK_MINUTES, "digest_hour": DISPATCHER_DIGEST_HOUR,
+            "groups": dispatcher.groups, "today": dispatcher.today, "last_result": dispatcher.last_result}
 
 
 @app.get("/marketing/status")
