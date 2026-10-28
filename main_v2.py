@@ -31,6 +31,8 @@ Core guarantees:
   projects that need transport -> sheet "Лиды"; daily digest with "В работу / Пропустить" buttons.
 - V43 (stage 6): Dispatcher + Price agent (trans_ocean/dispatcher.py): a separate Telegram account reads
   freight groups -> "Объявления", "Ставки рынка" (used by /price), "Перевозчики"; /mashina, /stavka, /rynok.
+- V43.1: who writes in the groups -> "Диспетчеры рынка" (dispatchers by route, with phones) and
+  "Группы перевозчиков" (members / writers / silent %); /gruppy; one-time read of the last 7 days.
 
 Required environment variables:
 BOT_TOKEN
@@ -88,7 +90,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v43_dispatcher"
+VERSION = "cargo_v43_1_market_people"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -2512,7 +2514,7 @@ async def telegram_webhook(request: Request,
             logger.exception("Marketing /leads failed")
             await coordinator.telegram.send(f"⚠️ Ошибка: {html.escape(str(exc))[:300]}", chat_id=chat_id)
         return {"handled": True, "command": "leads"}
-    if text.lower().startswith(("/mashina", "/stavka", "/rynok", "/dispatcher")):
+    if text.lower().startswith(("/mashina", "/stavka", "/rynok", "/gruppy", "/dispatcher")):
         chat_id = str((message.get("chat") or {}).get("id", ""))
         if chat_id != str(MANAGEMENT_CHAT_ID):
             return {"handled": False, "reason": "wrong_chat"}
@@ -2524,6 +2526,8 @@ async def telegram_webhook(request: Request,
                 reply = await asyncio.to_thread(dispatcher.rates, text)
             elif low.startswith("/rynok"):
                 reply = await asyncio.to_thread(dispatcher.summary)
+            elif low.startswith("/gruppy"):
+                reply = await asyncio.to_thread(dispatcher.groups_report)
             else:
                 reply = DISPATCHER_HELP
         except Exception as exc:
@@ -2767,6 +2771,23 @@ async def dispatcher_tick(x_admin_token: Optional[str] = Header(None),
     return await dispatcher.tick(force=True)
 
 
+@app.post("/dispatcher/backfill")
+async def dispatcher_backfill(days: int = Query(7, ge=1, le=30, description="Сколько дней истории прочитать"),
+                              x_admin_token: Optional[str] = Header(None),
+                              token: Optional[str] = Query(None)) -> Dict[str, Any]:
+    """Read older messages once (runs by itself after the first start; this is to repeat it with more days)."""
+    require_admin(x_admin_token or token)
+
+    async def run() -> None:
+        async with dispatcher._lock:
+            dispatcher.last_result = {"time": now_local().strftime("%Y-%m-%d %H:%M"),
+                                      "backfill": await dispatcher.backfill(days)}
+    task = asyncio.create_task(run())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"status": "started", "days": days, "next": "Результат через 5–15 минут в GET /dispatcher/status (last_result)."}
+
+
 @app.get("/dispatcher/status")
 async def dispatcher_status() -> Dict[str, Any]:
     logged_in = False
@@ -2779,7 +2800,9 @@ async def dispatcher_status() -> Dict[str, Any]:
     return {"enabled": DISPATCHER_ENABLED, "api_keys_set": dispatcher.reader.configured,
             "session_set": bool(dispatcher.reader.session), "logged_in": logged_in, "account": dispatcher.reader.account,
             "error": error, "tick_minutes": DISPATCHER_TICK_MINUTES, "digest_hour": DISPATCHER_DIGEST_HOUR,
-            "groups": dispatcher.groups, "today": dispatcher.today, "last_result": dispatcher.last_result}
+            "groups": dispatcher.groups, "today": dispatcher.today,
+            "people_counted": len(dispatcher.book.people) if dispatcher.book else 0,
+            "last_result": dispatcher.last_result}
 
 
 @app.get("/marketing/status")

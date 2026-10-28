@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import TZ, Base, new_id, now_local, parse_date, stamp
 from .freight_parser import KIND_CARGO, KIND_TRUCK, Ad, ad_key, find_places, find_vehicle, parse_ad, split_ads
+from .market_people import GROUPS_SHEET, SENDERS_SHEET, TYPE_DISPATCHER, SenderBook, groups_text
 
 logger = logging.getLogger("trans_ocean.dispatcher")
 AGENT = "Диспетчер"
@@ -44,13 +45,16 @@ ADS_SHEET = "Объявления"
 RATES_SHEET = "Ставки рынка"
 CARRIERS_SHEET = "Перевозчики"
 REGISTRY_KEY = "dispatcher:last_ids"
+STATS_KEY = "dispatcher:stats"            # group id -> [oldest message id counted in "Диспетчеры рынка", its date]
+BACKFILL_KEY = "dispatcher:backfill_done"
 
 HELP = (
     "🚛 <b>Диспетчер и Ценовой</b>\n\n"
     "<code>/mashina Бухара Ташкент</code> — свободные машины в Бухаре (за 3 дня) и проверенные перевозчики\n"
     "<code>/mashina Ташкент трал</code> — с типом машины\n"
     "<code>/stavka Ташкент Нукус тент</code> — ставки рынка по маршруту за 30 дней\n"
-    "<code>/rynok</code> — что прочитано в группах сегодня\n\n"
+    "<code>/rynok</code> — что прочитано в группах сегодня\n"
+    "<code>/gruppy</code> — сколько в группах участников, сколько пишут и сколько молчат (в основном водители)\n\n"
     "Данные — из Telegram-групп перевозчиков. Перевозчики из объявлений не проверены: "
     "документы и машину проверяет диспетчер."
 )
@@ -65,6 +69,7 @@ class Message:
     link: str = ""
     sender_name: str = ""
     sender_username: str = ""
+    sender_id: int = 0
 
 
 @dataclass
@@ -75,6 +80,8 @@ class Settings:
     first_read_hours: int = 24
     groups_filter: Tuple[str, ...] = ()
     max_carrier_updates: int = 15
+    backfill_days: int = 7
+    backfill_per_group: int = 4000
 
 
 # ---------------------------------------------------------------- Telegram account (Telethon)
@@ -170,15 +177,34 @@ class TelethonReader:
             if dialog.is_group or dialog.is_channel:
                 groups.append({"id": dialog.id, "name": dialog.name or str(dialog.id),
                                "username": getattr(dialog.entity, "username", None) or "",
-                               "entity": dialog.entity})
+                               "entity": dialog.entity,
+                               "members": await self._member_count(client, dialog.entity)})
         self._groups, self._groups_at = groups, time.monotonic()
         return groups
 
+    @staticmethod
+    async def _member_count(client, entity) -> int:
+        """Number of members only — the member list itself is not read."""
+        count = getattr(entity, "participants_count", None)
+        if count:
+            return int(count)
+        try:
+            return int((await client.get_participants(entity, limit=0)).total or 0)
+        except Exception:
+            pass
+        try:
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            full = await client(GetFullChannelRequest(entity))
+            return int(full.full_chat.participants_count or 0)
+        except Exception:
+            return 0
+
     async def fetch(self, group: Dict[str, Any], min_id: int, since: Optional[datetime],
-                    limit: int) -> List[Message]:
+                    limit: int, max_id: int = 0) -> List[Message]:
         client = await self._client()
         out: List[Message] = []
-        async for m in client.iter_messages(group.get("entity") or group["id"], limit=limit, min_id=min_id or 0):
+        async for m in client.iter_messages(group.get("entity") or group["id"], limit=limit, min_id=min_id or 0,
+                                            max_id=max_id or 0):
             if since and m.date and m.date < since:
                 break
             text = m.message or ""
@@ -190,7 +216,8 @@ class TelethonReader:
                 id=m.id, date=m.date.astimezone(TZ), text=text, group=group["name"],
                 link=f"https://t.me/{group['username']}/{m.id}" if group.get("username") else "",
                 sender_name=name or getattr(sender, "title", "") or "",
-                sender_username=getattr(sender, "username", None) or ""))
+                sender_username=getattr(sender, "username", None) or "",
+                sender_id=int(getattr(m, "sender_id", 0) or 0)))
         return out
 
 
@@ -210,6 +237,11 @@ def ad_rows(messages: List[Message], seen: set) -> List[Tuple[Ad, Message]]:
             seen.add(key)
             out.append((ad, msg))
     return out
+
+
+def message_ads(text: str) -> List[Ad]:
+    """Useful ads in one message, reposts included (used to count who posts what)."""
+    return [ad for ad in (parse_ad(part) for part in split_ads(text)) if ad.useful]
 
 
 def ad_record(ad: Ad, msg: Message) -> Dict[str, Any]:
@@ -302,7 +334,7 @@ def money(value: float, currency: str = "UZS") -> str:
 
 
 def trucks_answer(ads: List[Dict[str, str]], carriers: List[Dict[str, str]], text: str,
-                  now: Optional[datetime] = None, days: int = 3) -> str:
+                  now: Optional[datetime] = None, days: int = 3, book: Optional[SenderBook] = None) -> str:
     origin, destination, vehicle = parse_query(text, "mashina")
     if not origin:
         return HELP
@@ -326,7 +358,16 @@ def trucks_answer(ads: List[Dict[str, str]], carriers: List[Dict[str, str]], tex
     known.sort(key=lambda c: (c.get("Документы проверены", "").lower() != "да", -int(c.get("Рейсов с нами") or 0)))
     e = html.escape
     title = f"🚛 <b>Машины: {e(route_text(origin, destination))}</b>" + (f" · {e(vehicle)}" if vehicle else "")
-    lines = [title, f"\n<b>Объявления за {days} дня</b> — {len(found)}"]
+    lines = [title]
+    route_people = book.for_route(origin, destination, vehicle) if book else []
+    if book is not None:
+        lines.append(f"\n<b>Диспетчеры этого маршрута</b> — {len(route_people)} (через них быстрее всего найти машину)")
+        for hits, person in route_people:
+            contact = ", ".join(person["phones"][:2]) or person["username"]
+            mark = "⭐" if person["posts"] >= 3 else "•"
+            lines.append(f"{mark} {e(person['name'] or person['username'] or '—')} · 📞 {e(contact)}\n"
+                         f"   по маршруту {hits} объявл., всего {person['posts']} · последнее {e(person['last'][5:])}")
+    lines.append(f"\n<b>Свободные машины в объявлениях за {days} дня</b> — {len(found)}")
     for row in found:
         contact = row.get("Телефон") or row.get("Контакт TG") or "—"
         price = f" · {e(row['Цена'])} {e(row.get('Валюта', ''))}" if row.get("Цена") else ""
@@ -378,7 +419,8 @@ def rates_answer(rates: List[Dict[str, str]], text: str, now: Optional[datetime]
     return "\n".join(lines)
 
 
-def summary_text(ads: List[Dict[str, str]], day: str, status: Dict[str, Any]) -> str:
+def summary_text(ads: List[Dict[str, str]], day: str, status: Dict[str, Any],
+                 book: Optional[SenderBook] = None) -> str:
     today = [r for r in ads if r.get("Дата", "").startswith(day)]
     kinds = Counter(r.get("Тип", "") for r in today)
     routes = Counter(route_text(r.get("Откуда", ""), r.get("Куда", "")) for r in today if r.get("Куда"))
@@ -397,7 +439,11 @@ def summary_text(ads: List[Dict[str, str]], day: str, status: Dict[str, Any]) ->
     if groups:
         lines.append("\n<b>Активные группы</b>")
         lines += [f"• {e(name)} — {count}" for name, count in groups.most_common(5)]
-    lines.append("\n/mashina Бухара Ташкент · /stavka Ташкент Нукус тент")
+    if book is not None and book.people:
+        kinds = Counter(book.kind(p) for p in book.people.values())
+        lines.append(f"\nПисали в группах с начала учёта: {len(book.people)} чел., из них диспетчеров "
+                     f"{kinds.get(TYPE_DISPATCHER, 0)} (лист «Диспетчеры рынка»)")
+    lines.append("\n/mashina Бухара Ташкент · /stavka Ташкент Нукус тент · /gruppy")
     return "\n".join(lines)
 
 
@@ -418,6 +464,9 @@ class DispatcherAgent:
         self._last_tick: Optional[float] = None
         self._last_ids: Optional[Dict[str, int]] = None
         self._seen: Optional[set] = None
+        self._stats: Optional[Dict[str, list]] = None
+        self.book: Optional[SenderBook] = None
+        self.group_info: List[Dict[str, Any]] = []
         self._sheet_ready = False
         self.last_result: Dict[str, Any] = {}
         self.today: Dict[str, Any] = {"day": "", "messages": 0, "ads": 0, "rates": 0, "carriers": 0}
@@ -428,7 +477,8 @@ class DispatcherAgent:
         if base is None:
             raise RuntimeError("Google Sheets не настроен")
         if not self._sheet_ready:
-            if ADS_SHEET not in base.existing_titles():
+            titles = set(base.existing_titles())
+            if not {ADS_SHEET, SENDERS_SHEET, GROUPS_SHEET} <= titles:
                 base.ensure_sheets()
             self._sheet_ready = True
         return base
@@ -479,8 +529,10 @@ class DispatcherAgent:
         if self._seen is None:
             rows = await asyncio.to_thread(base.records, ADS_SHEET)
             self._seen = {r.get("Ключ", "") for r in rows[-5000:] if r.get("Ключ")}
+        await self._load_people(base)
         groups = [g for g in await self.reader.list_groups() if self._wanted(g)]
         self.groups = [g["name"] for g in groups]
+        self.group_info = groups
         since_first = now_local() - timedelta(hours=self.settings.first_read_hours)
         messages: List[Message] = []
         errors = []
@@ -497,17 +549,92 @@ class DispatcherAgent:
             if batch:
                 self._last_ids[key] = max(m.id for m in batch)
             messages += batch
+        groups_by_name = {g["name"]: g for g in groups}
+        self._count_people(messages, groups_by_name)
         pairs = ad_rows(sorted(messages, key=lambda m: m.date), self._seen)
         saved = await asyncio.to_thread(self.save, base, pairs)
         await asyncio.to_thread(self.registry_save, REGISTRY_KEY, json.dumps(self._last_ids),
                                 "Диспетчер: последние прочитанные сообщения по группам")
+        people = await asyncio.to_thread(self._save_people, base)
         self._count(messages=len(messages), ads=saved["ads"], rates=saved["rates"], carriers=saved["carriers_new"])
-        return {"groups": len(groups), "messages": len(messages), **saved, "errors": errors}
+        return {"groups": len(groups), "messages": len(messages), **saved, **people, "errors": errors}
+
+    # ---------- who writes in the groups ----------
+    async def _load_people(self, base: Base) -> None:
+        if self.book is None:
+            self.book = SenderBook(await asyncio.to_thread(base.records, SENDERS_SHEET))
+        if self._stats is None:
+            raw = (await asyncio.to_thread(self.registry_load)).get(STATS_KEY, "")
+            try:
+                self._stats = {str(k): list(v) for k, v in json.loads(raw or "{}").items()}
+            except (ValueError, TypeError):
+                self._stats = {}
+
+    def _count_people(self, messages: List[Message], groups_by_name: Dict[str, Dict[str, Any]]) -> None:
+        for msg in messages:
+            self.book.add(msg.sender_id, msg.sender_name, msg.sender_username, msg.group, msg.date,
+                          message_ads(msg.text))
+            group = groups_by_name.get(msg.group)
+            if group is None:
+                continue
+            key = str(group["id"])
+            current = self._stats.get(key)
+            if current is None or msg.id < int(current[0]):
+                self._stats[key] = [msg.id, msg.date.strftime("%Y-%m-%d %H:%M")]
+
+    def _save_people(self, base: Base) -> Dict[str, int]:
+        if not self.book.changed:
+            return {"people": len(self.book.people)}
+        base.replace_rows(SENDERS_SHEET, self.book.rows())
+        since = {k: v[1] for k, v in self._stats.items()}
+        base.replace_rows(GROUPS_SHEET, self.book.group_rows(self.group_info, since, stamp()))
+        self.registry_save(STATS_KEY, json.dumps(self._stats), "Диспетчер: с какого сообщения ведётся учёт по группам")
+        self.book.changed = False
+        dispatchers = sum(1 for p in self.book.people.values() if self.book.kind(p) == TYPE_DISPATCHER)
+        return {"people": len(self.book.people), "dispatchers": dispatchers}
+
+    async def backfill(self, days: Optional[int] = None) -> Dict[str, Any]:
+        """Read the last `days` days once (older than what was already counted): who writes, old ads and rates."""
+        if not await self.reader.authorized():
+            return {"skipped": "not_logged_in"}
+        days = days or self.settings.backfill_days
+        base = await asyncio.to_thread(self._base)
+        await self._load_people(base)
+        if self._last_ids is None or self._seen is None:
+            await self.collect()
+        groups = [g for g in await self.reader.list_groups() if self._wanted(g)]
+        self.group_info = groups
+        since = now_local() - timedelta(days=days)
+        messages: List[Message] = []
+        errors = []
+        for group in groups:
+            key = str(group["id"])
+            below = int(self._stats[key][0]) if key in self._stats else self._last_ids.get(key, 0) + 1
+            if below <= 1:
+                continue
+            try:
+                messages += await self.reader.fetch(group, 0, since, self.settings.backfill_per_group, max_id=below)
+            except Exception as exc:
+                errors.append(f"{group['name']}: {exc}")
+                if type(exc).__name__ == "FloodWaitError":
+                    break
+        self._count_people(messages, {g["name"]: g for g in groups})
+        pairs = ad_rows(sorted(messages, key=lambda m: m.date), self._seen)
+        saved = await asyncio.to_thread(self.save, base, pairs)
+        people = await asyncio.to_thread(self._save_people, base)
+        if not errors:
+            await asyncio.to_thread(self.registry_save, BACKFILL_KEY, stamp(),
+                                    f"Диспетчер: прочитана история групп за {days} дней")
+        return {"days": days, "messages": len(messages), **saved, **people, "errors": errors}
 
     # ---------- commands ----------
     def trucks(self, text: str) -> str:
         base = self._base()
-        return trucks_answer(base.records(ADS_SHEET), base.records(CARRIERS_SHEET), text)
+        book = self.book if self.book is not None else SenderBook(base.records(SENDERS_SHEET))
+        return trucks_answer(base.records(ADS_SHEET), base.records(CARRIERS_SHEET), text, book=book)
+
+    def groups_report(self) -> str:
+        return groups_text(self._base().records(GROUPS_SHEET))
 
     def rates(self, text: str) -> str:
         return rates_answer(self._base().records(RATES_SHEET), text)
@@ -516,7 +643,7 @@ class DispatcherAgent:
         day = day or now_local().strftime("%Y-%m-%d")
         status = {"groups": len(self.groups), "messages_today": self.today["messages"] if self.today["day"] == day else 0,
                   "carriers_today": self.today["carriers"] if self.today["day"] == day else 0}
-        return summary_text(self._base().records(ADS_SHEET), day, status)
+        return summary_text(self._base().records(ADS_SHEET), day, status, self.book)
 
     async def post_digest(self) -> Dict[str, Any]:
         day = now_local().strftime("%Y-%m-%d")
@@ -542,6 +669,12 @@ class DispatcherAgent:
             except Exception as exc:
                 result["errors"].append(f"collect: {exc!r}")
                 logger.exception("Dispatcher collect failed")
+            if result.get("collect", {}).get("groups") and BACKFILL_KEY not in await asyncio.to_thread(self.registry_load):
+                try:
+                    result["backfill"] = await asyncio.wait_for(self.backfill(), timeout=1500)
+                except Exception as exc:
+                    result["errors"].append(f"backfill: {exc!r}")
+                    logger.exception("Dispatcher backfill failed")
             now = now_local()
             if (now.hour >= self.settings.digest_hour and self.telegram.configured
                     and result.get("collect", {}).get("skipped") is None):

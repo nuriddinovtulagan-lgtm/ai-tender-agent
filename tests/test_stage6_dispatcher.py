@@ -76,12 +76,13 @@ class FakeReader:
         return True
 
     async def list_groups(self):
-        return [{"id": -100, "name": "Yuk Markazi", "username": "yukmarkazi"},
-                {"id": -200, "name": "AVTO TRASSA UZ", "username": ""}]
+        return [{"id": -100, "name": "Yuk Markazi", "username": "yukmarkazi", "members": 1000},
+                {"id": -200, "name": "AVTO TRASSA UZ", "username": "", "members": 0}]
 
-    async def fetch(self, group, min_id, since, limit):
+    async def fetch(self, group, min_id, since, limit, max_id=0):
         self.calls.append((group["id"], min_id, since is not None))
-        return [m for m in self.messages.get(group["id"], []) if m.id > min_id]
+        return [m for m in self.messages.get(group["id"], [])
+                if m.id > min_id and (not max_id or m.id < max_id) and (since is None or m.date >= since)]
 
 
 class FakeTelegram:
@@ -148,7 +149,7 @@ def test_commands_answers():
     asyncio.run(agent.collect())
     trucks = agent.trucks("/mashina Бухара Ташкент трал")
     assert "99 111 22 33" in trucks and "90 222 33 44" not in trucks
-    assert "Объявления за 3 дня</b> — 2" in agent.trucks("/mashina Buxoro")
+    assert "объявлениях за 3 дня</b> — 2" in agent.trucks("/mashina Buxoro")
     rates = agent.rates("/stavka Ташкент Нукус тент")
     assert "2 ставок" in rates and "10 000 000 сум" in rates                     # median of 9 and 11 mln
     assert "ставок нет" in agent.rates("/stavka Ташкент Термез")
@@ -169,3 +170,67 @@ def test_not_logged_in_skips():
         return False
     agent.reader.authorized = no
     assert asyncio.run(agent.collect()) == {"skipped": "not_logged_in"}
+
+
+def msg(mid, text, sender, when=None, group="Yuk Markazi", username=""):
+    return Message(mid, when or NOW - timedelta(minutes=10), text, group, sender_id=sender,
+                   sender_name=f"User {sender}", sender_username=username)
+
+
+def test_people_dispatchers_and_group_shares():
+    msgs = {-100: [
+        msg(1, "Toshkent - Buxoro tent yuk bor 5 mln 90 111 11 11", 7),
+        msg(2, "Toshkent - Buxoro tral yuk bor 6 mln 90 111 11 11", 7),
+        msg(3, "Toshkent - Buxoro ref yuk bor 7 mln 90 111 11 11", 7),
+        msg(4, "Samarqand - Nukus tent yuk bor 8 mln 93 222 22 22", 8, username="disp8"),
+        msg(5, "Assalomu alaykum, kim boradi?", 9),
+        msg(6, "Toshkent - Buxoro tent yuk bor 5 mln 90 111 11 11", 7),     # repost: still a post by 7
+    ]}
+    agent, base, registry = make_agent(msgs)
+    result = asyncio.run(agent.collect())
+    assert result["people"] == 3 and result["dispatchers"] == 1
+
+    people = {r["ID TG"]: r for r in base.records("Диспетчеры рынка")}
+    assert people["7"]["Тип"] == "Диспетчер" and people["7"]["Объявлений"] == "4"
+    assert people["7"]["Маршруты"] == "Ташкент → Бухара (4)" and people["7"]["Телефоны"] == "+998 90 111 11 11"
+    assert people["8"]["Тип"] == "Пишет иногда" and people["8"]["Telegram"] == "@disp8"
+    assert people["9"]["Тип"] == "Только общается"
+
+    groups = {r["Группа"]: r for r in base.records("Группы перевозчиков")}
+    assert groups["Yuk Markazi"]["Участников"] == "1000" and groups["Yuk Markazi"]["Писали"] == "3"
+    assert groups["Yuk Markazi"]["Писали (%)"] == "0.3" and groups["Yuk Markazi"]["Молчат (%)"] == "99.7"
+    assert groups["AVTO TRASSA UZ"]["Писали (%)"] == ""                  # members hidden
+    report = agent.groups_report()
+    assert "1 000 участн." in report and "молчат 99.7%" in report
+
+    trucks = agent.trucks("/mashina Ташкент Бухара")
+    assert "Диспетчеры этого маршрута</b> — 1" in trucks and "+998 90 111 11 11" in trucks
+    assert "по маршруту 4 объявл." in trucks
+    assert "диспетчеров 1" in agent.summary()
+
+    # a restart keeps the counts (loaded back from the sheet)
+    agent2 = DispatcherAgent(lambda: base, FakeTelegram(), FakeReader({-100: [msg(7, "Toshkent - Buxoro tent 5 mln", 7)]}),
+                             registry_load=lambda: dict(registry), registry_save=lambda k, v, d: registry.__setitem__(k, v))
+    asyncio.run(agent2.collect())
+    again = {r["ID TG"]: r for r in base.records("Диспетчеры рынка")}
+    assert again["7"]["Объявлений"] == "5" and again["7"]["Маршруты"] == "Ташкент → Бухара (5)"
+
+
+def test_backfill_reads_older_messages_once():
+    old = NOW - timedelta(days=3)
+    msgs = {-100: [
+        msg(1, "Navoiy - Termiz tent yuk bor 9 mln 99 333 33 33", 11, when=NOW - timedelta(days=20)),   # too old
+        msg(2, "Navoiy - Termiz tent yuk bor 9 mln 99 333 33 33", 11, when=old),
+        msg(3, "Qarshi - Toshkent tral yuk bor 6 mln 99 333 33 33", 11, when=old),
+        msg(50, "Toshkent - Buxoro tent yuk bor 5 mln 90 111 11 11", 7),
+    ]}
+    agent, base, registry = make_agent(msgs)
+    agent.settings.first_read_hours = 24
+    asyncio.run(agent.collect())                      # first read: last 24 hours only
+    assert len(base.records("Диспетчеры рынка")) == 1
+    result = asyncio.run(agent.backfill(7))
+    assert result["messages"] == 2 and result["ads"] == 2 and "dispatcher:backfill_done" in registry
+    people = {r["ID TG"]: r for r in base.records("Диспетчеры рынка")}
+    assert people["11"]["Объявлений"] == "2" and people["7"]["Объявлений"] == "1"   # nothing counted twice
+    assert len(base.records("Ставки рынка")) == 3
+    assert asyncio.run(agent.backfill(7))["messages"] == 0                          # repeat: nothing new
