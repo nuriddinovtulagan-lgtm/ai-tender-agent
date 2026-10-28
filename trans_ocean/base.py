@@ -74,6 +74,11 @@ SCHEMA: Dict[str, List[str]] = {
     # Stage 6 (Dispatcher + Price agent): ads read from freight Telegram groups.
     "Объявления": ["Дата", "Тип", "Откуда", "Куда", "Тип машины", "Тоннаж (т)", "Цена", "Валюта",
                    "Телефон", "Контакт TG", "Группа", "Ссылка", "Текст", "Ключ"],
+    # Stage 6b: who writes in the freight groups and how many members stay silent.
+    "Диспетчеры рынка": ["ID TG", "Имя", "Telegram", "Телефоны", "Тип", "Объявлений", "Сообщений",
+                         "Маршруты", "Типы машин", "Группы", "Первое", "Последнее"],
+    "Группы перевозчиков": ["Группа", "Ссылка", "Участников", "Писали", "Из них диспетчеры", "Пишут иногда",
+                            "Писали (%)", "Молчат (%)", "Учёт с", "Обновлено"],
 }
 
 DEAL_STAGES = ["Новый", "Ищем контакт", "Письмо отправлено", "Ответили",
@@ -200,6 +205,19 @@ class Base:
         if values:
             self.worksheet(name).append_rows(values, value_input_option="USER_ENTERED")
         return len(values)
+
+    def replace_rows(self, name: str, rows: List[Dict[str, Any]]) -> int:
+        """Rewrite a whole sheet (header + rows) in a few API calls. For sheets fully owned by an agent."""
+        headers = SCHEMA[name]
+        values = [headers] + [["" if r.get(h) is None else r.get(h) for h in headers] for r in rows]
+        ws = self.worksheet(name)
+        ws.clear()
+        try:
+            ws.resize(rows=max(len(values) + 50, 100), cols=max(len(headers), 10))
+        except Exception:
+            logger.warning("Resize of %s failed", name)
+        ws.update(values=values, range_name="A1", value_input_option="USER_ENTERED")
+        return len(rows)
 
     def update_fields(self, name: str, row_number: int, data: Dict[str, Any]) -> None:
         headers = SCHEMA[name]

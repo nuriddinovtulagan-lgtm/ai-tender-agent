@@ -28,11 +28,18 @@ class FakeWorksheet:
     def get_all_values(self):
         return [list(r) for r in self.values]
 
-    def update(self, rng, values):
-        assert rng == "A1"
-        if not self.values:
-            self.values.append([])
-        self.values[0] = [str(v) for v in values[0]]
+    def update(self, rng=None, values=None, range_name=None, value_input_option=None):
+        assert (rng or range_name) == "A1"
+        for i, row in enumerate(values):
+            while len(self.values) <= i:
+                self.values.append([])
+            self.values[i] = [str(v) for v in row]
+
+    def clear(self):
+        self.values = []
+
+    def resize(self, rows=None, cols=None):
+        pass
 
     def update_cell(self, row, col, value):
         while len(self.values) < row:
