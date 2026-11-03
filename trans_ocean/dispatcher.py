@@ -80,8 +80,9 @@ class Settings:
     first_read_hours: int = 24
     groups_filter: Tuple[str, ...] = ()
     max_carrier_updates: int = 15
-    backfill_days: int = 7
-    backfill_per_group: int = 4000
+    backfill_enabled: bool = True
+    backfill_days: int = 3
+    backfill_per_group: int = 1500
 
 
 # ---------------------------------------------------------------- Telegram account (Telethon)
@@ -550,8 +551,9 @@ class DispatcherAgent:
                 self._last_ids[key] = max(m.id for m in batch)
             messages += batch
         groups_by_name = {g["name"]: g for g in groups}
-        self._count_people(messages, groups_by_name)
-        pairs = ad_rows(sorted(messages, key=lambda m: m.date), self._seen)
+        # Parsing thousands of messages is CPU work: keep it off the event loop, otherwise the whole bot
+        # (Coordinator, webhook, /health) freezes while it runs.
+        pairs = await asyncio.to_thread(self._digest_messages, messages, groups_by_name)
         saved = await asyncio.to_thread(self.save, base, pairs)
         await asyncio.to_thread(self.registry_save, REGISTRY_KEY, json.dumps(self._last_ids),
                                 "Диспетчер: последние прочитанные сообщения по группам")
@@ -582,6 +584,11 @@ class DispatcherAgent:
             if current is None or msg.id < int(current[0]):
                 self._stats[key] = [msg.id, msg.date.strftime("%Y-%m-%d %H:%M")]
 
+    def _digest_messages(self, messages: List[Message],
+                         groups_by_name: Dict[str, Dict[str, Any]]) -> List[Tuple[Ad, Message]]:
+        self._count_people(messages, groups_by_name)
+        return ad_rows(sorted(messages, key=lambda m: m.date), self._seen)
+
     def _save_people(self, base: Base) -> Dict[str, int]:
         if not self.book.changed:
             return {"people": len(self.book.people)}
@@ -602,30 +609,38 @@ class DispatcherAgent:
         await self._load_people(base)
         if self._last_ids is None or self._seen is None:
             await self.collect()
+        # Marked BEFORE the work: if the process dies on the way (memory, restart), it is not retried
+        # on every start. Repeat by hand: POST /dispatcher/backfill.
+        await asyncio.to_thread(self.registry_save, BACKFILL_KEY, f"начато {stamp()}",
+                                f"Диспетчер: история групп за {days} дн.")
         groups = [g for g in await self.reader.list_groups() if self._wanted(g)]
         self.group_info = groups
+        by_name = {g["name"]: g for g in groups}
         since = now_local() - timedelta(days=days)
-        messages: List[Message] = []
+        total = {"messages": 0, "ads": 0, "rates": 0, "carriers_new": 0, "carriers_updated": 0}
         errors = []
-        for group in groups:
+        for group in groups:                                   # one group at a time: small memory, short pauses
             key = str(group["id"])
             below = int(self._stats[key][0]) if key in self._stats else self._last_ids.get(key, 0) + 1
             if below <= 1:
                 continue
             try:
-                messages += await self.reader.fetch(group, 0, since, self.settings.backfill_per_group, max_id=below)
+                batch = await self.reader.fetch(group, 0, since, self.settings.backfill_per_group, max_id=below)
             except Exception as exc:
                 errors.append(f"{group['name']}: {exc}")
                 if type(exc).__name__ == "FloodWaitError":
                     break
-        self._count_people(messages, {g["name"]: g for g in groups})
-        pairs = ad_rows(sorted(messages, key=lambda m: m.date), self._seen)
-        saved = await asyncio.to_thread(self.save, base, pairs)
+                continue
+            pairs = await asyncio.to_thread(self._digest_messages, batch, by_name)
+            saved = await asyncio.to_thread(self.save, base, pairs)
+            total["messages"] += len(batch)
+            for k in ("ads", "rates", "carriers_new", "carriers_updated"):
+                total[k] += saved[k]
+            await asyncio.sleep(1)
         people = await asyncio.to_thread(self._save_people, base)
-        if not errors:
-            await asyncio.to_thread(self.registry_save, BACKFILL_KEY, stamp(),
-                                    f"Диспетчер: прочитана история групп за {days} дней")
-        return {"days": days, "messages": len(messages), **saved, **people, "errors": errors}
+        await asyncio.to_thread(self.registry_save, BACKFILL_KEY, stamp(),
+                                f"Диспетчер: прочитана история групп за {days} дн.")
+        return {"days": days, **total, **people, "errors": errors}
 
     # ---------- commands ----------
     def trucks(self, text: str) -> str:
@@ -669,7 +684,8 @@ class DispatcherAgent:
             except Exception as exc:
                 result["errors"].append(f"collect: {exc!r}")
                 logger.exception("Dispatcher collect failed")
-            if result.get("collect", {}).get("groups") and BACKFILL_KEY not in await asyncio.to_thread(self.registry_load):
+            if (self.settings.backfill_enabled and result.get("collect", {}).get("groups")
+                    and BACKFILL_KEY not in await asyncio.to_thread(self.registry_load)):
                 try:
                     result["backfill"] = await asyncio.wait_for(self.backfill(), timeout=1500)
                 except Exception as exc:
