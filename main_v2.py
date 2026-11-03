@@ -90,7 +90,7 @@ except Exception:
     Credentials = None
 
 
-VERSION = "cargo_v43_1_market_people"
+VERSION = "cargo_v43_2_dispatcher_safe"
 APP_NAME = "AI Tender Agent Cargo V42"
 TZ = timezone(timedelta(hours=5))
 
@@ -190,6 +190,7 @@ TG_API_HASH = os.getenv("TG_API_HASH", "").strip()
 TG_SESSION = os.getenv("TG_SESSION", "").strip()
 DISPATCHER_TICK_MINUTES = max(5, int(os.getenv("DISPATCHER_TICK_MINUTES", "15")))
 DISPATCHER_DIGEST_HOUR = int(os.getenv("DISPATCHER_DIGEST_HOUR", "18"))
+DISPATCHER_BACKFILL = os.getenv("DISPATCHER_BACKFILL", "true").lower() in {"1", "true", "yes", "on"}
 DISPATCHER_GROUPS = tuple(g.strip() for g in os.getenv("DISPATCHER_GROUPS", "").split(",") if g.strip())
 
 KEEPALIVE_ENABLED = os.getenv("KEEPALIVE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -2068,7 +2069,7 @@ dispatcher = DispatcherAgent(
     open_base, coordinator.telegram, TelethonReader(TG_API_ID, TG_API_HASH, TG_SESSION),
     registry_load=load_reminder_registry_sync, registry_save=save_reminder_registry_entry_sync,
     settings=DispatcherSettings(tick_minutes=DISPATCHER_TICK_MINUTES, digest_hour=DISPATCHER_DIGEST_HOUR,
-                                groups_filter=DISPATCHER_GROUPS),
+                                groups_filter=DISPATCHER_GROUPS, backfill_enabled=DISPATCHER_BACKFILL),
 )
 
 app = FastAPI(title=APP_NAME, version=VERSION, lifespan=lifespan)
@@ -2772,7 +2773,7 @@ async def dispatcher_tick(x_admin_token: Optional[str] = Header(None),
 
 
 @app.post("/dispatcher/backfill")
-async def dispatcher_backfill(days: int = Query(7, ge=1, le=30, description="Сколько дней истории прочитать"),
+async def dispatcher_backfill(days: int = Query(3, ge=1, le=14, description="Сколько дней истории прочитать"),
                               x_admin_token: Optional[str] = Header(None),
                               token: Optional[str] = Query(None)) -> Dict[str, Any]:
     """Read older messages once (runs by itself after the first start; this is to repeat it with more days)."""
